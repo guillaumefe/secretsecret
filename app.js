@@ -1941,6 +1941,16 @@ function updateDecryptButtonState() {
   btn.disabled = !(hasPassword && hasFile);
 }
 
+function maskPasswordField(inputSel, toggleSel) {
+  const p = (typeof inputSel === 'string') ? document.querySelector(inputSel) : inputSel;
+  if (!p) return;
+  p.type = 'password';
+  const t = (typeof toggleSel === 'string') ? document.querySelector(toggleSel) : toggleSel;
+  if (t) {
+    setText(t, 'Show');               // garde la logique existante (texte anglais)
+    t.setAttribute('aria-pressed','false');
+  }
+}
 
 
 
@@ -2757,10 +2767,9 @@ function wireDrop(zoneId, inputId, listId){
 function genPassphrase() {
   const p = $('#encPassword');
   p.value = genPassphraseWords(8);
-  p.type = 'text';
-  setText('#encPwdToggle', 'Hide');
-  $('#encPwdToggle').setAttribute('aria-pressed','true');
+  maskPasswordField('#encPassword', '#encPwdToggle');
   renderStrength(p.value);
+  setLive('Passphrase generated.');
 }
 
 /**
