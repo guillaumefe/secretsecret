@@ -1,0 +1,326 @@
+/* ================= Design tokens (dark by default) ================= */
+:root{
+  --bg:#0b0c10; --fg:#e8e8ea; --muted:#a8acb3;
+  --accent:#5aa9ff; --accent-2:#00e0a4; --warn:#ffcc00; --err:#ff6b6b;
+  --card:#15171c; --card-2:#1b1f26; --border:#2a2f38; --focus:#ffffff;
+  --radius:16px; --pad:16px; --pad-sm:12px; --gap:12px; --gap-lg:16px;
+  --tap:48px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  --shadow: 0 0 0 1px var(--border) inset, 0 6px 18px rgba(0,0,0,.25);
+  --safe-b: env(safe-area-inset-bottom);
+}
+
+/* ================= Light palette ================= */
+@media (prefers-color-scheme: light){
+  :root{
+    --bg:#f6f7fb; --fg:#101114; --muted:#4e5461;
+    --accent:#0b78d1; --accent-2:#0bb37b;
+    --card:#ffffff; --card-2:#f0f2f6; --border:#e1e4ea; --focus:#000000;
+    --shadow: 0 0 0 1px var(--border) inset, 0 8px 22px rgba(0,0,0,.06);
+  }
+}
+
+/* ================= Base ================= */
+*{ box-sizing:border-box }
+html,body{ height:100% }
+body{
+  margin:0;
+  background:var(--bg);
+  color:var(--fg);
+  font-family:var(--font);
+  line-height:1.5;
+  -webkit-text-size-adjust:100%;
+}
+a{ color:var(--accent) }
+.wrap{
+  max-width:920px;
+  margin:0 auto;
+  padding:var(--pad);
+  display:grid;
+  gap:var(--gap-lg);
+}
+
+/* Responsive root font-size for a comfortable scale */
+:root{ font-size:16px }
+@media (min-width: 480px){ :root{ font-size:17px } }
+@media (min-width: 768px){ :root{ font-size:18px } }
+
+/* ================= Accessibility helpers ================= */
+/* Visually-hidden utility for anchors or helper text controlled by JS */
+.sr-only{
+  position:absolute !important;
+  width:1px; height:1px;
+  padding:0; margin:-1px;
+  overflow:hidden;
+  clip:rect(0,0,0,0);
+  white-space:nowrap;
+  border:0;
+}
+
+/* Skip link for keyboard users */
+.skip{
+  position:absolute;
+  left:-9999px;
+}
+.skip:focus{
+  position:fixed;
+  left:var(--pad); top:var(--pad);
+  z-index:9999;
+  background:var(--card);
+  border:2px solid var(--focus);
+  border-radius:8px;
+  padding:8px 12px;
+}
+
+/* ================= UI Layout ================= */
+header{
+  display:grid;
+  grid-template-columns:1fr auto;
+  align-items:center;
+  gap:12px;
+}
+.brand{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  min-height:var(--tap);
+}
+.logo{
+  width:30px; height:30px;
+  border-radius:8px;
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+}
+h1{ margin:0; font-size:1.1rem }
+
+.badge-warn{
+  padding:4px 10px;
+  border-radius:999px;
+  font-weight:700;
+  background:var(--warn);
+  color:#000;
+}
+
+.card{
+  background:var(--card);
+  border:1px solid var(--border);
+  border-radius:var(--radius);
+  padding:var(--pad);
+  box-shadow:var(--shadow);
+}
+.row{ display:grid; gap:var(--gap) }
+
+/* ================= Buttons ================= */
+.btn{
+  border:1px solid var(--border);
+  background:var(--card-2);
+  padding:12px 14px;
+  border-radius:12px;
+  cursor:pointer;
+  min-height:var(--tap);
+  font-weight:600;
+}
+.btn.primary{
+  background:var(--accent);
+  border-color:var(--accent);
+  color:#0b0c10;
+}
+.btn:disabled{ opacity:.6; cursor:not-allowed }
+.btn:focus-visible{ outline:3px solid var(--focus); outline-offset:2px }
+
+/* ================= Segmented control (tabs) ================= */
+.seg{
+  display:grid;
+  grid-auto-flow:column;
+  gap:8px;
+  background:var(--card-2);
+  border:1px solid var(--border);
+  padding:6px;
+  border-radius:999px;
+}
+.seg [role="tab"]{
+  border-radius:999px;
+  background:transparent;
+  border:1px solid transparent;
+  min-width:96px;
+  color:var(--muted);
+  padding:10px 14px;
+  transition:.2s;
+}
+/* Auto 2px border for the active tab */
+.seg [aria-selected="true"]{
+  background:var(--card);
+  color:var(--fg);
+  border:2px solid var(--fg);
+  box-shadow:0 2px 4px rgba(0,0,0,.25);
+}
+
+/* ================= Form controls ================= */
+input,textarea,select{
+  width:100%;
+  padding:14px;
+  border-radius:12px;
+  border:1px solid var(--border);
+  background:var(--card-2);
+  color:var(--fg);
+}
+
+/* NOTE: this block had a missing closing brace; now fixed */
+input[type="text"], input[type="password"], textarea, select{
+  margin-bottom:1em;
+  margin-bottom:1em; /* (intentional duplicate—kept from original style) */
+}
+
+/* Small helpers used by the markup (not mandatory but nice for layout) */
+.input-actions{ display:flex; gap:8px; align-items:center }
+.inline{ display:flex; align-items:center; justify-content:space-between; gap:8px }
+.status{ font-size:.95rem }
+
+/* Muted text */
+.muted{ color:var(--muted); font-size:.9rem; font-style:italic; opacity:.85 }
+
+/* Textarea sizing */
+textarea{ min-height:160px }
+
+/* ================= Progress ================= */
+.progress{
+  height:12px;
+  background:var(--card-2);
+  border-radius:999px;
+  border:1px solid var(--border);
+}
+.bar{
+  height:100%;
+  width:0%;
+  background:linear-gradient(90deg,var(--accent),var(--accent-2));
+  border-radius:999px;
+}
+
+/* ================= Dropzones ================= */
+.drop{
+  padding:18px;
+  border:2px dashed var(--border);
+  border-radius:14px;
+  display:grid;
+  place-items:center;
+  gap:6px;
+  min-height:96px;
+  text-align:center;
+}
+.drop.drag{ border-color:var(--accent) }
+
+/* ================= Sticky action bar ================= */
+.actionbar{
+  position:sticky;
+  bottom:var(--safe-b);
+  padding-top:6px;
+}
+.actionbar .buttons{
+  background:var(--card);
+  border:1px solid var(--border);
+  padding:8px;
+  border-radius:14px;
+  box-shadow:var(--shadow);
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+}
+
+/* ================= Footer ================= */
+footer{
+  margin-bottom:calc(10px + var(--safe-b));
+  color:var(--muted);
+  font-size:.95rem;
+}
+
+/* ================= Minor polish ================= */
+/* Smooth focus for interactive drop areas */
+.drop:focus-visible{
+  outline:3px solid var(--focus);
+  outline-offset:2px;
+}
+
+/* Ensure tabpanels don’t create awkward gaps when hidden */
+[role="tabpanel"][hidden]{ display:none !important }
+
+/* Resize behavior for small screens inside cards */
+@media (max-width: 420px){
+  .brand h1{ font-size:1rem }
+  .seg [role="tab"]{ min-width:84px; padding:8px 10px }
+}
+
+/* =================================================================== */
+/* ================= Inline styles migrated to stylesheet ============= */
+/* =================================================================== */
+
+/* 1) Fieldset “Content” top spacing (was: style="margin-top:8px") */
+fieldset.row.mt-8{ margin-top:8px } /* if you add class="mt-8" to that fieldset */
+fieldset.row{ /* safe default if you prefer not to add a class */
+  /* no-op by default; keep the utility class approach for clarity */
+}
+
+/* 2) Content-type segmented control width (was: style="width:max-content") */
+/* Option A (preferred): add class="w-max" in HTML */
+.w-max{ width:max-content }
+/* Option B: structural target (kept as fallback, remove if you adopt .w-max) */
+/* [role="tablist"][aria-label="Content type"] .seg{ width:max-content } */
+
+/* 3) Encrypt: file list spacing (was: style="margin:8px 0 0; padding-left:18px") */
+#encFileList{ margin:8px 0 0; padding-left:18px }
+
+/* 4) Encrypt: progress bar spacing in action bar (was: style="margin-top:10px") */
+/* Use utility .mt-10 on the .progress container when desired */
+.mt-10{ margin-top:10px }
+
+/* 5) Encrypt: outputs container (was: style="margin-top:12px; display:none") */
+#encOutputs{ margin-top:12px }
+
+/* 6) Decrypt: first row spacing under passphrase (was: style="margin-top:8px") */
+/* Add class="mt-8" to that .row */
+.mt-8{ margin-top:8px }
+
+/* 7) Decrypt: selected filename spacing (was: style="margin-top:6px") */
+#decFileName{ margin-top:6px }
+
+/* 8) Decrypt: results <details> spacing (was: style="margin-top:8px") */
+#decDetails{ margin-top:8px }
+
+/* 9) Decrypt: plaintext preview block (was: style="margin-top:8px; white-space:pre-wrap; overflow:auto; max-height:40vh") */
+#decText{
+  margin-top:8px;
+  white-space:pre-wrap;
+  overflow:auto;
+  max-height:40vh;
+}
+
+/* 10) Encrypt: the small inline .inline had justify-content:space-between inline, already provided by .inline */
+/* Nothing to add here; .inline already sets justify-content:space-between. */
+
+/* 11) Generic utilities you can reuse when removing other inline styles */
+.mt-12{ margin-top:12px }
+.pl-18{ padding-left:18px }
+.hidden{ display:none !important }
+
+/* Progress in 5% steps using classes */
+.bar.p-0   { width: 0% }
+.bar.p-5   { width: 5% }
+.bar.p-10  { width:10% }
+.bar.p-15  { width:15% }
+.bar.p-20  { width:20% }
+.bar.p-25  { width:25% }
+.bar.p-30  { width:30% }
+.bar.p-35  { width:35% }
+.bar.p-40  { width:40% }
+.bar.p-45  { width:45% }
+.bar.p-50  { width:50% }
+.bar.p-55  { width:55% }
+.bar.p-60  { width:60% }
+.bar.p-65  { width:65% }
+.bar.p-70  { width:70% }
+.bar.p-75  { width:75% }
+.bar.p-80  { width:80% }
+.bar.p-85  { width:85% }
+.bar.p-90  { width:90% }
+.bar.p-95  { width:95% }
+.bar.p-100 { width:100% }
+
+.visible { display:block !important }
