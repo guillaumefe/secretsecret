@@ -130,6 +130,28 @@ index.html → Cache-Control: no-cache
 
 If the hosting environment does not support per-file CSP overrides:
 
+Set the build-time flag `ALLOW_PERMISSIVE_FALLBACK` to `false` to completely disable loading
+of the permissive worker even if the strict worker fails:
+
+```js
+// app.js (built with ALLOW_PERMISSIVE_FALLBACK=false)
+const ALLOW_PERMISSIVE_FALLBACK = false;
+```
+
+When disabled, only the strict worker (`argon-worker.js`) is ever started and any CSP/WASM
+initialization failure is treated as a hard failure. This configuration is recommended for
+environments with a reliable strict CSP.
+
+Do not deploy the permissive worker file.
+
+In app.js, disable fallback:
+
+```js
+async function getArgonWorker() {
+  return await startArgonWorker('./argon-worker.js');
+}
+```
+
 Do not deploy the permissive worker file.
 
 In app.js, disable fallback:
