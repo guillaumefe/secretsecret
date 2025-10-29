@@ -232,7 +232,7 @@
   /* =========================================================
      Sticky action bar
      ========================================================= */
-  .actionbar{ position:sticky; bottom:var(--safe-b); padding-top:6px }
+  .actionbar{ position:sticky; bottom:var(--safe-b); padding-top:6px; background: #FFF }
   .actionbar .buttons{
     background:var(--card);
     border:1px solid var(--border);
