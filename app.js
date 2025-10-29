@@ -1,7 +1,7 @@
 // ===== Constants and parameters =====
 
 // eff_large_wordlist.json is generated at build time from the EFF list
-import WORDS from './eff_large_wordlist.json' assert { type: 'json' };
+import WORDS from './eff_large_wordlist.json' with { type: 'json' };
 
 // Build-time flag: set to false in hard-CSP builds
 // When false → strict worker only → any CSP/WASM failure is a hard failure
