@@ -1,7 +1,7 @@
 // ===== Constants and parameters =====
 
 // eff_large_wordlist.json is generated at build time from the EFF list
-import WORDS from './eff_large_wordlist.json' with { type: 'json' };
+let WORDS = null;
 
 // Build-time flag: set to false in hard-CSP builds
 // When false → strict worker only → any CSP/WASM failure is a hard failure
@@ -1390,6 +1390,12 @@ async function init() {
       if (be) { be.setAttribute('aria-disabled','true'); be.disabled = true; }
       if (bd) { bd.setAttribute('aria-disabled','true'); bd.disabled = true; }
       return;
+    }
+
+    try {
+      WORDS = (await import('./eff_large_wordlist.json', { with: { type: 'json' } })).default;
+    } catch {
+      WORDS = await (await fetch(new URL('./eff_large_wordlist.json', import.meta.url))).json();
     }
 
     await loadWordlist();
