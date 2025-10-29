@@ -1,0 +1,18 @@
+# Serve WebAssembly with the correct MIME type
+*.wasm  binary
+*.wasm  application/wasm
+
+# Ensure JS served correctly
+*.js    text/javascript
+
+# Correct MIME types for common static assets
+*.css   text/css
+*.html  text/html
+*.json  application/json
+*.txt   text/plain
+
+# Binary files (prevent line-ending conversion)
+*.ico   binary
+*.zip   binary
+*.cbox* binary
+
