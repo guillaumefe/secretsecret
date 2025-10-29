@@ -212,12 +212,29 @@ function clearNode(selOrEl) {
     ? document.querySelector(selOrEl)
     : selOrEl;
   if (!el) return;
+
+  // Revoke any blob: URLs inside before removing nodes
+  try {
+    const anchors = el.querySelectorAll ? el.querySelectorAll('a[href^="blob:"]') : [];
+    let revoked = 0;
+    anchors.forEach(a => {
+      const href = a.getAttribute('href');
+      if (href) {
+        try { URL.revokeObjectURL(href); } catch {}
+        try { __urlsToRevoke && __urlsToRevoke.delete && __urlsToRevoke.delete(href); } catch {}
+        revoked++;
+      }
+    });
+    logInfo && logInfo('[clearNode] revoked blob links', { revoked, sel: typeof selOrEl === 'string' ? selOrEl : el.id || 'node' });
+  } catch {}
+
   if (typeof el.replaceChildren === 'function') {
     el.replaceChildren();
   } else {
     while (el.firstChild) el.removeChild(el.firstChild);
   }
 }
+
 
 /**
  * Set plain text content on an element safely (no HTML interpretation).
@@ -289,8 +306,47 @@ const __urlsToRevoke = new Set();
 function addDownload(containerSel, blob, filename, label) {
   const container = $(containerSel);
   if (!container) return;
-  const url = URL.createObjectURL(blob);
+
+  try {
+    const old = container.querySelectorAll('a[href^="blob:"]');
+    logInfo('[addDownload] existing blob links in container', { count: old.length });
+    old.forEach(a => {
+      const href = a.getAttribute('href');
+      if (href) {
+        try { URL.revokeObjectURL(href); } catch {}
+        try { __urlsToRevoke && __urlsToRevoke.delete && __urlsToRevoke.delete(href); } catch {}
+      }
+      try { a.remove(); } catch {}
+    });
+    const oldBtns = container.querySelectorAll('button');
+    logInfo('[addDownload] removing old buttons', { count: oldBtns.length });
+    oldBtns.forEach(b => { try { b.remove(); } catch {} });
+  } catch (e) {
+    logWarn('[addDownload] cleanup warn', e);
+  }
+
+  let url;
+  try {
+    url = URL.createObjectURL(blob);
+    logInfo('[addDownload] created object URL', { trackedBefore: __urlsToRevoke.size + 0 });
+  } catch (e) {
+    logError('[addDownload] URL.createObjectURL failed', e, { blobSize: blob && blob.size });
+    throw e;
+  }
   __urlsToRevoke.add(url);
+  logInfo('[addDownload] tracking URL', { trackedAfter: __urlsToRevoke.size });
+
+  try {
+    const MAX_TRACKED = 20;
+    while (__urlsToRevoke.size > MAX_TRACKED) {
+      const first = __urlsToRevoke.values().next().value;
+      if (!first) break;
+      try { URL.revokeObjectURL(first); } catch {}
+      __urlsToRevoke.delete(first);
+    }
+  } catch (e) {
+    logWarn('[addDownload] capping tracked URLs warn', e);
+  }
 
   const a = document.createElement('a');
   a.href = url;
@@ -301,19 +357,19 @@ function addDownload(containerSel, blob, filename, label) {
   btn.type = 'button';
   btn.className = 'btn secondary';
   setText(btn, label || ('Download ' + filename));
-  btn.onclick = () => { 
-    a.click(); 
-    // Revoke the URL right after the download has started
+  btn.onclick = () => {
+    try { a.click(); } catch (e) { logError('[addDownload] anchor click failed', e); }
     requestAnimationFrame(() => {
       try { URL.revokeObjectURL(url); } catch {}
       try { __urlsToRevoke.delete(url); } catch {}
+      logInfo('[addDownload] revoked after click', { trackedNow: __urlsToRevoke.size });
     });
   };
 
   container.appendChild(btn);
   container.appendChild(a);
+  logInfo('[addDownload] appended elements');
 }
-
 
 
 // ===== Hashing =====
@@ -665,7 +721,14 @@ function padToFixed(u8) {
   const out = new Uint8Array(FIXED_CHUNK_SIZE);
   out.set(u8, 0);
   if (u8.length < FIXED_CHUNK_SIZE) {
-    crypto.getRandomValues(out.subarray(u8.length));
+    // Fill the remainder with cryptographically‐strong random bytes in <=64 KiB chunks
+    const MAX = 65536; // browser limit for getRandomValues
+    let offset = u8.length;
+    while (offset < FIXED_CHUNK_SIZE) {
+      const n = Math.min(MAX, FIXED_CHUNK_SIZE - offset);
+      crypto.getRandomValues(out.subarray(offset, offset + n));
+      offset += n;
+    }
   }
   return out;
 }
@@ -1245,8 +1308,10 @@ function renderStrength(pw) {
 /**
  * Reset encryption panel inputs and progress.
  */
-function resetEncryptUI() {
-  $('#encPassword').value = '';
+function resetEncryptUI(preservePassword = false) {
+  if (!preservePassword) {
+    try { $('#encPassword').value = ''; } catch {}
+  }
   $('#encText').value = '';
   $('#encFiles').value = '';
   clearNode('#encResults');
@@ -1255,14 +1320,20 @@ function resetEncryptUI() {
   setText('#pwdStrength', '');
   setProgress(encBar, 0);
 
-  // Hide output section if visible
+  // Hide output section if visible, but DO NOT remove its DOM so bundle + hash remain across tabs
   const out = $('#encOutputs');
   if (out) {
     out.classList.add('hidden');
     out.classList.remove('visible');
   }
 
-  // (optional) Clear file list if used
+  // Hide encryption progress container (progress bars should not be visible unless active)
+  try {
+    const encProgress = document.querySelector('#encBar')?.parentElement;
+    if (encProgress) encProgress.style.display = 'none';
+  } catch {}
+
+  // Optional: Clear file list UI
   const list = $('#encFileList');
   if (list) setText(list, '');
 }
@@ -1271,22 +1342,35 @@ function resetEncryptUI() {
 /**
  * Reset decryption panel inputs and progress.
  */
-function resetDecryptUI() {
-  $('#decPassword').value   = '';
-  $('#decFile').value       = '';
-  setText('#decFileName', '');
-  clearNode('#decResults');
-  setText('#decText', '');
-  setText('#decIntegrity', '');
-  setProgress(decBar, 0);
+function resetDecryptUI(opts = {}) {
+  const { preservePassword = true, preserveFile = true } = opts;
+
+  // clear previous outputs only (results, text, integrity, errors)
+  try { clearNode('#decResults'); } catch {}
+  try { setText('#decText',''); } catch {}
+  try { setText('#decIntegrity',''); } catch {}
+  try { setText('#decFileErr',''); } catch {}
+
+  // keep password unless explicitly told otherwise
+  if (!preservePassword) {
+    try { $('#decPassword').value = ''; } catch {}
+  }
+
+  // keep chosen file unless explicitly told otherwise
+  if (!preserveFile) {
+    try { $('#decFile').value = ''; } catch {}
+    try { setText('#decFileName',''); } catch {}
+  }
 }
+
 
 /**
  * Switch between Encrypt and Decrypt tabs and reset both panels.
  */
 function selectTab(which) {
-  const encTab   = $('#tabEncrypt'), decTab   = $('#tabDecrypt');
+  const encTab   = $('#tabEncrypt'), decTab = $('#tabDecrypt');
   const encPanel = $('#panelEncrypt'), decPanel = $('#panelDecrypt');
+
   if (which === 'enc') {
     encTab.setAttribute('aria-selected', 'true');  decTab.setAttribute('aria-selected', 'false');
     encPanel.hidden = false; decPanel.hidden = true;
@@ -1294,7 +1378,30 @@ function selectTab(which) {
     decTab.setAttribute('aria-selected', 'true');  encTab.setAttribute('aria-selected', 'false');
     decPanel.hidden = false; encPanel.hidden = true;
   }
-  resetEncryptUI(); resetDecryptUI();
+
+  // IMPORTANT: do not reset the encrypt/decrypt UIs here — preserve outputs & bundle & hashes.
+  // However, always ensure encryption password is re-hidden after any tab change.
+  try {
+    const encPwd = $('#encPassword');
+    const encToggle = $('#encPwdToggle');
+    if (encPwd) {
+      encPwd.type = 'password';
+      if (encToggle) {
+        setText(encToggle, 'Show');
+        encToggle.setAttribute('aria-pressed', 'false');
+      }
+    }
+  } catch (e) { /* non-fatal UI tweak */ }
+
+  // Also ensure decrypt preview isn't accidentally visible until a result exists.
+  const decText = $('#decText'), decResults = $('#decResults');
+  if (decText && decText.textContent.trim() === '') {
+    try { decText.hidden = true; } catch {}
+  }
+  // If there is content in decResults (a result was produced), keep it visible across tab switches.
+  if (decResults && decResults.childElementCount > 0) {
+    decResults.classList.remove('hidden');
+  }
 }
 
 /**
@@ -1495,8 +1602,22 @@ function chunkFixedGeneric(u8) {
 async function doEncrypt() {
   let payloadBytes = null, bundle = null;
   try {
+    logInfo('[enc] start');
+    try { logInfo('[enc] tracked URLs before', { tracked: __urlsToRevoke ? __urlsToRevoke.size : 'n/a' }); } catch {}
+
+    // Show encryption progress only while running
+    try {
+      const encProgress = document.querySelector('#encBar')?.parentElement;
+      if (encProgress) encProgress.style.display = 'block';
+    } catch {}
+
     setProgress(encBar, 5);
-    clearNode('#encResults'); setText('#encHash',''); setText('#encPlainHash','');
+
+    // Only clear OUTPUTS — keep inputs AND password !
+    clearNode('#encResults');
+    setText('#encHash','');
+    setText('#encPlainHash','');
+    logInfo('[enc] outputs cleared');
 
     const pw = $('#encPassword').value || '';
     if (!pw) throw new EnvelopeError('input', 'missing');
@@ -1524,7 +1645,11 @@ async function doEncrypt() {
         }
         items.push({ name: f.name, bytes: buf, type: f.type || 'application/octet-stream' });
       }
-      fileList = items.map(x => ({ name: x.name, size: x.bytes.length }));
+      fileList = items.map(x => ({
+        name: x.name,
+        size: x.bytes.length,
+        type: x.type || 'application/octet-stream'
+      }));
       if (items.length === 1) {
         payloadBytes = items[0].bytes;
       } else {
@@ -1538,19 +1663,23 @@ async function doEncrypt() {
     if (payloadBytes.length > (window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES)) {
       throw new EnvelopeError('input_large', 'Input too large for this device');
     }
+    logInfo('[enc] input prepared', {
+      sourceKind,
+      totalPlainLen: payloadBytes.length,
+      textMode
+    });
 
     const totalPlainLen = payloadBytes.length;
     const chunks        = chunkFixed(payloadBytes);
     const totalChunks   = chunks.length;
+    logInfo('[enc] chunked', { totalChunks, chunkSize: FIXED_CHUNK_SIZE, totalPlainLen });
 
-    // Anti-replay: one random bundleId per encryption session
+    // Random bundleId
     const bundleIdBytes = crypto.getRandomValues(new Uint8Array(16));
     const bundleId = b64(bundleIdBytes);
-    
-    // Whole-plaintext hash (kept for integrity binding; not shown in UI)
+
     const wholeHashHex = await sha256Hex(payloadBytes);
 
-    // Per-slice hash + sealed parts
     setProgress(encBar, 15);
     const sealedParts    = [];
     const perChunkHashes = [];
@@ -1568,7 +1697,7 @@ async function doEncrypt() {
         chunkIndex: i,
         totalChunks,
         totalPlainLen,
-        params: { ...tunedParams, bundleId } // <— propagate bundleId
+        params: { ...tunedParams, bundleId }
       });
 
       sealedParts.push({ name: `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: part });
@@ -1577,11 +1706,11 @@ async function doEncrypt() {
       if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
     }
 
-    // --------- Chunked MANIFEST + INDEX ----------
+    // MANIFEST chunks
     const manifestInner = {
       v: 1,
       kind: 'manifest',
-      bundleId, // <— redundant copy (not trusted alone; real binding is via AAD)
+      bundleId,
       chunkSize: FIXED_CHUNK_SIZE,
       totalPlainLen,
       totalChunks,
@@ -1591,11 +1720,7 @@ async function doEncrypt() {
       createdAt: new Date().toISOString()
     };
     const manifestBytes  = TE.encode(JSON.stringify(manifestInner));
-
-    // Slice MANIFEST into 4 MiB chunks
-    const manChunksClear = chunkFixedGeneric(manifestBytes);
-
-    // Seal each MANIFEST chunk (pad to fixed size)
+    const manChunksClear = chunkFixedGeneric(manifestBytes); // slices
     const manSealedParts = [];
     for (let i = 0; i < manChunksClear.length; i++) {
       const padded = padToFixed(manChunksClear[i]);
@@ -1608,10 +1733,9 @@ async function doEncrypt() {
         params: { ...tunedParams, bundleId }
       });
       manSealedParts.push({ name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: sealed });
-      if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
     }
 
-    // Authenticated index for MANIFEST chunks
+    // Authenticated manifest index
     const manChunkHashes = [];
     for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
     const manifestIndexInner = {
@@ -1622,12 +1746,9 @@ async function doEncrypt() {
       chunkSize: FIXED_CHUNK_SIZE,
       chunkHashes: manChunkHashes
     };
-    
-    // Build a multi-part MANIFEST_INDEX just like MANIFEST
     const manIndexBytes  = TE.encode(JSON.stringify(manifestIndexInner));
-    const manIndexChunks = chunkFixedGeneric(manIndexBytes); // splits into 4 MiB slices
+    const manIndexChunks = chunkFixedGeneric(manIndexBytes);
     const manIndexSealed = [];
-    
     for (let i = 0; i < manIndexChunks.length; i++) {
       const chunk = padToFixed(manIndexChunks[i]);
       const sealed = await sealFixedChunk({
@@ -1643,16 +1764,24 @@ async function doEncrypt() {
         bytes: sealed
       });
     }
-    
+
     const filesOut = [
       ...sealedParts,
       ...manSealedParts,
       ...manIndexSealed
     ];
+    logInfo('[enc] filesOut', { count: filesOut.length });
 
-    const bundleZip = buildZip(filesOut);
+    let bundleZip;
+    try {
+      bundleZip = buildZip(filesOut);
+      logInfo('[enc] buildZip ok', { zipBytes: bundleZip.length });
+    } catch (e) {
+      logError('[enc] buildZip failed', e);
+      throw e;
+    }
 
-    // Wipe & drop per-part buffers now that bundleZip holds the copy
+    // Wipe & drop buffers now that everything is in the ZIP
     try {
       for (const f of filesOut) { f?.bytes?.fill?.(0); }
     } catch {}
@@ -1660,16 +1789,69 @@ async function doEncrypt() {
     sealedParts.length = 0;
     manSealedParts.length = 0;
     manIndexSealed.length = 0;
-    
+
     bundle = bundleZip;
 
-    addDownload('#encResults', new Blob([bundleZip], { type: 'application/octet-stream' }), `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
-    const bundleHash = await sha256Hex(bundleZip);
-    setText('#encHash', `SHA-256 (bundle): ${bundleHash}`);
-    // Do not display plaintext hash anymore:
-    // setText('#encPlainHash', `SHA-256 (plaintext): ${wholeHashHex}`);
+    let outBlob;
+    try {
+      outBlob = new Blob([bundleZip], { type: 'application/octet-stream' });
+      logInfo('[enc] Blob created', { blobSize: outBlob.size });
+    } catch (e) {
+      logError('[enc] Blob creation failed', e, { zipBytes: bundleZip?.length||null });
+      throw e;
+    }
 
-    // Show outputs container now that results are available
+    try {
+      addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
+      logInfo('[enc] addDownload ok', { tracked: __urlsToRevoke?.size });
+    } catch (e) {
+      logError('[enc] addDownload failed', e);
+      throw e;
+    }
+
+    const bundleHash = await sha256Hex(bundleZip);
+
+    // Fancy SHA UI
+    const hashContainer = document.querySelector('#encHash');
+    if (hashContainer) {
+      clearNode(hashContainer);
+
+      const label = document.createElement('div');
+      label.className = 'muted';
+      setText(label, 'Bundle SHA-256:');
+
+      const codeWrap = document.createElement('div');
+      codeWrap.style.display = 'flex';
+      codeWrap.style.alignItems = 'center';
+      codeWrap.style.gap = '8px';
+      codeWrap.style.marginTop = '6px';
+
+      const shaCode = document.createElement('code');
+      shaCode.style.fontFamily = 'monospace, monospace';
+      shaCode.style.padding = '6px 8px';
+      shaCode.style.borderRadius = '8px';
+      shaCode.style.background = 'rgba(255,255,255,0.02)';
+      shaCode.textContent = bundleHash;
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'btn secondary';
+      copyBtn.type = 'button';
+      setText(copyBtn, 'Copy');
+      copyBtn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(bundleHash);
+          setLive('Bundle SHA copied to clipboard.');
+        } catch {
+          setLive('Copy failed.');
+        }
+      };
+
+      codeWrap.appendChild(shaCode);
+      codeWrap.appendChild(copyBtn);
+      hashContainer.appendChild(label);
+      hashContainer.appendChild(codeWrap);
+    }
+
     const out = $('#encOutputs');
     if (out) {
       out.classList.remove('hidden');
@@ -1679,17 +1861,27 @@ async function doEncrypt() {
     }
 
     setProgress(encBar, 100);
-    $('#encText').value      = '';
-    $('#encFiles').value     = '';
-    $('#encPassword').value  = '';
-    setText('#pwdStrength', '');
     setLive('Encryption complete (bundle bound by manifest index).');
+    logInfo('[enc] success');
+
   } catch (err) {
-    logError(err);
+    logError('[enc] failed', err);
     await secureFail('Encryption');
     setProgress(encBar, 0);
     clearPasswords();
   } finally {
+    try {
+      const encProgress = document.querySelector('#encBar')?.parentElement;
+      if (encProgress) encProgress.style.display = 'none';
+    } catch {}
+
+    try { logInfo('[enc] finally: tracked URLs', { tracked: __urlsToRevoke?.size }); } catch {}
+    try {
+      const resEl = document.querySelector('#encResults');
+      const blobs = resEl ? resEl.querySelectorAll('a[href^="blob:"]').length : 0;
+      logInfo('[enc] finally: blobs in #encResults', { blobs });
+    } catch {}
+
     if (payloadBytes) wipeBytes(payloadBytes);
     if (bundle) wipeBytes(bundle);
   }
@@ -1744,11 +1936,12 @@ async function decodeChunked(u8, chunkSize = 64 * 1024) {
  * otherwise offer a binary download.
  */
 async function tryRenderOrDownload(bytes, containerSel, textSel) {
+  const decResults = document.querySelector('#decResults');
+  const decTextEl = document.querySelector('#decText');
+
   const isUtf8Text = looksLikeUtf8Text(bytes);
   if (isUtf8Text) {
-    // Very large text? Don’t render; offer a download instead.
     if (bytes.length > MAX_PREVIEW) {
-      // keep bytes (no full decode), but mark as text for correct file handling
       addDownload(
         containerSel,
         new Blob([bytes], { type: 'text/plain;charset=utf-8' }),
@@ -1756,9 +1949,11 @@ async function tryRenderOrDownload(bytes, containerSel, textSel) {
         'Download text'
       );
       setText(textSel, 'Large text content — download provided.');
+      // Reveal the results container since we have a result (download).
+      if (decResults) decResults.classList.remove('hidden');
+      if (decTextEl) decTextEl.hidden = true;
       return;
     }
-    // Decode incrementally to avoid UI stalls.
     const t = await decodeChunked(bytes);
     setText(textSel, t);
     addDownload(
@@ -1767,6 +1962,9 @@ async function tryRenderOrDownload(bytes, containerSel, textSel) {
       'decrypted.txt',
       'Download text'
     );
+    // Reveal the results now that we have content
+    if (decResults) decResults.classList.remove('hidden');
+    if (decTextEl) decTextEl.hidden = false;
   } else {
     addDownload(
       containerSel,
@@ -1774,8 +1972,11 @@ async function tryRenderOrDownload(bytes, containerSel, textSel) {
       'decrypted.bin',
       'Download file'
     );
+    if (decResults) decResults.classList.remove('hidden');
+    if (decTextEl) decTextEl.hidden = true;
   }
 }
+
 
 
 
@@ -1786,45 +1987,106 @@ async function tryRenderOrDownload(bytes, containerSel, textSel) {
  * against the authenticated manifest. Implements basic UX rate-limit.
  */
 async function doDecrypt() {
-  let zipU8 = null; let recovered = null;
+  let zipU8 = null;
+  let recovered = null;
 
   let entries = null;
   let decryptBtn = null;
   let prevDisabled = false;
-  
-  try{
+
+  try {
+    logInfo('[dec] start');
+
+    // Clear previous decryption outputs (keep user password so retry is easy)
+    logInfo('[dec] reset UI outputs');
+    resetDecryptUI({ preservePassword: true, preserveFile: true });
+
+    // Show decryption progress container only while active
+    try {
+      const decProgress = document.querySelector('#decBar')?.parentElement;
+      if (decProgress) { decProgress.style.display = 'block'; logInfo('[dec] progress shown'); }
+    } catch (e) { logWarn('[dec] progress show warn', e); }
+
     // UX rate-limit
     const gate = allow('decrypt');
     if (!gate.ok) {
+      logWarn('[dec] rate-limited', { wait: gate.wait });
       cooldownButton('#btnDecrypt', gate.wait);
-      setProgress(decBar, 0); // instant visual reset
+      setProgress(decBar, 0);
+      try {
+        const decProgress = document.querySelector('#decBar')?.parentElement;
+        if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (rate-limit)'); }
+      } catch (e) { logWarn('[dec] progress hide warn (rate-limit)', e); }
       throw new EnvelopeError('rate_limit', 'cooldown');
     }
 
     setProgress(decBar, 10);
-    // Anti double-clic pendant le traitement
+
+    // Anti double-click during processing
     decryptBtn = document.querySelector('#btnDecrypt');
-    prevDisabled = decryptBtn?.disabled;
+    prevDisabled = !!decryptBtn?.disabled;
     if (decryptBtn) {
       decryptBtn.disabled = true;
-      decryptBtn.setAttribute('aria-disabled','true');
+      decryptBtn.setAttribute('aria-disabled', 'true');
+      logInfo('[dec] btnDecrypt disabled for processing');
     }
 
-    clearNode('#decResults'); setText('#decText',''); setText('#decIntegrity','');
+    // Clean output containers
+    clearNode('#decResults'); setText('#decText', ''); setText('#decIntegrity', '');
+    logInfo('[dec] outputs cleared');
 
+    // Read inputs
     const pw = $('#decPassword').value || '';
-    if (!pw) throw new EnvelopeError('input', 'missing');
+    if (!pw) {
+      logWarn('[dec] missing password');
+      setText('#decFileErr', 'Please enter your passphrase.');
+      setProgress(decBar, 0);
+      try { const decProgress = document.querySelector('#decBar')?.parentElement; if (decProgress) decProgress.style.display = 'none'; } catch {}
+      try { document.getElementById('decPassword')?.focus(); } catch {}
+      // restore button state and bail out cleanly
+      try { if (decryptBtn) { decryptBtn.disabled = !!prevDisabled; if (!prevDisabled) decryptBtn.removeAttribute('aria-disabled'); } } catch {}
+      logInfo('[dec] abort: no password');
+      return;
+    }
     const password = pw.normalize('NFKC');
 
     const f = $('#decFile').files?.[0];
-    if (!f)  throw new EnvelopeError('input', 'missing');
+    if (!f)  {
+      logWarn('[dec] missing file');
+      setText('#decFileErr', 'Please choose a .cbox or .cboxbundle file.');
+      setProgress(decBar, 0);
+      try { const decProgress = document.querySelector('#decBar')?.parentElement; if (decProgress) decProgress.style.display = 'none'; } catch {}
+      try { document.getElementById('decDrop')?.focus(); } catch {}
+      try { if (decryptBtn) { decryptBtn.disabled = !!prevDisabled; if (!prevDisabled) decryptBtn.removeAttribute('aria-disabled'); } } catch {}
+      logInfo('[dec] abort: no file selected');
+      return;
+    }
+
     const name = f.name.toLowerCase();
 
+    // Inputs validated, ensure progress visible
+    try {
+      const decProgress = document.querySelector('#decBar')?.parentElement;
+      if (decProgress) { decProgress.style.display = 'block'; logInfo('[dec] progress shown'); }
+    } catch (e) { logWarn('[dec] progress show warn', e); }
+
+    const fSize = f.size|0;
+    logInfo('[dec] input file', { name, size: fSize });
+
+    // -------- Single fixed-chunk .cbox path --------
     if (name.endsWith(FILE_SINGLE_EXT)) {
-      // Single chunk case. Decrypt and render.
+      logInfo('[dec] mode=single .cbox');
       const env    = new Uint8Array(await f.arrayBuffer());
+      logInfo('[dec] single env bytes', { bytes: env.length });
+
       const opened = await openFixedChunk({ password, bytes: env });
       const meta   = opened.innerMeta;
+
+      logInfo('[dec] single innerMeta', {
+        kind: meta?.kind, idx: meta?.chunkIndex, total: meta?.totalChunks,
+        totalPlainLen: meta?.totalPlainLen
+      });
+
       if (meta.kind !== 'fixed') throw new EnvelopeError('kind', 'Unexpected type');
 
       const idx = meta.chunkIndex|0, total = meta.totalChunks|0, fixed = opened.fixedChunk;
@@ -1836,8 +2098,11 @@ async function doDecrypt() {
         throw new EnvelopeError('single_len', 'Invalid size for single chunk');
       }
 
-      const sliceEnd = meta.totalPlainLen;
+      const sliceEnd = meta.totalPlainLen|0;
       const payload  = fixed.subarray(0, sliceEnd);
+      logInfo('[dec] single payload', { sliceEnd });
+
+      // Let tryRenderOrDownload decide (text/html preview vs download)
       await tryRenderOrDownload(payload, '#decResults', '#decText');
       setText('#decIntegrity', `Single-chunk decrypted. Size: ${payload.length} bytes.`);
       try { opened.fixedChunk.fill(0); } catch {}
@@ -1845,6 +2110,17 @@ async function doDecrypt() {
 
       setProgress(decBar, 100);
       setLive('Decryption complete.');
+      logInfo('[dec] single decryption success');
+
+      // Reveal results and hide progress container after success
+      try {
+        const decResults = document.getElementById('decResults');
+        const decTextEl  = document.getElementById('decText');
+        if (decResults) decResults.classList.remove('hidden');
+        if (decTextEl && (decTextEl.textContent || '').trim() !== '') decTextEl.hidden = false;
+        const decProgress = document.querySelector('#decBar')?.parentElement;
+        if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (single done)'); }
+      } catch (e) { logWarn('[dec] results reveal warn (single)', e); }
 
       const det = document.getElementById('decDetails');
       if (det) {
@@ -1858,33 +2134,47 @@ async function doDecrypt() {
       return;
     }
 
+    // -------- Bundle (.cboxbundle) path --------
     if (!name.endsWith(FILE_BUNDLE_EXT)) {
+      logWarn('[dec] unsupported file extension', { name });
       throw new EnvelopeError('input', 'unsupported');
     }
 
-    // Read ZIP and extract strict entries
     zipU8 = new Uint8Array(await f.arrayBuffer());
+    logInfo('[dec] zip bytes', { bytes: zipU8.length });
     entries = await extractZipEntriesStrict(zipU8);
+    logInfo('[dec] zip parsed', { entries: entries.length });
 
-    // Build an index for O(1) lookups and detect duplicates
+    // Build a name index and detect duplicates
     const byName = new Map(entries.map(e => [e.name, e]));
     if (byName.size !== entries.length) {
+      logWarn('[dec] duplicate entry names detected');
       throw new EnvelopeError('zip_dupe', 'Duplicate entry names in bundle');
     }
 
-    // Only allow the expected entry name patterns — reject any extra files.
+    // Only allow expected entry name patterns
     const allowed = [
       /^part-\d{6}\.cbox$/i,
       /^MANIFEST\.part-\d{6}\.cbox$/i,
       /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i
     ];
+    let unexpected = 0;
     for (const e of entries) {
-      if (!allowed.some(rx => rx.test(e.name))) {
-        throw new EnvelopeError('zip_extra', `Unexpected entry in bundle: ${e.name}`);
-      }
+      const ok = allowed.some(rx => rx.test(e.name));
+      if (!ok) unexpected++;
+    }
+    if (unexpected) {
+      logWarn('[dec] unexpected entries in ZIP', { unexpected });
+      throw new EnvelopeError('zip_extra', `Unexpected entry in bundle`);
     }
 
-    // We no longer need the raw ZIP buffer — free it early
+    // Count categories for logs
+    const countParts   = entries.filter(e=>/^part-\d{6}\.cbox$/i.test(e.name)).length;
+    const countMan     = entries.filter(e=>/^MANIFEST\.part-\d{6}\.cbox$/i.test(e.name)).length;
+    const countManIdx  = entries.filter(e=>/^MANIFEST_INDEX\.part-\d{6}\.cbox$/i.test(e.name)).length;
+    logInfo('[dec] entry categories', { dataParts: countParts, manifestParts: countMan, manifestIndexParts: countManIdx });
+
+    // Free raw ZIP buffer early
     try { zipU8.fill(0); } catch {}
     zipU8 = null;
 
@@ -1892,87 +2182,84 @@ async function doDecrypt() {
     const idxEntries = entries
       .filter(e => /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i.test(e.name))
       .sort((a, b) => a.name.localeCompare(b.name));
-    
+    logInfo('[dec] idxEntries', { count: idxEntries.length });
+
     let expectedBundleId = null; // learned from first MANIFEST_INDEX part
-    
     if (idxEntries.length === 0) {
+      logWarn('[dec] no manifest index');
       throw new EnvelopeError('no_manifest_index', 'Manifest index missing');
     }
-    
+
     // Decrypt & rebuild the index buffer
     let idxLen = null;
     const idxSlices = [];
-    
     for (let i = 0; i < idxEntries.length; i++) {
       const opened = await openFixedChunk({ password, bytes: idxEntries[i].bytes });
 
-      // Learn bundleId from the first index part; enforce on the rest
       const bi = opened.meta && opened.meta.bundleId;
       if (i === 0) {
         if (typeof bi !== 'string' || bi.length === 0) {
+          logWarn('[dec] bundleId missing on index part 0');
           throw new EnvelopeError('bundle_missing', 'Missing bundleId');
         }
         expectedBundleId = bi;
+        logInfo('[dec] learned bundleId for index', { bundleIdPrefix: String(bi).slice(0, 8) });
       } else {
         if (bi !== expectedBundleId) {
+          logWarn('[dec] mixed bundleId in index', { i });
           throw new EnvelopeError('bundle_mix', 'Mixed bundleId across manifest index parts');
         }
       }
 
-      const inner  = opened.innerMeta;
-    
-      // Strict structural checks
-      if (inner.kind !== 'fixed') {
-        throw new EnvelopeError('idx_part', `Manifest index part ${i}: unexpected type`);
-      }
-      if (inner.chunkIndex !== i) {
-        throw new EnvelopeError('idx_part', `Manifest index part ${i}: wrong index`);
-      }
-      if (inner.totalChunks !== idxEntries.length) {
-        throw new EnvelopeError('idx_part', `Manifest index part ${i}: totalChunks mismatch`);
-      }
-    
+      const inner = opened.innerMeta;
+      logInfo('[dec] index part meta', { i, kind: inner.kind, idx: inner.chunkIndex, total: inner.totalChunks, totalPlainLen: inner.totalPlainLen });
+
+      if (inner.kind !== 'fixed') throw new EnvelopeError('idx_part', `Manifest index part ${i}: unexpected type`);
+      if (inner.chunkIndex !== i) throw new EnvelopeError('idx_part', `Manifest index part ${i}: wrong index`);
+      if (inner.totalChunks !== idxEntries.length) throw new EnvelopeError('idx_part', `Manifest index part ${i}: totalChunks mismatch`);
+
       if (idxLen === null) {
         idxLen = inner.totalPlainLen | 0;
         if (!Number.isFinite(idxLen) || idxLen < 0) {
+          logWarn('[dec] invalid manifest index length', { idxLen });
           throw new EnvelopeError('bad_manifest_index', 'Invalid manifest index length');
         }
       }
-    
+
       const isLast   = (i === idxEntries.length - 1);
-      const sliceEnd = isLast
-        ? (idxLen - (FIXED_CHUNK_SIZE * (idxEntries.length - 1)))
-        : FIXED_CHUNK_SIZE;
-    
+      const sliceEnd = isLast ? (idxLen - (FIXED_CHUNK_SIZE * (idxEntries.length - 1))) : FIXED_CHUNK_SIZE;
       if (sliceEnd < 0 || sliceEnd > FIXED_CHUNK_SIZE) {
+        logWarn('[dec] invalid index slice size', { i, sliceEnd });
         throw new EnvelopeError('idx_part', `Manifest index part ${i}: invalid slice size`);
       }
-    
+
       const slice = opened.fixedChunk.subarray(0, sliceEnd);
-      // Copy out so we can wipe the worker buffer
       const copy  = new Uint8Array(slice.length);
       copy.set(slice);
       idxSlices.push(copy);
-    
-      // Best-effort wipe
+
       try { opened.fixedChunk.fill(0); } catch {}
     }
-    
-    // Stitch the slices into a single buffer
+
     const idxBuf = new Uint8Array(idxLen);
     let offset = 0;
     for (const s of idxSlices) { idxBuf.set(s, offset); offset += s.length; }
-    
+
     let manIndex;
     try {
       manIndex = JSON.parse(TD.decode(idxBuf));
-    } catch {
+      logInfo('[dec] parsed manifest index', {
+        kind: manIndex?.kind,
+        totalChunks: manIndex?.totalChunks,
+        totalLen: manIndex?.totalLen,
+        chunkSize: manIndex?.chunkSize
+      });
+    } catch (e) {
+      logError('[dec] index parse error', e);
       throw new EnvelopeError('index_parse', 'Malformed manifest index');
     } finally {
-      // Best-effort wipe of temporary index buffers
       try { idxBuf.fill(0); } catch {}
       for (const s of idxSlices) { try { s.fill(0); } catch {} }
-      // Drop references so GC can reclaim
       idxSlices.length = 0;
     }
 
@@ -1982,15 +2269,11 @@ async function doDecrypt() {
     const mSize  = manIndex.chunkSize|0;
     if (mSize !== FIXED_CHUNK_SIZE) throw new EnvelopeError('index_chunksize', 'Manifest chunk size mismatch');
 
-    // Sanity checks supplémentaires sur l'index
-    if (!Number.isFinite(mTotal) || mTotal <= 0) {
-      throw new EnvelopeError('index_total', 'Invalid manifest index totalChunks');
-    }
-    if (!Array.isArray(manIndex.chunkHashes) || manIndex.chunkHashes.length !== mTotal) {
-      throw new EnvelopeError('index_hashes', 'Manifest index chunkHashes mismatch');
-    }
+    if (!Number.isFinite(mTotal) || mTotal <= 0) throw new EnvelopeError('index_total', 'Invalid manifest index totalChunks');
+    if (!Array.isArray(manIndex.chunkHashes) || manIndex.chunkHashes.length !== mTotal) throw new EnvelopeError('index_hashes', 'Manifest index chunkHashes mismatch');
     for (let i = 0; i < manIndex.chunkHashes.length; i++) {
       if (!/^[0-9a-f]{64}$/i.test(manIndex.chunkHashes[i])) {
+        logWarn('[dec] invalid manifest index hash', { i });
         throw new EnvelopeError('index_hash', `Invalid index hash at ${i}`);
       }
     }
@@ -2000,7 +2283,7 @@ async function doDecrypt() {
     let mWritten = 0;
     for (let i = 0; i < mTotal; i++) {
       const entry = byName.get(`MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
-      if (!entry) throw new EnvelopeError('missing_manifest_part', `Manifest chunk ${i} missing`);
+      if (!entry) { logWarn('[dec] missing manifest part', { i }); throw new EnvelopeError('missing_manifest_part', `Manifest chunk ${i} missing`); }
 
       const opened = await openFixedChunk({
         password,
@@ -2008,14 +2291,13 @@ async function doDecrypt() {
         expectedBundleId
       });
 
-      // Enforce same bundleId across MANIFEST parts
       const bm = opened.meta && opened.meta.bundleId;
       if (bm !== expectedBundleId) {
+        logWarn('[dec] bundleId mismatch in manifest part', { i });
         throw new EnvelopeError('bundle_mismatch', `Manifest chunk ${i}: bundleId mismatch`);
       }
-      
-      const inner  = opened.innerMeta;
 
+      const inner  = opened.innerMeta;
       if (inner.kind !== 'fixed') throw new EnvelopeError('man_part_kind',  `Manifest chunk ${i}: unexpected type`);
       if (inner.chunkIndex !== i) throw new EnvelopeError('man_part_idx',   `Manifest chunk ${i}: wrong index`);
       if (inner.totalChunks !== mTotal) throw new EnvelopeError('man_part_total', `Manifest chunk ${i}: totalChunks mismatch`);
@@ -2027,8 +2309,8 @@ async function doDecrypt() {
 
       const h = await sha256Hex(slice);
       const expected = manIndex.chunkHashes[i];
-      
       if (!timingSafeEqual(h, expected)) {
+        logWarn('[dec] manifest hash mismatch', { i });
         throw new EnvelopeError('man_hash_mismatch', `Manifest chunk ${i}: unexpected hash`);
       }
 
@@ -2039,57 +2321,41 @@ async function doDecrypt() {
       setProgress(decBar, 10 + Math.floor(10 * (i + 1) / mTotal));
       if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
     }
-    if (mWritten !== mLen) throw new EnvelopeError('man_rebuild_size', 'Incorrect manifest reconstructed size');
+    if (mWritten !== mLen) { logWarn('[dec] manifest rebuild size mismatch', { mWritten, mLen }); throw new EnvelopeError('man_rebuild_size', 'Incorrect manifest reconstructed size'); }
 
     let manifest;
     try {
       manifest = JSON.parse(TD.decode(manifestRecovered));
-    } catch {
+      logInfo('[dec] parsed manifest', {
+        kind: manifest?.kind,
+        totalChunks: manifest?.totalChunks,
+        totalPlainLen: manifest?.totalPlainLen,
+        chunkSize: manifest?.chunkSize
+      });
+    } catch (e) {
+      logError('[dec] manifest parse error', e);
       throw new EnvelopeError('bad_manifest', 'Invalid manifest JSON');
     } finally {
-      // best-effort wipe of the reconstructed manifest buffer
       try { manifestRecovered.fill(0); } catch {}
     }
-    
-    // ===== Additional manifest sanity checks =====
-    if (manifest.kind !== 'manifest') {
-      throw new EnvelopeError('bad_manifest_kind', 'Unexpected manifest kind');
-    }
-    if (!Number.isFinite(manifest.totalChunks) || manifest.totalChunks <= 0) {
-      throw new EnvelopeError('bad_manifest_total', 'Invalid totalChunks');
-    }
-    if (!Number.isFinite(manifest.totalPlainLen) || manifest.totalPlainLen < 0) {
-      throw new EnvelopeError('bad_manifest_len', 'Invalid totalPlainLen');
-    }
-    if (manifest.chunkSize !== FIXED_CHUNK_SIZE) {
-      throw new EnvelopeError('bad_manifest_chunksize', 'Chunk size mismatch');
-    }
-    if (!Array.isArray(manifest.chunkHashes) || manifest.chunkHashes.length !== manifest.totalChunks) {
-      throw new EnvelopeError('bad_manifest_hashes', 'chunkHashes length mismatch');
-    }
-    // each chunk hash must be a 64-hex string (sha256 hex)
+
+    // Manifest sanity checks
+    if (manifest.kind !== 'manifest') throw new EnvelopeError('bad_manifest_kind', 'Unexpected manifest kind');
+    if (!Number.isFinite(manifest.totalChunks) || manifest.totalChunks <= 0) throw new EnvelopeError('bad_manifest_total', 'Invalid totalChunks');
+    if (!Number.isFinite(manifest.totalPlainLen) || manifest.totalPlainLen < 0) throw new EnvelopeError('bad_manifest_len', 'Invalid totalPlainLen');
+    if (manifest.chunkSize !== FIXED_CHUNK_SIZE) throw new EnvelopeError('bad_manifest_chunksize', 'Chunk size mismatch');
+    if (!Array.isArray(manifest.chunkHashes) || manifest.chunkHashes.length !== manifest.totalChunks) throw new EnvelopeError('bad_manifest_hashes', 'chunkHashes length mismatch');
     for (let i = 0; i < manifest.chunkHashes.length; i++) {
       if (!/^[0-9a-f]{64}$/i.test(manifest.chunkHashes[i])) {
+        logWarn('[dec] invalid hash in manifest', { i });
         throw new EnvelopeError('bad_hash', `Invalid hash at manifest index ${i}`);
       }
     }
-    // wholePlainHash present and well-formed
-    if (!/^[0-9a-f]{64}$/i.test(manifest.wholePlainHash || '')) {
-      throw new EnvelopeError('bad_whole_hash', 'Invalid wholePlainHash');
-    }
-    // optional: check source.files hygiene
-    if (manifest.source?.files) {
-      if (!Array.isArray(manifest.source.files)) throw new EnvelopeError('bad_source', 'Malformed source.files');
-      for (const f of manifest.source.files) {
-        if (typeof f?.name !== 'string' || f.name.includes('..') || f.name.startsWith('/') || f.name.includes('\\')) {
-          throw new EnvelopeError('bad_source_name', 'Suspicious file name in source');
-        }
-        if (!Number.isFinite(f.size) || f.size < 0) throw new EnvelopeError('bad_source_size', 'Invalid file size in source');
-      }
-    }
+    if (!/^[0-9a-f]{64}$/i.test(manifest.wholePlainHash || '')) throw new EnvelopeError('bad_whole_hash', 'Invalid wholePlainHash');
 
     // ---- 2) Validate indices (data parts) ----
     const { idxs, max } = validateIndexSetFromNames(entries);
+    logInfo('[dec] data index set', { count: idxs.length, max });
     if ((max + 1) !== manifest.totalChunks) throw new EnvelopeError('total_mismatch', 'totalChunks mismatch');
 
     // ---- 3) Decrypt and verify each data chunk ----
@@ -2099,7 +2365,7 @@ async function doDecrypt() {
 
     for (let i = 0; i < manifest.totalChunks; i++) {
       const entry = byName.get(`part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
-      if (!entry) throw new EnvelopeError('missing_part', `Chunk ${i} missing`);
+      if (!entry) { logWarn('[dec] missing data chunk', { i }); throw new EnvelopeError('missing_part', `Chunk ${i} missing`); }
 
       const opened = await openFixedChunk({
         password,
@@ -2107,14 +2373,13 @@ async function doDecrypt() {
         expectedBundleId
       });
 
-      // Enforce same bundleId across DATA parts
       const bd = opened.meta && opened.meta.bundleId;
       if (bd !== expectedBundleId) {
+        logWarn('[dec] bundleId mismatch in data part', { i });
         throw new EnvelopeError('bundle_mismatch', `Chunk ${i}: bundleId mismatch`);
       }
 
       const inner  = opened.innerMeta;
-
       if (inner.kind !== 'fixed') throw new EnvelopeError('part_kind',  `Chunk ${i}: unexpected type`);
       if (inner.chunkIndex !== i) throw new EnvelopeError('part_idx',   `Chunk ${i}: wrong internal index`);
       if (inner.totalChunks !== manifest.totalChunks)     throw new EnvelopeError('part_total', `Chunk ${i}: totalChunks mismatch`);
@@ -2126,8 +2391,8 @@ async function doDecrypt() {
 
       const h = await sha256Hex(slice);
       const expected = manifest.chunkHashes[i];
-
       if (!timingSafeEqual(h, expected)) {
+        logWarn('[dec] data hash mismatch', { i });
         throw new EnvelopeError('hash_mismatch', `Chunk ${i}: unexpected hash`);
       }
 
@@ -2139,17 +2404,66 @@ async function doDecrypt() {
       if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
     }
 
-    if (written !== manifest.totalPlainLen) throw new EnvelopeError('rebuild_size', 'Incorrect reconstructed size');
+    if (written !== manifest.totalPlainLen) {
+      logWarn('[dec] rebuilt total size mismatch', { written, expected: manifest.totalPlainLen });
+      throw new EnvelopeError('rebuild_size', 'Incorrect reconstructed size');
+    }
 
     // ---- 4) Verify whole-plaintext hash (silent in UI) ----
     const whole = await sha256Hex(recovered);
     const ok = timingSafeEqual(whole, manifest.wholePlainHash);
+    logInfo('[dec] whole hash check', { ok });
     setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
 
     // ---- 5) Render / download ----
-    await tryRenderOrDownload(recovered, '#decResults', '#decText');
+    let handled = false;
+    if (manifest?.source?.kind === 'files' && Array.isArray(manifest.source.files)) {
+      if (manifest.source.files.length === 1) {
+        // Single original file: restore original name + MIME
+        const meta0 = manifest.source.files[0] || {};
+        const safeName = String(meta0.name || 'file').replace(/[\/\\]/g, '');
+        const mime = meta0.type || 'application/octet-stream';
+        addDownload(
+          '#decResults',
+          new Blob([recovered], { type: mime }),
+          safeName,
+          'Download file'
+        );
+        handled = true;
+        logInfo('[dec] rendered single file download', { name: safeName, mime });
+      } else {
+        // Multi-file: you encrypted a ZIP at source -> return ZIP
+        addDownload(
+          '#decResults',
+          new Blob([recovered], { type: 'application/zip' }),
+          'files.zip',
+          'Download archive'
+        );
+        handled = true;
+        logInfo('[dec] rendered multi-file zip download');
+      }
+    }
+
+    if (!handled) {
+      // Fallback: render text/HTML if it looks like text; else generic download
+      const looksText = looksLikeUtf8Text(recovered);
+      logInfo('[dec] rendering generic', { looksText, bytes: recovered.length });
+      await tryRenderOrDownload(recovered, '#decResults', '#decText');
+    }
+
     setProgress(decBar, 100);
     setLive('Decryption complete.');
+    logInfo('[dec] success');
+
+    // Reveal results and hide progress container after success
+    try {
+      const decResults = document.getElementById('decResults');
+      const decTextEl  = document.getElementById('decText');
+      if (decResults) decResults.classList.remove('hidden');
+      if (decTextEl && (decTextEl.textContent || '').trim() !== '') decTextEl.hidden = false;
+      const decProgress = document.querySelector('#decBar')?.parentElement;
+      if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (done)'); }
+    } catch (e) { logWarn('[dec] results reveal warn', e); }
 
     const det = document.getElementById('decDetails');
     if (det) {
@@ -2159,37 +2473,63 @@ async function doDecrypt() {
       else det.querySelector('summary')?.focus();
       det.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }
-    try { $('#decFile').value = ''; setText('#decFileName',''); } catch {}
+
+    try { $('#decFile').value = ''; setText('#decFileName', ''); } catch {}
   } catch (err) {
-    logError(err);
+    // Log with extra metadata when possible
+    const meta = { name: (err && err.name) || null, code: (err && err.code) || null, msg: (err && err.message) || String(err) };
+    logError('[dec] failed', meta, err);
     await secureFail('Decryption');
     setProgress(decBar, 0);
     clearPasswords();
+    // always hide progress container on error
+    try {
+      const decProgress = document.querySelector('#decBar')?.parentElement;
+      if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (error)'); }
+    } catch (e) { logWarn('[dec] progress hide warn (error)', e); }
   } finally {
-    // ---- UI restore (anti double-clic) ----
+    // ---- UI restore (anti double-click) ----
     try {
       if (decryptBtn) {
         decryptBtn.disabled = !!prevDisabled;
         if (!prevDisabled) decryptBtn.removeAttribute('aria-disabled');
+        logInfo('[dec] btnDecrypt restored', { disabled: !!prevDisabled });
       }
-    } catch {}
-  
+    } catch (e) { logWarn('[dec] btn restore warn', e); }
+
+    // Ensure progress is hidden on any exit path
+    try {
+      const decProgress = document.querySelector('#decBar')?.parentElement;
+      if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (finally)'); }
+    } catch (e) { logWarn('[dec] progress hide warn (finally)', e); }
+
     // ---- Wipe encrypted chunk buffers (from ZIP or direct .cbox) ----
     try {
-      for (const e of entries || []) {
-        e?.bytes?.fill?.(0);
-      }
-    } catch {}
+      let wiped = 0;
+      for (const e of entries || []) { if (e?.bytes?.fill) { e.bytes.fill(0); wiped++; } }
+      logInfo('[dec] wiped encrypted buffers', { wiped });
+    } catch (e) { logWarn('[dec] wipe buffers warn', e); }
+
     // ---- Drop references so GC can reclaim ----
     entries = null;
-    
+
     // ---- Existing memory wipes ----
-    if (zipU8)     wipeBytes(zipU8);
-    if (recovered) wipeBytes(recovered);
+    if (zipU8)     { wipeBytes(zipU8); logInfo('[dec] wiped zipU8'); }
+    if (recovered) { logInfo('[dec] recovered bytes length', { bytes: recovered.length }); wipeBytes(recovered); logInfo('[dec] wiped recovered'); }
     zipU8 = null;
     recovered = null;
-  }
 
+    // Keep results visible only if there is content; otherwise keep hidden
+    try {
+      const decResults = document.getElementById('decResults');
+      const decTextEl  = document.getElementById('decText');
+      const resChildren = decResults ? decResults.childElementCount : 0;
+      const hasText = decTextEl ? ((decTextEl.textContent || '').trim() !== '') : false;
+      if (decResults && resChildren === 0) decResults.classList.add('hidden');
+      if (decTextEl && !hasText) decTextEl.hidden = true;
+      logInfo('[dec] final visibility', { resChildren, hasText });
+    } catch (e) { logWarn('[dec] final visibility warn', e); }
+  }
 }
 
 
@@ -2264,7 +2604,7 @@ function panicClear() {
     setText('#decIntegrity', '');
     setProgress(encBar, 0);
     setProgress(decBar, 0);
-    setLive('All local state cleared.');
+    setLive('All local state cleared. Decryption results removed.');
 
     for (const url of __urlsToRevoke) {
       try { URL.revokeObjectURL(url); } catch {}
@@ -2278,10 +2618,13 @@ function panicClear() {
 // --- Revoke any pending object URLs on pagehide/unload ---
 function revokeAllObjectURLsNow() {
   try {
+    let count = 0;
     for (const url of __urlsToRevoke) {
       try { URL.revokeObjectURL(url); } catch {}
+      count++;
     }
     __urlsToRevoke.clear();
+    logInfo && logInfo('[revokeAllObjectURLsNow] revoked all', { count });
   } catch {}
 }
 
@@ -2400,8 +2743,15 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#encPassword').addEventListener('input', (e) => renderStrength(e.target.value));
 
   // Panel clears
-  $('#btnClearEncrypt').addEventListener('click', resetEncryptUI);
-  $('#btnClearDecrypt').addEventListener('click', resetDecryptUI);
+  $('#btnClearEncrypt').addEventListener('click', () => {
+       resetEncryptUI();
+       setLive('Encryption UI cleared.');
+     });
+    
+  $('#btnClearDecrypt').addEventListener('click', () => {
+    resetDecryptUI();
+    setLive('Decryption UI cleared.');
+  });
 
   // Main actions
   $('#btnEncrypt').addEventListener('click', doEncrypt);

@@ -124,11 +124,14 @@
 
           <!-- Files content -->
           <div id="encPanelFiles" role="tabpanel" aria-labelledby="encTabFiles" hidden>
-            <div id="encDrop" class="drop" tabindex="0" role="button" aria-controls="encFiles" aria-label="Drop files to encrypt or press to browse">
-              <strong>Drag & drop files here</strong>
-              <span class="muted">or tap/click to select</span>
-              <input id="encFiles" type="file" multiple aria-label="Choose files to encrypt" hidden />
-            </div>
+	  <div id="encDrop" class="drop" tabindex="0" role="button"
+	    aria-controls="encFiles" aria-label="Drag & drop files or press to browse">
+	    <div class="drop-labels">
+	      <strong>Drag & drop files here</strong>
+	      <p class="muted">or tap/click to select</p>
+	    </div>
+	    <input id="encFiles" type="file" accept="*/*" multiple hidden>
+	  </div>
             <ul id="encFileList" class="muted"></ul>
           </div>
         </fieldset>
@@ -168,11 +171,18 @@
         <div class="row mt-8">
           <div>
             <label for="decFile">Envelope file</label>
-            <div id="decDrop" class="drop" tabindex="0" role="button" aria-controls="decFile" aria-label="Drop a .cbox or .cboxbundle file or press to browse">
-              <strong>Drop a .cbox / .cboxbundle</strong>
-              <span class="muted">or tap/click to select</span>
-              <input id="decFile" type="file" accept=".cbox,.cboxbundle" aria-label="Choose a .cbox or .cboxbundle file" hidden />
-            </div>
+	    <div id="decDrop" class="drop" tabindex="0" role="button"
+	        aria-controls="decFile"
+	        aria-label="Drop a .cbox or .cboxbundle file or press to browse">
+
+	      <div class="drop-labels">
+	        <strong>Drop a .cbox / .cboxbundle</strong>
+	        <p class="muted">or tap/click to select</p>
+	      </div>
+
+	      <input id="decFile" type="file" accept=".cbox,.cboxbundle"
+	        aria-label="Choose a .cbox or .cboxbundle file" hidden>
+	    </div>
             <div id="decFileName" class="muted"></div>
             <div id="decFileErr" class="muted status" role="status" aria-live="polite" aria-atomic="true"></div>
           </div>
@@ -190,17 +200,17 @@
 
           <details id="decDetails" class="muted">
             <summary>Results</summary>
-            <div id="decResults" class="row" role="status" aria-live="polite" aria-atomic="true"></div>
-            <pre id="decText" class="card"></pre>
+            <div id="decResults" class="row hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+            <pre id="decText" class="card" hidden></pre>
             <div id="decIntegrity" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
-          </details>
+          </details>          
         </div>
       </section>
     </main>
 
     <!-- ================= Footer ================= -->
     <footer>
-      <p>All encryption runs locally in your browser. No data ever leaves your device.</p>
+      <p class="trust-message">All encryption runs locally in your browser. No data ever leaves your device.</p>
     </footer>
   </div>
 </body>
