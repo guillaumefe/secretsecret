@@ -1,0 +1,63 @@
+// Strict worker: meant to succeed without 'wasm-unsafe-eval'.
+// Served with CSP equivalent to the page (no blob:, no eval).
+// If a platform requires 'wasm-unsafe-eval', the main app will fall back
+// to /argon-worker-permissive.js instead.
+
+let loaded = false;
+
+// Prefer explicit same-origin paths.
+self.Module = self.Module || {};
+self.Module.locateFile = (path) =>
+  path.endsWith('.wasm') ? '/argon2.wasm' : path;
+
+self.onmessage = async (e) => {
+  const { cmd, payload } = e.data || {};
+  try {
+    if (cmd === 'init') {
+      // Import the Argon2 glue (uses WebAssembly.instantiateStreaming if available).
+      importScripts('/argon2-bundled.min.js');
+
+      // Probe: one short hash just to ensure WASM is ready.
+      const salt = new Uint8Array(16);
+      const pass = new Uint8Array(1);
+      const res = await self.argon2.hash({
+        pass,
+        salt,
+        time: 1,
+        mem: 32 * 1024,
+        hashLen: 32,
+        parallelism: 1,
+        type: self.argon2.ArgonType.Argon2id
+      });
+      if (!res || !res.hash) throw new Error('Probe failed');
+      salt.fill(0); pass.fill(0);
+      loaded = true;
+      self.postMessage({ ok: true, cmd: 'init' });
+      return;
+    }
+
+    if (cmd === 'kdf') {
+      if (!loaded) throw new Error('Argon2 not loaded');
+      const { passBytes, salt, mMiB, t, p } = payload;
+      const res = await self.argon2.hash({
+        pass: new Uint8Array(passBytes),
+        salt: new Uint8Array(salt),
+        time: t,
+        mem: mMiB * 1024,
+        hashLen: 32,
+        parallelism: p,
+        type: self.argon2.ArgonType.Argon2id
+      });
+      const out = new Uint8Array(res.hash);
+      try { new Uint8Array(passBytes).fill(0); } catch {}
+      try { new Uint8Array(salt).fill(0); } catch {}
+      self.postMessage({ ok: true, cmd: 'kdf', key: out }, [ out.buffer ]);
+      // no self.close(): let the main thread terminate after transfer
+      return;
+    }
+
+    self.postMessage({ ok:false, error:'Unknown command' });
+  } catch(err){
+    self.postMessage({ ok:false, error: (err && err.message) || String(err) });
+  }
+};
