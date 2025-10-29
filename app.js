@@ -1133,28 +1133,39 @@ let wordlist    = null;
  */
 async function loadWordlist() {
   try {
-    // Use the bundled words directly (no network fetch, supply-chain risk reduced)
-    const tmp = [];
+    const res = await fetch(WORDLIST_PATH);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    let txt = await res.text();
+
+    // Enlève un éventuel BOM
+    if (txt.charCodeAt(0) === 0xFEFF) txt = txt.slice(1);
+
+    const tmp  = [];
     const seen = new Set();
 
-    // WORDS expected to be an array of words (strings).
-    // We still defensively normalize & dedupe in case the build artifact varies.
-    for (const raw of WORDS) {
-      if (typeof raw !== 'string') continue;
-      const tok = raw.normalize('NFKC').toLowerCase().trim();
-      if (!tok) continue;
-      if (!seen.has(tok)) { seen.add(tok); tmp.push(tok); }
+    for (const rawLine of txt.split(/\r?\n/)) {
+      let line = rawLine.trim();
+      if (!line) continue;
+      if (line.startsWith('#')) continue; // tolère commentaires
+
+      // EFF: "12345  word"  → garde la 2e colonne si présente
+      // Sinon: "word"
+      const m = line.match(/^(?:\d{5}\s+)?(.+)$/);
+      if (!m) continue;
+
+      const word = m[1].normalize('NFKC').toLowerCase().trim();
+      if (!word) continue;
+
+      if (!seen.has(word)) { seen.add(word); tmp.push(word); }
     }
 
-    // Same validation as before
     if (tmp.length < 2048) throw new Error('wordlist too small');
 
-    wordlist = tmp;
-    __WORDSET__ = new Set(wordlist);
-    __WORDLOG2__ = Math.log2(Math.max(1, wordlist.length));
+    wordlist     = tmp;
+    __WORDSET__  = new Set(tmp);
+    __WORDLOG2__ = Math.log2(tmp.length);
   } catch (e) {
-    // Graceful degradation — keep the app usable without generator/strength hints
-    logWarn('Bundled wordlist unavailable, generator/strength will degrade:', e);
+    logWarn('Wordlist load failed:', e);
     wordlist = null;
     __WORDSET__ = undefined;
     __WORDLOG2__ = undefined;
@@ -1390,12 +1401,6 @@ async function init() {
       if (be) { be.setAttribute('aria-disabled','true'); be.disabled = true; }
       if (bd) { bd.setAttribute('aria-disabled','true'); bd.disabled = true; }
       return;
-    }
-
-    try {
-      WORDS = (await import('./eff_large_wordlist.json', { with: { type: 'json' } })).default;
-    } catch {
-      WORDS = await (await fetch(new URL('./eff_large_wordlist.json', import.meta.url))).json();
     }
 
     await loadWordlist();
