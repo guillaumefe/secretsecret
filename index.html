@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <!-- ================= Document & metadata ================= -->
+  <meta charset="utf-8" />
+  <title>Secret Secret</title>
+
+  <!--
+    Security note:
+    - Prefer server-provided headers. Meta-based CSP is a fallback.
+    - This page is intended to run under a strict CSP:
+      • No inline/eval/blob/data (for scripts).
+      • Web Worker must be same-origin (see ./argon-worker*.js).
+      • Trusted Types required for scripts.
+  -->
+    <meta http-equiv="Content-Security-Policy" content="
+      default-src 'self';
+      script-src 'self';
+      script-src-attr 'none';
+      worker-src 'self';
+      style-src 'self';
+      style-src-attr 'none';
+      img-src 'self' data:;
+      font-src 'self';
+      connect-src 'self';
+      frame-src 'none';
+      object-src 'none';
+      base-uri 'none';
+      form-action 'self';
+      frame-ancestors 'none';
+      require-trusted-types-for 'script';
+      trusted-types default worker-url;
+
+
+
+    ">
+
+
+  <!-- Viewport & privacy -->
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+
+  <!-- ================= Static assets ================= -->
+  <link rel="icon" href="./favicon.ico">
+  <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png">
+  <link rel="icon" type="image/png" sizes="64x64" href="./favicon-64.png">
+  <link rel="icon" type="image/png" sizes="128x128" href="./favicon-128.png">
+
+  <!-- ================= Styles ================= -->
+  <link rel="stylesheet" href="./styles.css" />
+
+  <!-- ================= App script ================= -->
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <!-- ================= Keyboard skip link ================= -->
+  <a class="skip" href="#main">Skip to content</a>
+
+  <div class="wrap">
+    <!-- ================= Header ================= -->
+    <header>
+      <div class="brand" aria-label="Secret Secret">
+        <div class="logo" aria-hidden="true"></div>
+        <h1 id="title">Secret Secret</h1>
+      </div>
+
+      <div class="meta">
+        <!-- Live region for short status updates set by JS -->
+        <span id="liveInfo" class="muted" role="status" aria-live="polite" aria-atomic="true">Ready</span>
+        <!-- Jank badge appears when long tasks are detected -->
+        <span id="lagBadge" class="badge-warn" hidden aria-live="polite">⚠️ Slow…</span>
+        <!-- Optional: cancel auto-tune/benchmark (JS hides/shows it) -->
+        <button id="btnCancelBench" class="btn secondary" type="button" hidden>Cancel test</button>
+        <!-- Panic button clears all local state and revokes object URLs -->
+        <button id="btnPanic" class="btn secondary" type="button" aria-label="Clear all local state">Purge</button>
+      </div>
+    </header>
+
+    <!-- Error banner, hidden by default -->
+    <div id="errBanner" class="banner error" role="alert" hidden></div>
+
+    <!-- ================= Main ================= -->
+    <main id="main" class="card" aria-labelledby="title">
+      <!-- Mode switch (segmented control as tabs) -->
+      <div class="row" role="tablist" aria-label="Mode">
+        <div class="seg">
+          <button id="tabEncrypt" class="btn" role="tab" aria-selected="true" tabindex="0" aria-controls="panelEncrypt">Encrypt</button>
+          <button id="tabDecrypt" class="btn" role="tab" aria-selected="false" tabindex="-1" aria-controls="panelDecrypt">Decrypt</button>
+        </div>
+      </div>
+
+      <!-- ===== Panel: Encrypt ===== -->
+      <section id="panelEncrypt" role="tabpanel" aria-labelledby="tabEncrypt">
+        <div class="row">
+          <div>
+            <label for="encPassword">Passphrase</label>
+            <div class="input-actions" aria-describedby="passHelp">
+              <input id="encPassword" type="password" inputmode="text" autocomplete="new-password" aria-describedby="pwdStrength passHelp" />
+              <button id="encPwdToggle" class="btn secondary" type="button" aria-pressed="false" aria-controls="encPassword" aria-label="Toggle passphrase visibility">Show</button>
+              <button id="encPwdGen" class="btn secondary" type="button">Generate</button>
+            </div>
+            <div id="passHelp" class="muted">Use a 4+ word phrase or 16+ characters.</div>
+            <div class="inline muted">
+              <div id="pwdStrength" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
+            </div>
+          </div>
+        </div>
+
+        <fieldset class="row mt-8">
+          <legend>Content</legend>
+          <!-- Content type (text vs files) -->
+          <div class="row" role="tablist" aria-label="Content type">
+            <div class="seg w-max">
+              <button id="encTabText"  class="btn" role="tab" aria-selected="true"  tabindex="0"  aria-controls="encPanelText">Text</button>
+              <button id="encTabFiles" class="btn" role="tab" aria-selected="false" tabindex="-1" aria-controls="encPanelFiles">Files</button>
+            </div>
+          </div>
+
+          <!-- Text content -->
+          <div id="encPanelText" role="tabpanel" aria-labelledby="encTabText">
+            <label for="encText">Text to encrypt</label>
+            <textarea id="encText" placeholder="Paste or type your text…"></textarea>
+          </div>
+
+          <!-- Files content -->
+          <div id="encPanelFiles" role="tabpanel" aria-labelledby="encTabFiles" hidden>
+            <div id="encDrop" class="drop" tabindex="0" role="button" aria-controls="encFiles" aria-label="Drop files to encrypt or press to browse">
+              <strong>Drag & drop files here</strong>
+              <span class="muted">or tap/click to select</span>
+              <input id="encFiles" type="file" multiple aria-label="Choose files to encrypt" hidden />
+            </div>
+            <ul id="encFileList" class="muted"></ul>
+          </div>
+        </fieldset>
+
+        <!-- Sticky actions -->
+        <div class="actionbar">
+          <div class="buttons">
+            <button id="btnEncrypt" class="btn primary" type="button" disabled aria-disabled="true">Encrypt</button>
+            <button id="btnClearEncrypt" class="btn secondary" type="button">Clear</button>
+          </div>
+
+          <div class="progress mt-10" aria-label="Encryption progress">
+            <div id="encBar" class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+          </div>
+
+          <!-- Results container (revealed by JS) -->
+          <div id="encOutputs" class="row hidden">
+            <div id="encResults" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="encHash" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="encPlainHash" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ===== Panel: Decrypt ===== -->
+      <section id="panelDecrypt" role="tabpanel" aria-labelledby="tabDecrypt" hidden>
+        <div class="row">
+          <div>
+            <label for="decPassword">Passphrase</label>
+            <div class="input-actions">
+              <input id="decPassword" type="password" inputmode="text" autocomplete="current-password" />
+              <button id="decPwdToggle" class="btn secondary" type="button" aria-pressed="false" aria-controls="decPassword" aria-label="Toggle passphrase visibility">Show</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="row mt-8">
+          <div>
+            <label for="decFile">Envelope file</label>
+            <div id="decDrop" class="drop" tabindex="0" role="button" aria-controls="decFile" aria-label="Drop a .cbox or .cboxbundle file or press to browse">
+              <strong>Drop a .cbox / .cboxbundle</strong>
+              <span class="muted">or tap/click to select</span>
+              <input id="decFile" type="file" accept=".cbox,.cboxbundle" aria-label="Choose a .cbox or .cboxbundle file" hidden />
+            </div>
+            <div id="decFileName" class="muted"></div>
+            <div id="decFileErr" class="muted status" role="status" aria-live="polite" aria-atomic="true"></div>
+          </div>
+        </div>
+
+        <div class="actionbar">
+          <div class="buttons">
+            <button id="btnDecrypt" class="btn primary" type="button" disabled aria-disabled="true">Decrypt</button>
+            <button id="btnClearDecrypt" class="btn secondary" type="button">Clear</button>
+          </div>
+
+          <div class="progress mt-10" aria-label="Decryption progress">
+            <div id="decBar" class="bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+          </div>
+
+          <details id="decDetails" class="muted">
+            <summary>Results</summary>
+            <div id="decResults" class="row" role="status" aria-live="polite" aria-atomic="true"></div>
+            <pre id="decText" class="card"></pre>
+            <div id="decIntegrity" class="status" role="status" aria-live="polite" aria-atomic="true"></div>
+          </details>
+        </div>
+      </section>
+    </main>
+
+    <!-- ================= Footer ================= -->
+    <footer>
+      <p>All encryption runs locally in your browser. No data ever leaves your device.</p>
+    </footer>
+  </div>
+</body>
+</html>
