@@ -6,16 +6,23 @@
 let loaded = false;
 
 // Prefer explicit same-origin paths.
+// Will be finalized on 'init' using the wasmURL provided by the main app.
 self.Module = self.Module || {};
-self.Module.locateFile = (path) =>
-  path.endsWith('.wasm') ? '/argon2.wasm' : path;
 
 self.onmessage = async (e) => {
   const { cmd, payload } = e.data || {};
   try {
     if (cmd === 'init') {
+      // Allow main thread to pass explicit URLs; fall back to defaults.
+      const jsURL   = (payload && payload.jsURL)   || '/argon2-bundled.min.js';
+      const wasmURL = (payload && payload.wasmURL) || '/argon2.wasm';
+
+      // Point the Emscripten loader at the correct WASM path.
+      self.Module.locateFile = (path) =>
+        path.endsWith('.wasm') ? wasmURL : path;
+
       // Import the Argon2 glue (uses WebAssembly.instantiateStreaming if available).
-      importScripts('/argon2-bundled.min.js');
+      importScripts(jsURL);
 
       // Probe: one short hash just to ensure WASM is ready.
       const salt = new Uint8Array(16);
