@@ -7,7 +7,8 @@ let __WORDSET__ = undefined;
 let __WORDLOG2__ = undefined;
 
 // File and chunking
-const MAX_INPUT_BYTES   = 100 * 1024 * 1024;        // 100 MiB bound for input payload
+const MAX_INPUT_BYTES   = 512 * 1024 * 1024;        // 512 MiB bound for ZIP extraction DoS guard
+const MAX_BUNDLE_BYTES = MAX_INPUT_BYTES; 
 const FIXED_CHUNK_SIZE  = 4 * 1024 * 1024;          // 4 MiB fixed-size chunks
 const FILE_BUNDLE_EXT   = '.cboxbundle';
 const FILE_SINGLE_EXT   = '.cbox';
@@ -22,7 +23,8 @@ const ARGON_MAX_MIB      = 1024;
 const ARGON_MIN_T        = 3;
 const ARGON_MAX_T        = 10;
 
-
+// Max amount of text we render directly in the UI (1 MiB)
+const MAX_PREVIEW = 1 * 1024 * 1024;
 
 // ===== Utilities =====
 
@@ -54,8 +56,24 @@ function wipeBytes(u8) {
 /**
  * Revoke an object URL soon (after downloads start).
  */
-function revokeSoon(url) {
-  try { setTimeout(() => URL.revokeObjectURL(url), 1500); } catch {}
+function revokeSoon(url, delay = 1500) {
+  try {
+    if (!url) return;
+    // If we track URLs, skip scheduling if it's already been removed (defense-in-depth).
+    try {
+      if (__urlsToRevoke && typeof __urlsToRevoke.has === 'function' && !__urlsToRevoke.has(url)) {
+        // ensure it's not lying around
+        try { __urlsToRevoke.delete(url); } catch {}
+        return;
+      }
+    } catch {}
+
+    const tid = setTimeout(() => {
+      try { URL.revokeObjectURL(url); } catch {}
+      try { __urlsToRevoke && __urlsToRevoke.delete && __urlsToRevoke.delete(url); } catch {}
+      try { clearTimeout(tid); } catch {}
+    }, delay);
+  } catch {}
 }
 
 /**
@@ -93,6 +111,14 @@ const DEBUG = location.hostname === 'localhost';
 function logError(...args) { if (DEBUG) { try { console.error(...args); } catch {} } }
 function logWarn (...args) { if (DEBUG) { try { console.warn (...args); } catch {} } }
 function logInfo (...args) { if (DEBUG) { try { console.info (...args); } catch {} } }
+function userError(msg) {
+  alert(msg || 'An unexpected error occurred.');
+}
+function handleOpError(ctx, err) {
+  if (DEBUG) { console.error(`[${ctx}]`, err); }
+  // Neutral and consistent UX message (no sensitive leak)
+  userError(`${ctx} failed or file is corrupted.`);
+}
 
 /**
  * Clear password inputs and strength readout for hygiene.
@@ -100,7 +126,7 @@ function logInfo (...args) { if (DEBUG) { try { console.info (...args); } catch 
 function clearPasswords() {
   try { $('#encPassword').value = ''; } catch {}
   try { $('#decPassword').value = ''; } catch {}
-  try { $('#pwdStrength').textContent = ''; } catch {}
+  try { setText('#pwdStrength', ''); } catch {}
 }
 
 /**
@@ -123,6 +149,66 @@ function randU32() { return crypto.getRandomValues(new Uint32Array(1))[0]; }
 function b64 (u8) { return bytesToBase64(u8); }
 function b64d(s)  { return base64ToBytes(s); }
 
+/**
+ * Detect basic device capabilities
+ */
+function deviceProfile() {
+  const cores = navigator.hardwareConcurrency || 2;
+  const memGiB = navigator.deviceMemory || 4; // Approximation
+  const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
+  return { cores, memGiB, isMobile };
+}
+
+/**
+ * Choose safe limits based on device capabilities
+ */
+function chooseCaps() {
+  const { cores, memGiB, isMobile } = deviceProfile();
+
+  // Overall max input size
+  const maxInput = (isMobile || memGiB <= 4)
+    ? 64 * 1024 * 1024       // Low-end device
+    : (memGiB <= 8)
+      ? 128 * 1024 * 1024    // Mid-range device
+      : 256 * 1024 * 1024;   // Desktop / high-end laptop
+
+  // Argon2 auto-tuning limits
+  const minMemMiB = (isMobile || memGiB <= 4) ? 64 : 128;
+  const maxMemMiB = (isMobile || memGiB <= 4) ? 256 : 512;
+  const maxParallel = Math.min(HEALTHY_P_MAX, Math.max(1, Math.floor(cores / 2)));
+
+  return { maxInput, minMemMiB, maxMemMiB, maxParallel };
+}
+
+
+
+// ===== Trusted Types Safe DOM Helpers =====
+
+/**
+ * Remove all child nodes from an element.
+ */
+function clearNode(selOrEl) {
+  const el = (typeof selOrEl === 'string')
+    ? document.querySelector(selOrEl)
+    : selOrEl;
+  if (!el) return;
+  if (typeof el.replaceChildren === 'function') {
+    el.replaceChildren();
+  } else {
+    while (el.firstChild) el.removeChild(el.firstChild);
+  }
+}
+
+/**
+ * Set plain text content on an element safely (no HTML interpretation).
+ */
+function setText(selOrEl, text) {
+  const el = (typeof selOrEl === 'string')
+    ? document.querySelector(selOrEl)
+    : selOrEl;
+  if (el) el.textContent = text ?? '';
+}
+
 
 
 // ===== Errors =====
@@ -142,7 +228,7 @@ class EnvelopeError extends Error {
  * Update live region with status text.
  */
 function setLive(msg) {
-  const el = $('#liveInfo'); if (el) el.textContent = msg;
+  const el = $('#liveInfo'); if (el) setText(el, msg);
 }
 
 /**
@@ -194,8 +280,15 @@ function addDownload(containerSel, blob, filename, label) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'btn secondary';
-  btn.textContent = label || ('Download ' + filename);
-  btn.onclick = () => { a.click(); revokeSoon(url); };
+  setText(btn, label || ('Download ' + filename));
+  btn.onclick = () => { 
+    a.click(); 
+    // Revoke the URL right after the download has started
+    requestAnimationFrame(() => {
+      try { URL.revokeObjectURL(url); } catch {}
+      try { __urlsToRevoke.delete(url); } catch {}
+    });
+  };
 
   container.appendChild(btn);
   container.appendChild(a);
@@ -221,38 +314,128 @@ async function sha256Hex(u8) {
   return Array.from(b).map(x => x.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * Timing-safe comparison of two equal-length Uint8Array or hex strings.
+ * Returns true only if all bytes match.
+ */
+function timingSafeEqual(a, b) {
+  if (typeof a === 'string' && typeof b === 'string') {
+    if (a.length !== b.length) return false;
+    let out = 0;
+    for (let i = 0; i < a.length; i++) out |= (a.charCodeAt(i) ^ b.charCodeAt(i));
+    return out === 0;
+  }
+  if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array)) return false;
+  if (a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) out |= (a[i] ^ b[i]);
+  return out === 0;
+}
+
 
 
 // ===== Worker selection (strict vs permissive) =====
-
-/*
-  We prefer a strict worker (./argon-worker.js).
-  If initialization fails (likely due to missing 'wasm-unsafe-eval' for that platform’s WASM engine),
-  we fallback to ./argon-worker-permissive.js, which must be served with a CSP that adds:
-    script-src 'self' 'wasm-unsafe-eval'
-  Only that worker should get the relaxed directive — never the page.
-*/
+//
+// Production-safe policy (no user/manual toggles):
+//  - Always attempt the strict worker first (./argon-worker.js).
+//  - Only auto-fallback to the permissive worker (./argon-worker-permissive.js)
+//    when the strict worker fails *for reasons that strongly indicate* a CSP
+//    or WebAssembly-engine restriction.
+//  - There are no query flags, globals, or switches to force permissive mode.
+//  - This makes permissive mode effectively "break-glass by environment":
+//      it activates only when the runtime truly cannot run the strict worker.
+//
+// Security notes:
+//  - Keep the page’s CSP strict. Serve a *relaxed CSP only on the permissive worker file*.
+//  - Keep your Trusted Types policy whitelisting only these script URLs:
+//      /app.js, /argon-worker.js, /argon-worker-permissive.js, /argon2-bundled.min.js
+//  - This ensures permissive mode is possible *only* as a last-resort on devices
+//    where strict WASM cannot initialize, and cannot be enabled intentionally.
 
 /**
- * Start an Argon2 worker and wait for its init probe. Reject on timeout or load error.
+ * Heuristic: identify errors typically caused by CSP/WASM restrictions.
+ * We only consider permissive fallback on these failures.
  */
+function looksLikeWasmCspError(err) {
+  const msg = String((err && (err.message || err)) || '').toLowerCase();
+  const name = (err && err.name) || '';
+  return (
+    msg.includes('wasm-unsafe-eval') ||
+    msg.includes('content security policy') ||
+    (msg.includes('webassembly') && (msg.includes('blocked') || msg.includes('not permitted') || msg.includes('disallow'))) ||
+    (msg.includes('compile') && msg.includes('wasm')) ||
+    msg.includes('disallowed by embedder') ||     // + Safari/Chromium variants
+    msg.includes('code generation') ||            // + “Wasm code generation …”
+    name === 'SecurityError' ||
+    name === 'DOMException'
+  );
+}
+
 async function startArgonWorker(url) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const w = new Worker(url);
+    let w;
+    try {
+      // Trusted Types policy for Worker script URLs
+      const workerPolicy = (window.trustedTypes && trustedTypes.createPolicy('worker-url', {
+        createScriptURL: (u) => {
+          const abs = new URL(u, location.href);
+          // Allow only same-origin + specific worker script files
+          const okOrigin = abs.origin === location.origin;
+          const okPath =
+            abs.pathname.endsWith('/argon-worker.js') ||
+            abs.pathname.endsWith('/argon-worker-permissive.js');
+          if (!okOrigin || !okPath) {
+            throw new TypeError('Rejected Worker ScriptURL');
+          }
+          return abs.toString();
+        }
+      })) || { createScriptURL: (u) => u }; // Fallback when Trusted Types is unavailable
+ 
+      w = new Worker(workerPolicy.createScriptURL(url));
+    } catch (syncErr) {
+      // CSP/TT/URL can block synchronously
+      reject(syncErr);
+      return;
+    }
+
     const to = setTimeout(() => {
-      if (!settled) { settled = true; try { w.terminate(); } catch {} ; reject(new Error('worker_init_timeout')); }
+      if (!settled) {
+        settled = true;
+        try { w.terminate(); } catch {}
+        reject(new Error('worker_init_timeout'));
+      }
     }, 10000);
 
-    w.onmessage = (e) => {
+    const onMsg = (e) => {
       const d = e.data || {};
       if (d.cmd === 'init') {
         clearTimeout(to);
+        w.removeEventListener('message', onMsg);
         if (!settled) { settled = true; resolve(w); }
       }
     };
+
+    w.addEventListener('message', onMsg);
+
     w.onerror = (e) => {
-      if (!settled) { settled = true; clearTimeout(to); try { w.terminate(); } catch {} ; reject(e); }
+      if (!settled) {
+        settled = true;
+        clearTimeout(to);
+        try { w.terminate(); } catch {}
+        const err = (e && e.error) || new Error(e && e.message ? e.message : 'worker_error');
+        reject(err);
+      }
+    };
+
+    // Optionnel : capturer les erreurs de désérialisation de message
+    w.onmessageerror = (e) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(to);
+        try { w.terminate(); } catch {}
+        reject(new Error('worker_message_error'));
+      }
     };
 
     w.postMessage({ cmd: 'init', payload: { jsURL: ARGON2_JS_PATH, wasmURL: ARGON2_WASM_PATH } });
@@ -260,13 +443,33 @@ async function startArgonWorker(url) {
 }
 
 /**
- * Attempt strict worker, fallback to permissive worker if strict init fails.
+ * Attempt strict worker first; auto-fallback to permissive only when strictly necessary.
  */
 async function getArgonWorker() {
   try {
-    return await startArgonWorker('./argon-worker.js');       // strict
-  } catch {
-    return await startArgonWorker('./argon-worker-permissive.js'); // permissive
+    return await startArgonWorker('./argon-worker.js'); // strict
+  } catch (err) {
+    // If it doesn't look like a CSP/WASM capability failure, permissive won't help.
+    if (!looksLikeWasmCspError(err)) {
+      throw err;
+    }
+
+    // Last-chance: try permissive worker (served with its own relaxed CSP).
+    // No flags or query params control this: it's purely environmental.
+    try {
+      console.warn('[argon2] Strict worker blocked by CSP/WASM; attempting permissive worker…');
+      return await startArgonWorker('./argon-worker-permissive.js');
+    } catch (err2) {
+      // If permissive also fails, surface the original context + secondary error.
+      const combo = new Error(
+        'permissive_fallback_failed: strict=' +
+        String(err && (err.message || err)) +
+        '; permissive=' +
+        String(err2 && (err2.message || err2))
+      );
+      combo.name = 'WorkerFallbackError';
+      throw combo;
+    }
   }
 }
 
@@ -408,8 +611,8 @@ function cooldownButton(btnSel, ms) {
   btn.disabled = true;
   let left = Math.ceil(ms / 1000);
   const id = setInterval(() => {
-    btn.textContent = `${saved} (${left--}s)`;
-    if (left < 0) { clearInterval(id); btn.disabled = false; btn.textContent = saved; }
+    setText(btn, `${saved} (${left--}s)`);
+    if (left < 0) { clearInterval(id); btn.disabled = false; setText(btn, saved); }
   }, 1000);
 }
 
@@ -518,15 +721,24 @@ async function openFixedChunk({ password, bytes }) {
   if (metaEnd > bytes.length) throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
 
   const metaBytes = bytes.subarray(9, metaEnd);
+  if (metaBytes.length > 4096)
+    throw new EnvelopeError('meta_big', 'Metadata too large');
   let meta;
   try { meta = JSON.parse(TD.decode(metaBytes)); }
   catch { throw new EnvelopeError('meta_parse', 'Malformed metadata'); }
 
   const salt = b64d(meta.salt || '');
   const iv   = b64d(meta.iv || '');
+
+  if (salt.length !== 16) throw new EnvelopeError('salt_len', 'Bad salt length');
+  if (iv.length   !== 12) throw new EnvelopeError('iv_len',   'Bad IV length');
+  
   const k    = meta.kdf || {};
   if (k.kdf !== 'Argon2id') throw new EnvelopeError('kdf', 'Unsupported KDF');
   validateArgon({ mMiB: k.mMiB, t: k.t, p: k.p });
+
+  if (salt.length !== 16) throw new EnvelopeError('salt_len', 'Bad salt length');
+  if (iv.length   !== 12) throw new EnvelopeError('iv_len',   'Bad IV length');
 
   const keyBytes = await deriveArgon2id(password, salt, { mMiB: k.mMiB, t: k.t, p: k.p });
   const key      = await importAesKey(keyBytes);
@@ -658,11 +870,15 @@ async function extractZipEntriesStrict(u8) {
   let i = 0;
   const LIMIT = u8.length;
 
+  // DoS protection: cumulative uncompressed size limit
+  let totalDeclared = 0;
+  const LIMIT_TOTAL = (window.__MAX_INPUT_BYTES_DYNAMIC || MAX_BUNDLE_BYTES);
+
   while (i + 30 <= LIMIT) {
     const sig = readU32(dv, i);
-    if (sig !== 0x04034b50) break; // stop at first non-LFH
+    if (sig !== 0x04034b50) break;
 
-    const versionNeeded = readU16(dv, i + 4); // sanity only
+    const versionNeeded = readU16(dv, i + 4);
     const gpFlags       = readU16(dv, i + 6);
     const method        = readU16(dv, i + 8);
     const compSize      = readU32(dv, i + 18);
@@ -670,38 +886,55 @@ async function extractZipEntriesStrict(u8) {
     const nameLen       = readU16(dv, i + 26);
     const extraLen      = readU16(dv, i + 28);
 
-    // Reject data descriptors and non-store methods
-    if ((gpFlags & 0x0008) !== 0) throw new EnvelopeError('zip_dd',    'Data descriptor not allowed');
-    if (method !== 0)              throw new EnvelopeError('zip_method','Compression method not supported');
+    if ((gpFlags & 0x0008) !== 0)
+      throw new EnvelopeError('zip_dd', 'Data descriptor not allowed');
+    if (method !== 0)
+      throw new EnvelopeError('zip_method', 'Compression method not supported');
 
-    const headerLen = 30;
-    const nameStart = i + headerLen;
-    const nameEnd   = nameStart + nameLen;
-    const extraStart= nameEnd;
-    const extraEnd  = extraStart + extraLen;
-    const dataStart = extraEnd;
-    const dataEnd   = dataStart + compSize;
+    const headerLen  = 30;
+    const nameStart  = i + headerLen;
+    const nameEnd    = nameStart + nameLen;
+    const extraStart = nameEnd;
+    const extraEnd   = extraStart + extraLen;
+    const dataStart  = extraEnd;
+    const dataEnd    = dataStart + compSize;
 
-    // Bounds checks
-    if (nameLen === 0) throw new EnvelopeError('zip_noname','Entry without a name');
-    if (nameEnd > LIMIT || extraEnd > LIMIT || dataEnd > LIMIT) throw new EnvelopeError('zip_oob','Entry exceeds buffer');
-    if (compSize !== uncompSize) throw new EnvelopeError('zip_len','Store entry must have equal comp/uncomp sizes');
+    if (nameLen === 0)
+      throw new EnvelopeError('zip_noname', 'Entry without a name');
+    if (nameEnd > LIMIT || extraEnd > LIMIT || dataEnd > LIMIT)
+      throw new EnvelopeError('zip_oob', 'Entry exceeds buffer');
+    if (compSize !== uncompSize)
+      throw new EnvelopeError('zip_len', 'Store entry must have equal comp/uncomp sizes');
+
+    // DoS protection: reject oversized declared content
+    totalDeclared += uncompSize;
+    if (totalDeclared > LIMIT_TOTAL)
+      throw new EnvelopeError('zip_total', 'ZIP total size exceeds limit');
 
     const nameBytes = u8.subarray(nameStart, nameEnd);
     const name = TD.decode(nameBytes);
-    // Basic name hygiene
-    if (name.includes('..') || name.startsWith('/') || name.includes('\\')) throw new EnvelopeError('zip_path','Suspicious entry name');
+    if (name.includes('..') || name.startsWith('/') || name.includes('\\'))
+      throw new EnvelopeError('zip_path', 'Suspicious entry name');
 
     const data = u8.subarray(dataStart, dataEnd);
+
+    // CRC-32 verification (LFH)
+    const declaredCRC = readU32(dv, i + 14);
+    const actualCRC = crc32(data);
+    if (declaredCRC !== actualCRC) {
+      throw new EnvelopeError('zip_crc', 'CRC mismatch in ZIP entry');
+    }
+
     entries.push({ name, bytes: new Uint8Array(data) });
 
-    // Advance
     i = dataEnd;
-    // Hard stop guard: prevent looping over arbitrary junk
-    if (entries.length > 2000) throw new EnvelopeError('zip_toomany','Too many entries');
+    if (entries.length > 2000)
+      throw new EnvelopeError('zip_toomany', 'Too many entries');
   }
 
-  if (entries.length === 0) throw new EnvelopeError('zip_empty','No entries found');
+  if (entries.length === 0)
+    throw new EnvelopeError('zip_empty', 'No entries found');
+
   return entries;
 }
 
@@ -805,9 +1038,9 @@ async function loadWordlist() {
       const first = s.split(/\s+/)[0];
       sampleCount++;
       if (/^\d+$/.test(first)) indexedCount++;
-      if (sampleCount >= 20) break; // small sample is enough
+      if (sampleCount >= 20) break;
     }
-    const isIndexed = indexedCount > sampleCount * 0.6; // threshold
+    const isIndexed = indexedCount > sampleCount * 0.6;
 
     for (const ln of lines) {
       const s = ln.trim();
@@ -816,10 +1049,8 @@ async function loadWordlist() {
       let tok;
       const parts = s.split(/\s+/);
       if (isIndexed && parts.length >= 2 && /^\d+$/.test(parts[0])) {
-        // EFF-style indexed line
         tok = parts.slice(1).join(' ');
       } else {
-        // plain wordlist
         tok = s;
       }
 
@@ -834,10 +1065,11 @@ async function loadWordlist() {
     __WORDSET__ = new Set(wordlist);
     __WORDLOG2__ = Math.log2(Math.max(1, wordlist.length));
   } catch (e) {
+    // Graceful degradation — keep the app usable
+    logWarn('Wordlist unavailable, generator/strength will degrade:', e);
     wordlist = null;
     __WORDSET__ = undefined;
     __WORDLOG2__ = undefined;
-    throw e;
   }
 }
 
@@ -899,7 +1131,7 @@ function genPassphraseWords(n = 8) {
 function renderStrength(pw) {
   const el = $('#pwdStrength');
   const bits = Math.round(estimatePasswordEntropyBits(pw));
-  if (bits === 0) { el.textContent = ''; return; }
+  if (bits === 0) { setText(el, ''); return; }
 
   let msg = `Estimated entropy: ~${bits} bits.`;
   if      (bits <  60) msg += ' Weak.';
@@ -907,7 +1139,7 @@ function renderStrength(pw) {
   else if (bits < 100) msg += ' Strong.';
   else                 msg += ' Very strong.';
   if (bits < 75) msg += ' Consider using the generator.';
-  el.textContent = msg;
+  setText(el, msg);
 }
 
 
@@ -921,10 +1153,10 @@ function resetEncryptUI() {
   $('#encPassword').value = '';
   $('#encText').value = '';
   $('#encFiles').value = '';
-  $('#encResults').innerHTML = '';
-  $('#encHash').textContent = '';
-  $('#encPlainHash').textContent = '';
-  $('#pwdStrength').textContent = '';
+  clearNode('#encResults');
+  setText('#encHash', '');
+  setText('#encPlainHash', '');
+  setText('#pwdStrength', '');
   setProgress(encBar, 0);
 
   // Hide output section if visible
@@ -936,7 +1168,7 @@ function resetEncryptUI() {
 
   // (optional) Clear file list if used
   const list = $('#encFileList');
-  if (list) list.textContent = '';
+  if (list) setText(list, '');
 }
 
 
@@ -946,9 +1178,10 @@ function resetEncryptUI() {
 function resetDecryptUI() {
   $('#decPassword').value   = '';
   $('#decFile').value       = '';
-  $('#decResults').innerHTML= '';
-  $('#decText').textContent = '';
-  $('#decIntegrity').textContent = '';
+  setText('#decFileName', '');
+  clearNode('#decResults');
+  setText('#decText', '');
+  setText('#decIntegrity', '');
   setProgress(decBar, 0);
 }
 
@@ -981,9 +1214,9 @@ function selectContentTab(which) {
     fBtn.setAttribute('aria-selected','true');  tBtn.setAttribute('aria-selected','false');
     fPanel.hidden = false; tPanel.hidden = true;
   }
-  $('#encResults').innerHTML = '';
-  $('#encHash').textContent = '';
-  $('#encPlainHash').textContent = '';
+  clearNode('#encResults');
+  setText('#encHash', '');
+  setText('#encPlainHash', '');
 }
 
 
@@ -1039,6 +1272,17 @@ async function autoTuneStrongWithBudget(budgetMs = 2500) {
 // ===== Capability probe + auto-tune init =====
 
 /**
+ * Checks whether the browser provides the minimum crypto and Worker features required to run safely.
+ */
+function cryptoRuntimeOk() {
+  try {
+    const hasSubtle = !!(crypto && crypto.subtle && crypto.getRandomValues);
+    const hasWorker = typeof Worker === 'function';
+    return hasSubtle && hasWorker;
+  } catch { return false; }
+}
+
+/**
  * Initialize UI, load wordlist, rate-limit the benchmark, run auto-tune with budget,
  * and store tuned parameters. Disable buttons on failure.
  */
@@ -1051,19 +1295,48 @@ async function init() {
     if ($('#btnDecrypt')) $('#btnDecrypt').disabled = true;
 
     setLive('Initializing…');
+    
+    if (!cryptoRuntimeOk()) {
+      setLive('This browser lacks required crypto/worker features.');
+      const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
+      if (be) { be.setAttribute('aria-disabled','true'); be.disabled = true; }
+      if (bd) { bd.setAttribute('aria-disabled','true'); bd.disabled = true; }
+      return;
+    }
 
     await loadWordlist();
 
     // Benchmark rate-limit check
     const gate = allow('bench');
     if (!gate.ok) {
-      setLive(`Auto-tune on cooldown. Try again in ~${Math.ceil(gate.wait/1000)}s.`);
-      return;
+      // Fallback params so the app remains usable
+      const caps = chooseCaps();
+      const guessedMiB = clamp(jitterMemory(512), caps.minMemMiB, caps.maxMemMiB);
+      const guessedP = clamp(Math.min((navigator.hardwareConcurrency || 2), HEALTHY_P_MAX), 1, caps.maxParallel);
+    
+      tunedParams = { mMiB: guessedMiB, t: 5, p: guessedP };
+      window.__MAX_INPUT_BYTES_DYNAMIC = caps.maxInput;
+    
+      setLive(`Auto (fallback): ${tunedParams.mMiB} MiB, t=${tunedParams.t}, p=${tunedParams.p}`);
+    
+      // Re-enable buttons so the app can run with fallback parameters
+      const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
+      if (be) { be.removeAttribute('aria-disabled'); be.disabled = false; }
+      if (bd) { bd.removeAttribute('aria-disabled'); bd.disabled = false; }
+    
+      // IMPORTANT: do not return; we keep going with fallback params
     }
 
     // Auto-tune with a time budget; safe fallback on failure
     const tuned = await autoTuneStrongWithBudget(2500)
       .catch(() => ({ mMiB: 512, t: 5, p: 2, ms: 0 }));
+
+    // Apply adaptive limits based on device profile
+    const caps = chooseCaps();
+    tuned.mMiB = clamp(tuned.mMiB, caps.minMemMiB, caps.maxMemMiB);
+    tuned.p    = clamp(tuned.p, 1, caps.maxParallel);
+    window.__MAX_INPUT_BYTES_DYNAMIC = caps.maxInput;
+
     tuned.mMiB = jitterMemory(tuned.mMiB);
     tunedParams = {
       mMiB: clamp(tuned.mMiB, ARGON_MIN_MIB, ARGON_MAX_MIB),
@@ -1100,6 +1373,16 @@ function chunkNames(n) {
   return Array.from({ length: n }, (_, i) => `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
 }
 
+/**
+ * Chunking util for arbitrary bytes into FIXED_CHUNK_SIZE.
+ */
+function chunkFixedGeneric(u8) {
+  const chunks = [];
+  for (let i = 0; i < u8.length; i += FIXED_CHUNK_SIZE) {
+    chunks.push(u8.subarray(i, Math.min(u8.length, i + FIXED_CHUNK_SIZE)));
+  }
+  return chunks.length ? chunks : [ new Uint8Array(0) ];
+}
 
 
 // ===== Encrypt flow =====
@@ -1112,10 +1395,10 @@ async function doEncrypt() {
   let payloadBytes = null, bundle = null;
   try {
     setProgress(encBar, 5);
-    $('#encResults').innerHTML = ''; $('#encHash').textContent = ''; $('#encPlainHash').textContent = '';
+    clearNode('#encResults'); setText('#encHash',''); setText('#encPlainHash','');
 
     const pw = $('#encPassword').value || '';
-    if (!pw) { alert('Please provide a passphrase.'); return; }
+    if (!pw) { userError('Please provide a passphrase.'); return; }
     const password = pw.normalize('NFKC');
 
     // Source selection: text or files
@@ -1124,16 +1407,20 @@ async function doEncrypt() {
     const textMode = !$('#encPanelText').hidden;
     if (textMode) {
       const raw = $('#encText').value;
-      if (!raw) { alert('Enter some text.'); return; }
+      if (!raw) { userError('Enter some text.'); return; }
       payloadBytes = TE.encode(raw);
       sourceKind = 'text';
     } else {
       const files = Array.from($('#encFiles').files || []);
-      if (files.length === 0) { alert('Choose at least one file.'); return; }
+      if (files.length === 0) { userError('Choose at least one file.'); return; }
       let total = 0; const items = [];
       for (const f of files) {
         const buf = new Uint8Array(await f.arrayBuffer());
-        total += buf.length; if (total > MAX_INPUT_BYTES) throw new EnvelopeError('input_large', 'Total input too large');
+        const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
+        total += buf.length;
+        if (total > maxIn) {
+          throw new EnvelopeError('input_large', 'Total input too large for this device');
+        }
         items.push({ name: f.name, bytes: buf, type: f.type || 'application/octet-stream' });
       }
       fileList = items.map(x => ({ name: x.name, size: x.bytes.length }));
@@ -1147,13 +1434,15 @@ async function doEncrypt() {
       sourceKind = 'files';
     }
 
-    if (payloadBytes.length > MAX_INPUT_BYTES) throw new EnvelopeError('input_large', 'Input too large');
+    if (payloadBytes.length > (window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES)) {
+      throw new EnvelopeError('input_large', 'Input too large for this device');
+    }
 
     const totalPlainLen = payloadBytes.length;
     const chunks        = chunkFixed(payloadBytes);
     const totalChunks   = chunks.length;
 
-    // Whole-plaintext hash for manifest binding
+    // Whole-plaintext hash (kept for integrity binding; not shown in UI)
     const wholeHashHex = await sha256Hex(payloadBytes);
 
     // Per-slice hash + sealed parts
@@ -1174,12 +1463,10 @@ async function doEncrypt() {
       sealedParts.push({ name: `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: part });
 
       setProgress(encBar, 15 + Math.floor(70 * (i + 1) / totalChunks));
-
-      // Yield to keep the UI responsive for long inputs
       if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
     }
 
-    // Authenticated manifest as a fixed "chunk" (padded/truncated to FIXED_CHUNK_SIZE)
+    // --------- Chunked MANIFEST + INDEX ----------
     const manifestInner = {
       v: 1,
       kind: 'manifest',
@@ -1187,28 +1474,87 @@ async function doEncrypt() {
       totalPlainLen,
       totalChunks,
       chunkHashes: perChunkHashes,
-      wholePlainHash: wholeHashHex,
+      wholePlainHash: wholeHashHex,           // verified on decrypt, not displayed
       source: { kind: sourceKind, files: fileList || null },
       createdAt: new Date().toISOString()
     };
     const manifestBytes  = TE.encode(JSON.stringify(manifestInner));
-    const manifestPadded = manifestBytes.length <= FIXED_CHUNK_SIZE ? manifestBytes : manifestBytes.subarray(0, FIXED_CHUNK_SIZE);
-    const manifestSealed = await sealFixedChunk({
-      password,
-      payloadChunk: manifestPadded,
-      chunkIndex: totalChunks,
-      totalChunks: totalChunks + 1,
-      totalPlainLen: totalPlainLen,
-      params: tunedParams
-    });
 
-    const filesOut  = [ ...sealedParts, { name: 'MANIFEST.cbox', bytes: manifestSealed } ];
+    // Slice MANIFEST into 4 MiB chunks
+    const manChunksClear = chunkFixedGeneric(manifestBytes);
+
+    // Seal each MANIFEST chunk (pad to fixed size)
+    const manSealedParts = [];
+    for (let i = 0; i < manChunksClear.length; i++) {
+      const padded = padToFixed(manChunksClear[i]);
+      const sealed = await sealFixedChunk({
+        password,
+        payloadChunk: padded,
+        chunkIndex: i,
+        totalChunks: manChunksClear.length,
+        totalPlainLen: manifestBytes.length,
+        params: tunedParams
+      });
+      manSealedParts.push({ name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: sealed });
+      if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
+    }
+
+    // Authenticated index for MANIFEST chunks
+    const manChunkHashes = [];
+    for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
+    const manifestIndexInner = {
+      v: 1,
+      kind: 'manifest_index',
+      totalChunks: manChunksClear.length,
+      totalLen: manifestBytes.length,
+      chunkSize: FIXED_CHUNK_SIZE,
+      chunkHashes: manChunkHashes
+    };
+    
+    // Build a multi-part MANIFEST_INDEX just like MANIFEST
+    const manIndexBytes  = TE.encode(JSON.stringify(manifestIndexInner));
+    const manIndexChunks = chunkFixedGeneric(manIndexBytes); // splits into 4 MiB slices
+    const manIndexSealed = [];
+    
+    for (let i = 0; i < manIndexChunks.length; i++) {
+      const sealed = await sealFixedChunk({
+        password,
+        payloadChunk: padToFixed(manIndexChunks[i]),
+        chunkIndex: i,
+        totalChunks: manIndexChunks.length,
+        totalPlainLen: manIndexBytes.length,
+        params: tunedParams
+      });
+      manIndexSealed.push({
+        name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
+        bytes: sealed
+      });
+    }
+    
+    const filesOut = [
+      ...sealedParts,
+      ...manSealedParts,
+      ...manIndexSealed
+    ];
+
     const bundleZip = buildZip(filesOut);
+
+    // Wipe & drop per-part buffers now that bundleZip holds the copy
+    try {
+      for (const f of filesOut) { f?.bytes?.fill?.(0); }
+    } catch {}
+    filesOut.length = 0;
+    sealedParts.length = 0;
+    manSealedParts.length = 0;
+    manIndexSealed.length = 0;
+    
     bundle = bundleZip;
 
     addDownload('#encResults', new Blob([bundleZip], { type: 'application/octet-stream' }), `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
-    $('#encHash').textContent       = `SHA-256 (bundle): ${await sha256Hex(bundleZip)}`;
-    $('#encPlainHash').textContent  = `SHA-256 (plaintext): ${wholeHashHex}`;
+    const bundleHash = await sha256Hex(bundleZip);
+    setText('#encHash', `SHA-256 (bundle): ${bundleHash}`);
+    // Do not display plaintext hash anymore:
+    // setText('#encPlainHash', `SHA-256 (plaintext): ${wholeHashHex}`);
 
     // Show outputs container now that results are available
     const out = $('#encOutputs');
@@ -1223,11 +1569,11 @@ async function doEncrypt() {
     $('#encText').value      = '';
     $('#encFiles').value     = '';
     $('#encPassword').value  = '';
-    $('#pwdStrength').textContent = '';
-    setLive('Encryption complete (bundle bound by manifest).');
+    setText('#pwdStrength', '');
+    setLive('Encryption complete (bundle bound by manifest index).');
   } catch (err) {
     logError(err);
-    alert('Encryption failed: ' + (err?.message || err));
+    handleOpError('Encryption', err);
     setProgress(encBar, 0);
     clearPasswords();
   } finally {
@@ -1264,15 +1610,39 @@ function validateIndexSetFromNames(entries) {
 // ===== Post-decrypt rendering =====
 
 /**
+ * Incremental text decoding to keep the UI responsive on mid-sized buffers.
+ */
+async function decodeChunked(u8, chunkSize = 64 * 1024) {
+  const td = new TextDecoder();
+  let out = '';
+  for (let i = 0; i < u8.length; i += chunkSize) {
+    out += td.decode(u8.subarray(i, i + chunkSize), { stream: i + chunkSize < u8.length });
+    // Yield periodically to keep the event loop responsive
+    if (((i / chunkSize) | 0) % 8 === 0) {
+      await new Promise(r => setTimeout(r, 0));
+    }
+  }
+  out += td.decode();
+  return out;
+}
+
+/**
  * If the recovered payload looks like text, render it and offer a text download;
  * otherwise offer a binary download.
  */
-function tryRenderOrDownload(bytes, containerSel, textSel) {
+async function tryRenderOrDownload(bytes, containerSel, textSel) {
   const isUtf8Text = looksLikeUtf8Text(bytes);
   if (isUtf8Text) {
-    const t = TD.decode(bytes);
-    $(textSel).textContent = t;
-    addDownload(containerSel, new Blob([t], { type: 'text/plain;charset=utf-8' }), 'decrypted.txt', 'Download text');
+     // Very large text? Don’t render; offer a download instead.
+     if (bytes.length > MAX_PREVIEW) {
+       addDownload(containerSel, new Blob([bytes], { type: 'application/octet-stream' }), 'decrypted.txt', 'Download text');
+       setText(textSel, 'Large text content — download provided.');
+       return;
+     }
+     // Decode incrementally to avoid UI stalls.
+     const t = await decodeChunked(bytes);
+     setText(textSel, t);
+     addDownload(containerSel, new Blob([t], { type: 'text/plain;charset=utf-8' }), 'decrypted.txt', 'Download text');
   } else {
     addDownload(containerSel, new Blob([bytes], { type: 'application/octet-stream' }), 'decrypted.bin', 'Download file');
   }
@@ -1288,25 +1658,38 @@ function tryRenderOrDownload(bytes, containerSel, textSel) {
  */
 async function doDecrypt() {
   let zipU8 = null; let recovered = null;
+
+  let entries = null;
+  let decryptBtn = null;
+  let prevDisabled = false;
+  
   try{
-    // Rate-limit decrypt attempts
+    // UX rate-limit
     const gate = allow('decrypt');
     if (!gate.ok) {
-      alert(`Too many attempts in a short period. Please wait ~${Math.ceil(gate.wait/1000)}s.`);
+      userError(`Too many attempts in a short period. Please wait ~${Math.ceil(gate.wait/1000)}s.`);
       cooldownButton('#btnDecrypt', gate.wait);
       setProgress(decBar, 0);
       return;
     }
 
     setProgress(decBar, 10);
-    $('#decResults').innerHTML = ''; $('#decText').textContent = ''; $('#decIntegrity').textContent = '';
+    // Anti double-clic pendant le traitement
+    decryptBtn = document.querySelector('#btnDecrypt');
+    prevDisabled = decryptBtn?.disabled;
+    if (decryptBtn) {
+      decryptBtn.disabled = true;
+      decryptBtn.setAttribute('aria-disabled','true');
+    }
+
+    clearNode('#decResults'); setText('#decText',''); setText('#decIntegrity','');
 
     const pw = $('#decPassword').value || '';
-    if (!pw) { alert('Please provide the passphrase.'); return; }
+    if (!pw) { userError('Please provide the passphrase.'); return; }
     const password = pw.normalize('NFKC');
 
     const f = $('#decFile').files?.[0];
-    if (!f) { alert('Choose a .cbox or .cboxbundle file.'); return; }
+    if (!f) { userError('Choose a .cbox or .cboxbundle file.'); return; }
     const name = f.name.toLowerCase();
 
     if (name.endsWith(FILE_SINGLE_EXT)) {
@@ -1319,14 +1702,22 @@ async function doDecrypt() {
       const idx = meta.chunkIndex|0, total = meta.totalChunks|0, fixed = opened.fixedChunk;
       if (idx !== 0 || total !== 1) throw new EnvelopeError('idx_single', 'Inconsistent index/total');
 
+      if (!Number.isFinite(meta.totalPlainLen) ||
+          meta.totalPlainLen < 0 ||
+          meta.totalPlainLen > FIXED_CHUNK_SIZE) {
+        throw new EnvelopeError('single_len', 'Invalid size for single chunk');
+      }
+
       const sliceEnd = meta.totalPlainLen;
       const payload  = fixed.subarray(0, sliceEnd);
-      tryRenderOrDownload(payload, '#decResults', '#decText');
-      $('#decIntegrity').textContent = `Single-chunk decrypted. Size: ${payload.length} bytes.`;
+      await tryRenderOrDownload(payload, '#decResults', '#decText');
+      setText('#decIntegrity', `Single-chunk decrypted. Size: ${payload.length} bytes.`);
+      try { opened.fixedChunk.fill(0); } catch {}
+      try { env.fill(0); } catch {}
+
       setProgress(decBar, 100);
       setLive('Decryption complete.');
 
-      // Expand results; focus first action (download) if present, else the summary; gentle scroll.
       const det = document.getElementById('decDetails');
       if (det) {
         det.open = true;
@@ -1335,38 +1726,226 @@ async function doDecrypt() {
         else det.querySelector('summary')?.focus();
         det.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
       }
+      try { $('#decFile').value = ''; setText('#decFileName',''); } catch {}
       return;
     }
 
     if (!name.endsWith(FILE_BUNDLE_EXT)) {
-      alert('Unsupported file type.');
+      userError('Unsupported file type.');
       setProgress(decBar, 0);
       return;
     }
 
     // Read ZIP and extract strict entries
     zipU8 = new Uint8Array(await f.arrayBuffer());
-    const entries = await extractZipEntriesStrict(zipU8);
+    entries = await extractZipEntriesStrict(zipU8);
 
-    // 1) Manifest
-    const manifestEntry = entries.find(e => e.name === 'MANIFEST.cbox');
-    if (!manifestEntry) throw new EnvelopeError('no_manifest', 'Manifest missing');
+    // Build an index for O(1) lookups and detect duplicates
+    const byName = new Map(entries.map(e => [e.name, e]));
+    if (byName.size !== entries.length) {
+      throw new EnvelopeError('zip_dupe', 'Duplicate entry names in bundle');
+    }
 
-    const manifestOpened = await openFixedChunk({ password, bytes: manifestEntry.bytes });
-    const manifest = manifestOpened.innerMeta;
-    if (!manifest || manifest.kind !== 'manifest') throw new EnvelopeError('bad_manifest', 'Invalid manifest');
+    // Only allow the expected entry name patterns — reject any extra files.
+    const allowed = [
+      /^part-\d{6}\.cbox$/i,
+      /^MANIFEST\.part-\d{6}\.cbox$/i,
+      /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i
+    ];
+    for (const e of entries) {
+      if (!allowed.some(rx => rx.test(e.name))) {
+        throw new EnvelopeError('zip_extra', `Unexpected entry in bundle: ${e.name}`);
+      }
+    }
 
-    // 2) Validate indices
+    // We no longer need the raw ZIP buffer — free it early
+    try { zipU8.fill(0); } catch {}
+    zipU8 = null;
+
+    // ---- 1) MANIFEST via INDEX (multi-part) + PARTS ----
+    const idxEntries = entries
+      .filter(e => /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i.test(e.name))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    
+    if (idxEntries.length === 0) {
+      throw new EnvelopeError('no_manifest_index', 'Manifest index missing');
+    }
+    
+    // Decrypt & rebuild the index buffer
+    let idxLen = null;
+    const idxSlices = [];
+    
+    for (let i = 0; i < idxEntries.length; i++) {
+      const opened = await openFixedChunk({ password, bytes: idxEntries[i].bytes });
+      const inner  = opened.innerMeta;
+    
+      // Strict structural checks
+      if (inner.kind !== 'fixed') {
+        throw new EnvelopeError('idx_part', `Manifest index part ${i}: unexpected type`);
+      }
+      if (inner.chunkIndex !== i) {
+        throw new EnvelopeError('idx_part', `Manifest index part ${i}: wrong index`);
+      }
+      if (inner.totalChunks !== idxEntries.length) {
+        throw new EnvelopeError('idx_part', `Manifest index part ${i}: totalChunks mismatch`);
+      }
+    
+      if (idxLen === null) {
+        idxLen = inner.totalPlainLen | 0;
+        if (!Number.isFinite(idxLen) || idxLen < 0) {
+          throw new EnvelopeError('bad_manifest_index', 'Invalid manifest index length');
+        }
+      }
+    
+      const isLast   = (i === idxEntries.length - 1);
+      const sliceEnd = isLast
+        ? (idxLen - (FIXED_CHUNK_SIZE * (idxEntries.length - 1)))
+        : FIXED_CHUNK_SIZE;
+    
+      if (sliceEnd < 0 || sliceEnd > FIXED_CHUNK_SIZE) {
+        throw new EnvelopeError('idx_part', `Manifest index part ${i}: invalid slice size`);
+      }
+    
+      const slice = opened.fixedChunk.subarray(0, sliceEnd);
+      // Copy out so we can wipe the worker buffer
+      const copy  = new Uint8Array(slice.length);
+      copy.set(slice);
+      idxSlices.push(copy);
+    
+      // Best-effort wipe
+      try { opened.fixedChunk.fill(0); } catch {}
+    }
+    
+    // Stitch the slices into a single buffer
+    const idxBuf = new Uint8Array(idxLen);
+    let offset = 0;
+    for (const s of idxSlices) { idxBuf.set(s, offset); offset += s.length; }
+    
+    let manIndex;
+    try {
+      manIndex = JSON.parse(TD.decode(idxBuf));
+    } catch {
+      throw new EnvelopeError('index_parse', 'Malformed manifest index');
+    } finally {
+      // Best-effort wipe of temporary index buffers
+      try { idxBuf.fill(0); } catch {}
+      for (const s of idxSlices) { try { s.fill(0); } catch {} }
+      // Drop references so GC can reclaim
+      idxSlices.length = 0;
+    }
+
+    if (manIndex.kind !== 'manifest_index') throw new EnvelopeError('index_kind', 'Unexpected manifest index kind');
+    const mTotal = manIndex.totalChunks|0;
+    const mLen   = manIndex.totalLen|0;
+    const mSize  = manIndex.chunkSize|0;
+    if (mSize !== FIXED_CHUNK_SIZE) throw new EnvelopeError('index_chunksize', 'Manifest chunk size mismatch');
+
+    // Sanity checks supplémentaires sur l'index
+    if (!Number.isFinite(mTotal) || mTotal <= 0) {
+      throw new EnvelopeError('index_total', 'Invalid manifest index totalChunks');
+    }
+    if (!Array.isArray(manIndex.chunkHashes) || manIndex.chunkHashes.length !== mTotal) {
+      throw new EnvelopeError('index_hashes', 'Manifest index chunkHashes mismatch');
+    }
+    for (let i = 0; i < manIndex.chunkHashes.length; i++) {
+      if (!/^[0-9a-f]{64}$/i.test(manIndex.chunkHashes[i])) {
+        throw new EnvelopeError('index_hash', `Invalid index hash at ${i}`);
+      }
+    }
+
+    // Decrypt + verify each MANIFEST part
+    let manifestRecovered = new Uint8Array(mLen);
+    let mWritten = 0;
+    for (let i = 0; i < mTotal; i++) {
+      const entry = byName.get(`MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
+      if (!entry) throw new EnvelopeError('missing_manifest_part', `Manifest chunk ${i} missing`);
+
+      const opened = await openFixedChunk({ password, bytes: entry.bytes });
+      const inner  = opened.innerMeta;
+
+      if (inner.kind !== 'fixed') throw new EnvelopeError('man_part_kind',  `Manifest chunk ${i}: unexpected type`);
+      if (inner.chunkIndex !== i) throw new EnvelopeError('man_part_idx',   `Manifest chunk ${i}: wrong index`);
+      if (inner.totalChunks !== mTotal) throw new EnvelopeError('man_part_total', `Manifest chunk ${i}: totalChunks mismatch`);
+      if (inner.totalPlainLen !== mLen) throw new EnvelopeError('man_part_len',   `Manifest chunk ${i}: totalLen mismatch`);
+
+      const isLast   = (i === mTotal - 1);
+      const sliceEnd = isLast ? (mLen - (FIXED_CHUNK_SIZE * (mTotal - 1))) : FIXED_CHUNK_SIZE;
+      const slice    = opened.fixedChunk.subarray(0, sliceEnd);
+
+      const h = await sha256Hex(slice);
+      const expected = manIndex.chunkHashes[i];
+      
+      if (!timingSafeEqual(h, expected)) {
+        throw new EnvelopeError('man_hash_mismatch', `Manifest chunk ${i}: unexpected hash`);
+      }
+
+      manifestRecovered.set(slice, i * FIXED_CHUNK_SIZE);
+      mWritten += slice.length;
+      try { opened.fixedChunk.fill(0); } catch {}
+
+      setProgress(decBar, 10 + Math.floor(10 * (i + 1) / mTotal));
+      if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
+    }
+    if (mWritten !== mLen) throw new EnvelopeError('man_rebuild_size', 'Incorrect manifest reconstructed size');
+
+    let manifest;
+    try {
+      manifest = JSON.parse(TD.decode(manifestRecovered));
+    } catch {
+      throw new EnvelopeError('bad_manifest', 'Invalid manifest JSON');
+    } finally {
+      // best-effort wipe of the reconstructed manifest buffer
+      try { manifestRecovered.fill(0); } catch {}
+    }
+    
+    // ===== Additional manifest sanity checks =====
+    if (manifest.kind !== 'manifest') {
+      throw new EnvelopeError('bad_manifest_kind', 'Unexpected manifest kind');
+    }
+    if (!Number.isFinite(manifest.totalChunks) || manifest.totalChunks <= 0) {
+      throw new EnvelopeError('bad_manifest_total', 'Invalid totalChunks');
+    }
+    if (!Number.isFinite(manifest.totalPlainLen) || manifest.totalPlainLen < 0) {
+      throw new EnvelopeError('bad_manifest_len', 'Invalid totalPlainLen');
+    }
+    if (manifest.chunkSize !== FIXED_CHUNK_SIZE) {
+      throw new EnvelopeError('bad_manifest_chunksize', 'Chunk size mismatch');
+    }
+    if (!Array.isArray(manifest.chunkHashes) || manifest.chunkHashes.length !== manifest.totalChunks) {
+      throw new EnvelopeError('bad_manifest_hashes', 'chunkHashes length mismatch');
+    }
+    // each chunk hash must be a 64-hex string (sha256 hex)
+    for (let i = 0; i < manifest.chunkHashes.length; i++) {
+      if (!/^[0-9a-f]{64}$/i.test(manifest.chunkHashes[i])) {
+        throw new EnvelopeError('bad_hash', `Invalid hash at manifest index ${i}`);
+      }
+    }
+    // wholePlainHash present and well-formed
+    if (!/^[0-9a-f]{64}$/i.test(manifest.wholePlainHash || '')) {
+      throw new EnvelopeError('bad_whole_hash', 'Invalid wholePlainHash');
+    }
+    // optional: check source.files hygiene
+    if (manifest.source?.files) {
+      if (!Array.isArray(manifest.source.files)) throw new EnvelopeError('bad_source', 'Malformed source.files');
+      for (const f of manifest.source.files) {
+        if (typeof f?.name !== 'string' || f.name.includes('..') || f.name.startsWith('/') || f.name.includes('\\')) {
+          throw new EnvelopeError('bad_source_name', 'Suspicious file name in source');
+        }
+        if (!Number.isFinite(f.size) || f.size < 0) throw new EnvelopeError('bad_source_size', 'Invalid file size in source');
+      }
+    }
+
+    // ---- 2) Validate indices (data parts) ----
     const { idxs, max } = validateIndexSetFromNames(entries);
     if ((max + 1) !== manifest.totalChunks) throw new EnvelopeError('total_mismatch', 'totalChunks mismatch');
 
-    // 3) Decrypt and verify each chunk against manifest
+    // ---- 3) Decrypt and verify each data chunk ----
     const totalLen = manifest.totalPlainLen | 0;
     recovered = new Uint8Array(totalLen);
     let written = 0;
 
     for (let i = 0; i < manifest.totalChunks; i++) {
-      const entry = entries.find(e => e.name === `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
+      const entry = byName.get(`part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
       if (!entry) throw new EnvelopeError('missing_part', `Chunk ${i} missing`);
 
       const opened = await openFixedChunk({ password, bytes: entry.bytes });
@@ -1383,32 +1962,31 @@ async function doDecrypt() {
 
       const h = await sha256Hex(slice);
       const expected = manifest.chunkHashes[i];
-      if (h !== expected) throw new EnvelopeError('hash_mismatch', `Chunk ${i}: unexpected hash`);
+
+      if (!timingSafeEqual(h, expected)) {
+        throw new EnvelopeError('hash_mismatch', `Chunk ${i}: unexpected hash`);
+      }
 
       recovered.set(slice, i * FIXED_CHUNK_SIZE);
       written += slice.length;
+      try { opened.fixedChunk.fill(0); } catch {}
 
-      setProgress(decBar, 10 + Math.floor(80 * (i + 1) / manifest.totalChunks));
-
-      // Yield to keep the UI responsive
+      setProgress(decBar, 20 + Math.floor(70 * (i + 1) / manifest.totalChunks));
       if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
     }
 
     if (written !== manifest.totalPlainLen) throw new EnvelopeError('rebuild_size', 'Incorrect reconstructed size');
 
-    // 4) Verify whole-plaintext hash
+    // ---- 4) Verify whole-plaintext hash (silent in UI) ----
     const whole = await sha256Hex(recovered);
-    const ok = (whole === manifest.wholePlainHash);
-    $('#decIntegrity').textContent = ok
-      ? `Integrity OK. SHA-256(plaintext)=${whole}`
-      : `Alert: Unexpected SHA-256(plaintext) (expected ${manifest.wholePlainHash}, got ${whole})`;
+    const ok = timingSafeEqual(whole, manifest.wholePlainHash);
+    setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
 
-    // 5) Render / download
-    tryRenderOrDownload(recovered, '#decResults', '#decText');
+    // ---- 5) Render / download ----
+    await tryRenderOrDownload(recovered, '#decResults', '#decText');
     setProgress(decBar, 100);
     setLive('Decryption complete.');
 
-    // 6) Expand results; focus first action (download) if present, else the summary; gentle scroll.
     const det = document.getElementById('decDetails');
     if (det) {
       det.open = true;
@@ -1417,17 +1995,38 @@ async function doDecrypt() {
       else det.querySelector('summary')?.focus();
       det.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }
+    try { $('#decFile').value = ''; setText('#decFileName',''); } catch {}
   } catch (err) {
     logError(err);
-    alert('Decryption failed: ' + (err?.message || err));
+    handleOpError('Decryption', err);
     setProgress(decBar, 0);
     clearPasswords();
   } finally {
+    // ---- UI restore (anti double-clic) ----
+    try {
+      if (decryptBtn) {
+        decryptBtn.disabled = !!prevDisabled;
+        if (!prevDisabled) decryptBtn.removeAttribute('aria-disabled');
+      }
+    } catch {}
+  
+    // ---- Wipe encrypted chunk buffers (from ZIP or direct .cbox) ----
+    try {
+      for (const e of entries || []) {
+        e?.bytes?.fill?.(0);
+      }
+    } catch {}
+    // ---- Drop references so GC can reclaim ----
+    entries = null;
+    
+    // ---- Existing memory wipes ----
     if (zipU8)     wipeBytes(zipU8);
     if (recovered) wipeBytes(recovered);
+    zipU8 = null;
+    recovered = null;
   }
-}
 
+}
 
 
 // ===== Trusted Types: strong default policy + GitHub Pages compatibility =====
@@ -1492,12 +2091,13 @@ function panicClear() {
     $('#encText').value = '';
     $('#encFiles').value = '';
     $('#decFile').value  = '';
-    $('#decResults').innerHTML = '';
-    $('#encResults').innerHTML = '';
-    $('#decText').textContent = '';
-    $('#encHash').textContent = '';
-    $('#encPlainHash').textContent = '';
-    $('#decIntegrity').textContent = '';
+    setText('#decFileName', '');
+    clearNode('#decResults');
+    clearNode('#encResults');
+    setText('#decText', '');
+    setText('#encHash', '');
+    setText('#encPlainHash', '');
+    setText('#decIntegrity', '');
     setProgress(encBar, 0);
     setProgress(decBar, 0);
     setLive('All local state cleared.');
@@ -1510,6 +2110,17 @@ function panicClear() {
     logWarn('panicClear issue:', e);
   }
 }
+
+// --- Revoke any pending object URLs on pagehide/unload ---
+function revokeAllObjectURLsNow() {
+  try {
+    for (const url of __urlsToRevoke) {
+      try { URL.revokeObjectURL(url); } catch {}
+    }
+    __urlsToRevoke.clear();
+  } catch {}
+}
+
 
 
 // ===== Drag & Drop (mobile & desktop accessibility) =====
@@ -1558,10 +2169,10 @@ function wireDrop(zoneId, inputId, listId){
   // Update UI when files are selected (optional list of file names)
   input.addEventListener('change', () => {
     if (list) {
-      list.innerHTML = '';
+      clearNode(list);
       [...(input.files || [])].forEach(f => {
         const li = document.createElement('li');
-        li.textContent = `${f.name} (${(f.size / 1024).toFixed(1)} KB)`;
+        setText(li, `${f.name} (${(f.size / 1024).toFixed(1)} KB)`);
         list.appendChild(li);
       });
     }
@@ -1569,7 +2180,7 @@ function wireDrop(zoneId, inputId, listId){
     // Update selected filename in decrypt panel
     if (inputId === 'decFile') {
       const nameEl = document.getElementById('decFileName');
-      if (nameEl) nameEl.textContent = input.files?.[0]?.name || '';
+      if (nameEl) setText(nameEl, input.files?.[0]?.name || '');
     }
   });
 }
@@ -1585,7 +2196,7 @@ function genPassphrase() {
   const p = $('#encPassword');
   p.value = genPassphraseWords(8);
   p.type = 'text';
-  $('#encPwdToggle').textContent = 'Hide';
+  setText('#encPwdToggle', 'Hide');
   $('#encPwdToggle').setAttribute('aria-pressed','true');
   renderStrength(p.value);
 }
@@ -1610,13 +2221,13 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#encPwdToggle').addEventListener('click', () => {
     const p = $('#encPassword'); const b = $('#encPwdToggle');
     const show = p.type === 'password'; p.type = show ? 'text' : 'password';
-    b.textContent = show ? 'Hide' : 'Show';
+    setText(b, show ? 'Hide' : 'Show');
     b.setAttribute('aria-pressed', String(show));
   });
   $('#decPwdToggle').addEventListener('click', () => {
     const p = $('#decPassword'); const b = $('#decPwdToggle');
     const show = p.type === 'password'; p.type = show ? 'text' : 'password';
-    b.textContent = show ? 'Hide' : 'Show';
+    setText(b, show ? 'Hide' : 'Show');
     b.setAttribute('aria-pressed', String(show));
   });
 
@@ -1640,6 +2251,33 @@ document.addEventListener('DOMContentLoaded', () => {
   wireDrop('encDrop','encFiles','encFileList');
   wireDrop('decDrop','decFile');
 
+  // Revoke any pending object URLs on pagehide/unload
+  window.addEventListener('pagehide', revokeAllObjectURLsNow);
+  window.addEventListener('unload', revokeAllObjectURLsNow);
+
+  // Also revoke URLs when the tab goes to the background
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') {
+      for (const url of __urlsToRevoke) {
+        try { URL.revokeObjectURL(url); } catch {}
+      }
+      __urlsToRevoke.clear();
+    }
+  });
+
+  // Prevent page navigation when dropping files outside our dropzones
+  ['dragover', 'drop'].forEach(ev => {
+    window.addEventListener(ev, (e) => {
+      const t = e.target;
+      const insideDropzone =
+        t && typeof t.closest === 'function' &&
+        (t.closest('#encDrop') || t.closest('#decDrop'));
+      if (!insideDropzone) {
+        e.preventDefault();
+      }
+    });
+  });
+
   // Initialize
   init();
 });
@@ -1661,7 +2299,7 @@ document.addEventListener('DOMContentLoaded', () => {
     badge.className = 'badge-warn';
     badge.hidden = true;
     badge.setAttribute('aria-live', 'polite');
-    badge.textContent = '⚠️ Performance slowdown detected…';
+    setText(badge, '⚠️ Performance slowdown detected…');
     host.appendChild(badge);
   }
 
