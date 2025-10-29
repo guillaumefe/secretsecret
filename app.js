@@ -1,8 +1,10 @@
 // ===== Constants and parameters =====
 
-const ARGON2_JS_PATH   = '/argon2-bundled.min.js';
-const ARGON2_WASM_PATH = '/argon2.wasm';
-const WORDLIST_PATH = '/eff_large_wordlist.txt'; // UTF-8 wordlist, 1 word per line (may have indexes)
+const ARGON2_JS_PATH   = './argon2-bundled.min.js';
+const ARGON2_WASM_PATH = './argon2.wasm';
+const WORDLIST_PATH = './eff_large_wordlist.txt'; // UTF-8 wordlist, 1 word per line (may have indexes)
+let __WORDSET__ = undefined;
+let __WORDLOG2__ = undefined;
 
 // File and chunking
 const MAX_INPUT_BYTES   = 100 * 1024 * 1024;        // 100 MiB bound for input payload
@@ -146,12 +148,24 @@ function setLive(msg) {
 /**
  * Update a CSS progress bar and its ARIA now value.
  */
-function setProgress(bar, val) {
-  const el = $(bar);
+function setProgress(barSel, val) {
+  const el = document.querySelector(barSel);
   if (!el) return;
   const v = clamp(val, 0, 100);
-  el.style.width = v + '%';
-  el.setAttribute('aria-valuenow', String(v));
+
+  // Snap to the nearest 5% to reduce class count
+  const step = Math.round(v / 5) * 5;
+
+  // Update ARIA state
+  el.setAttribute('aria-valuenow', String(step));
+
+  // Remove any existing p-* class
+  for (const c of [...el.classList]) {
+    if (c.startsWith('p-')) el.classList.remove(c);
+  }
+
+  // Add the new class (e.g. p-45)
+  el.classList.add(`p-${step}`);
 }
 
 
@@ -212,9 +226,9 @@ async function sha256Hex(u8) {
 // ===== Worker selection (strict vs permissive) =====
 
 /*
-  We prefer a strict worker (/argon-worker.js).
+  We prefer a strict worker (./argon-worker.js).
   If initialization fails (likely due to missing 'wasm-unsafe-eval' for that platform’s WASM engine),
-  we fallback to /argon-worker-permissive.js, which must be served with a CSP that adds:
+  we fallback to ./argon-worker-permissive.js, which must be served with a CSP that adds:
     script-src 'self' 'wasm-unsafe-eval'
   Only that worker should get the relaxed directive — never the page.
 */
@@ -225,7 +239,7 @@ async function sha256Hex(u8) {
 async function startArgonWorker(url) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const w = new Worker(url, { type: 'module' });
+    const w = new Worker(url);
     const to = setTimeout(() => {
       if (!settled) { settled = true; try { w.terminate(); } catch {} ; reject(new Error('worker_init_timeout')); }
     }, 10000);
@@ -250,9 +264,9 @@ async function startArgonWorker(url) {
  */
 async function getArgonWorker() {
   try {
-    return await startArgonWorker('/argon-worker.js');       // strict
+    return await startArgonWorker('./argon-worker.js');       // strict
   } catch {
-    return await startArgonWorker('/argon-worker-permissive.js'); // permissive
+    return await startArgonWorker('./argon-worker-permissive.js'); // permissive
   }
 }
 
@@ -771,47 +785,6 @@ let wordlist    = null;
 // ===== Wordlist & passphrase generation =====
 
 /**
- * Load a local wordlist (one word per line) if available.
- */
-async function loadWordlist() {
-  try {
-    const res = await fetch(WORDLIST_PATH, { cache: 'no-store' });
-    if (!res.ok) throw new Error('wordlist missing');
-    const text  = await res.text();
-    const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    if (lines.length < 2048) throw new Error('wordlist too small');
-    wordlist = lines;
-  } catch { wordlist = null; }
-}
-
-/**
- * Sample a random word from the loaded wordlist.
- */
-function rngWord() {
-  const i = crypto.getRandomValues(new Uint32Array(1))[0] % wordlist.length;
-  return wordlist[i];
-}
-
-/**
- * Generate a Diceware-like passphrase (n words) if wordlist available,
- * otherwise fallback to base64url string (~192-bit raw).
- */
-function genPassphraseWords(n = 8) {
-  if (wordlist && wordlist.length >= 2048) {
-    const words = Array.from({ length: n }, () => rngWord());
-    return words.join('-');
-  }
-  const raw = new Uint8Array(24);
-  crypto.getRandomValues(raw);
-  const b64 = btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/,'');
-  return b64;
-}
-
-
-
-// ===== Password strength (lightweight estimation) =====
-
-/**
  * Load wordlist (auto-detect EFF indexed "12345  word" or plain one-word-per-line)
  */
 async function loadWordlist() {
@@ -869,6 +842,58 @@ async function loadWordlist() {
 }
 
 /**
+ * Sample a random word from the loaded wordlist.
+ */
+function rngWord() {
+  const i = crypto.getRandomValues(new Uint32Array(1))[0] % wordlist.length;
+  return wordlist[i];
+}
+
+/**
+ * Rough entropy (bits) via wordlist tokens or character-class pool size.
+ */
+function estimatePasswordEntropyBits(pw) {
+  if (!pw) return 0;
+
+  // Diceware detection when a wordlist is loaded and passphrase uses spaces, hyphens or underscores.
+  const parts = pw.split(/[\s\-_]+/).map(s => s.trim()).filter(Boolean);
+  const hasWL = Array.isArray(wordlist) && wordlist.length > 0 && typeof __WORDLOG2__ === 'number' && __WORDLOG2__ > 0;
+  if (hasWL && parts.length > 1) {
+    const set = (__WORDSET__ !== undefined) ? __WORDSET__ : new Set(wordlist);
+    const allWords = parts.every(token => set.has(token.normalize('NFKC').toLowerCase().trim()));
+    if (allWords) return parts.length * __WORDLOG2__;
+  }
+
+  // Character-class estimate fallback
+  let alpha = 0;
+  if (/[a-z]/.test(pw)) alpha += 26;
+  if (/[A-Z]/.test(pw)) alpha += 26;
+  if (/[0-9]/.test(pw)) alpha += 10;
+  if (/[^A-Za-z0-9]/.test(pw)) alpha += 33;
+  if (alpha === 0) return 0;
+  return pw.length * Math.log2(alpha);
+}
+
+/**
+ * Generate a Diceware-like passphrase (n words) if wordlist available,
+ * otherwise fallback to base64url string (~192-bit raw).
+ */
+function genPassphraseWords(n = 8) {
+  if (wordlist && wordlist.length >= 2048) {
+    const words = Array.from({ length: n }, () => rngWord());
+    return words.join('-');
+  }
+  const raw = new Uint8Array(24);
+  crypto.getRandomValues(raw);
+  const b64 = btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/,'');
+  return b64;
+}
+
+
+
+// ===== Password strength (lightweight estimation) =====
+
+/**
  * Render a plain English strength string in the UI based on entropy estimate.
  */
 function renderStrength(pw) {
@@ -893,15 +918,27 @@ function renderStrength(pw) {
  * Reset encryption panel inputs and progress.
  */
 function resetEncryptUI() {
-  $('#encPassword').value   = '';
-  $('#encText').value       = '';
-  $('#encFiles').value      = '';
-  $('#encResults').innerHTML= '';
+  $('#encPassword').value = '';
+  $('#encText').value = '';
+  $('#encFiles').value = '';
+  $('#encResults').innerHTML = '';
   $('#encHash').textContent = '';
   $('#encPlainHash').textContent = '';
   $('#pwdStrength').textContent = '';
   setProgress(encBar, 0);
+
+  // Hide output section if visible
+  const out = $('#encOutputs');
+  if (out) {
+    out.classList.add('hidden');
+    out.classList.remove('visible');
+  }
+
+  // (optional) Clear file list if used
+  const list = $('#encFileList');
+  if (list) list.textContent = '';
 }
+
 
 /**
  * Reset decryption panel inputs and progress.
@@ -1006,36 +1043,51 @@ async function autoTuneStrongWithBudget(budgetMs = 2500) {
  * and store tuned parameters. Disable buttons on failure.
  */
 async function init() {
-  try{
+  try {
+    // Disable clearly on startup (ARIA + native)
     $('#btnEncrypt').setAttribute('aria-disabled','true');
     $('#btnDecrypt').setAttribute('aria-disabled','true');
+    if ($('#btnEncrypt')) $('#btnEncrypt').disabled = true;
+    if ($('#btnDecrypt')) $('#btnDecrypt').disabled = true;
+
     setLive('Initializing…');
 
     await loadWordlist();
 
-    // Rate-limit the benchmark
+    // Benchmark rate-limit check
     const gate = allow('bench');
     if (!gate.ok) {
       setLive(`Auto-tune on cooldown. Try again in ~${Math.ceil(gate.wait/1000)}s.`);
       return;
     }
 
-    // Run the auto-tune with a time budget; fall back to safe defaults on error.
-    const tuned = await autoTuneStrongWithBudget(2500).catch(() => ({ mMiB: 512, t: 5, p: 2, ms: 0 }));
-    tuned.mMiB  = jitterMemory(tuned.mMiB);
-    tunedParams = { mMiB: tuned.mMiB, t: clamp(tuned.t, ARGON_MIN_T, ARGON_MAX_T), p: clamp(tuned.p, HEALTHY_P_MIN, HEALTHY_P_MAX) };
+    // Auto-tune with a time budget; safe fallback on failure
+    const tuned = await autoTuneStrongWithBudget(2500)
+      .catch(() => ({ mMiB: 512, t: 5, p: 2, ms: 0 }));
+    tuned.mMiB = jitterMemory(tuned.mMiB);
+    tunedParams = {
+      mMiB: clamp(tuned.mMiB, ARGON_MIN_MIB, ARGON_MAX_MIB),
+      t: clamp(tuned.t, ARGON_MIN_T, ARGON_MAX_T),
+      p: clamp(tuned.p, HEALTHY_P_MIN, HEALTHY_P_MAX)
+    };
     setLive(`Auto: ${tunedParams.mMiB} MiB, t=${tunedParams.t}, p=${tunedParams.p}`);
 
-    $('#btnEncrypt').removeAttribute('aria-disabled');
-    $('#btnDecrypt').removeAttribute('aria-disabled');
+    // Fully re-enable buttons (ARIA + native)
+    const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
+    if (be) { be.removeAttribute('aria-disabled'); be.disabled = false; }
+    if (bd) { bd.removeAttribute('aria-disabled'); bd.disabled = false; }
+
   } catch (e) {
-    setLive('This device cannot load Argon2/WASM. Encryption is disabled.');
-    $('#btnEncrypt').setAttribute('aria-disabled','true');
-    $('#btnDecrypt').setAttribute('aria-disabled','true');
+    setLive('This device cannot load Argon2/WASM. Encryption disabled.');
+    // Keep disabled (ARIA + native)
+    const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
+    if (be) { be.setAttribute('aria-disabled','true'); be.disabled = true; }
+    if (bd) { bd.setAttribute('aria-disabled','true'); bd.disabled = true; }
     logError(e);
     clearPasswords();
   }
 }
+
 
 
 
@@ -1158,6 +1210,15 @@ async function doEncrypt() {
     $('#encHash').textContent       = `SHA-256 (bundle): ${await sha256Hex(bundleZip)}`;
     $('#encPlainHash').textContent  = `SHA-256 (plaintext): ${wholeHashHex}`;
 
+    // Show outputs container now that results are available
+    const out = $('#encOutputs');
+    if (out) {
+      out.classList.remove('hidden');
+      out.classList.add('visible');
+      const firstBtn = out.querySelector('button');
+      if (firstBtn) firstBtn.focus();
+    }
+
     setProgress(encBar, 100);
     $('#encText').value      = '';
     $('#encFiles').value     = '';
@@ -1264,6 +1325,16 @@ async function doDecrypt() {
       $('#decIntegrity').textContent = `Single-chunk decrypted. Size: ${payload.length} bytes.`;
       setProgress(decBar, 100);
       setLive('Decryption complete.');
+
+      // Expand results; focus first action (download) if present, else the summary; gentle scroll.
+      const det = document.getElementById('decDetails');
+      if (det) {
+        det.open = true;
+        const firstBtn = document.querySelector('#decResults button');
+        if (firstBtn) firstBtn.focus();
+        else det.querySelector('summary')?.focus();
+        det.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      }
       return;
     }
 
@@ -1336,6 +1407,16 @@ async function doDecrypt() {
     tryRenderOrDownload(recovered, '#decResults', '#decText');
     setProgress(decBar, 100);
     setLive('Decryption complete.');
+
+    // 6) Expand results; focus first action (download) if present, else the summary; gentle scroll.
+    const det = document.getElementById('decDetails');
+    if (det) {
+      det.open = true;
+      const firstBtn = document.querySelector('#decResults button');
+      if (firstBtn) firstBtn.focus();
+      else det.querySelector('summary')?.focus();
+      det.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
   } catch (err) {
     logError(err);
     alert('Decryption failed: ' + (err?.message || err));
@@ -1349,11 +1430,13 @@ async function doDecrypt() {
 
 
 
-// ===== Trusted Types: strict default policy to reduce noise =====
+// ===== Trusted Types: strong default policy + GitHub Pages compatibility =====
 //
-// Keep `require-trusted-types-for 'script'` on the page CSP.
-// Default policy refuses HTML/script creation and only allows same-origin script URLs
-// whitelisted for this app’s static assets.
+// Keep `require-trusted-types-for 'script'` in the page CSP.
+// This policy:
+//  - blocks createHTML / createScript (no innerHTML/eval injection)
+//  - only allows same-origin ScriptURL
+//  - supports relative paths and subfolders (GitHub Pages)
 
 (function setupTrustedTypes() {
   if (!window.trustedTypes || trustedTypes.defaultPolicy) return;
@@ -1366,18 +1449,30 @@ async function doDecrypt() {
         throw new TypeError('Blocked createScript by default Trusted Types policy');
       },
       createScriptURL(url) {
-        const u = new URL(url, location.origin);
+        // Correctly resolves relative paths and GitHub Pages subfolders
+        const u = new URL(url, location.href);
+
+        // 1) Require same origin
         if (u.origin !== location.origin) {
           throw new TypeError('Only same-origin ScriptURL allowed');
         }
-        if (!/^\/(argon2-bundled\.min\.js|argon-worker(\-permissive)?\.js|app\.js)$/.test(u.pathname)) {
-          throw new TypeError('ScriptURL path not whitelisted');
+
+        // 2) Whitelist allowed JS files (works with subfolders)
+        const allowed =
+          u.pathname.endsWith('/app.js') ||
+          u.pathname.endsWith('/argon-worker.js') ||
+          u.pathname.endsWith('/argon-worker-permissive.js') ||
+          u.pathname.endsWith('/argon2-bundled.min.js');
+
+        if (!allowed) {
+          throw new TypeError('ScriptURL path not whitelisted: ' + u.pathname);
         }
+
         return u.toString();
       }
     });
   } catch (e) {
-    logWarn('Trusted Types default policy not installed:', e);
+    logWarn && logWarn('Trusted Types default policy not installed:', e);
   }
 })();
 
@@ -1414,6 +1509,69 @@ function panicClear() {
   } catch (e) {
     logWarn('panicClear issue:', e);
   }
+}
+
+
+// ===== Drag & Drop (mobile & desktop accessibility) =====
+
+/**
+ * Make a dropzone trigger an <input type="file"> (click or keyboard).
+ */
+function wireDrop(zoneId, inputId, listId){
+  const zone  = document.getElementById(zoneId);
+  const input = document.getElementById(inputId);
+  const list  = listId ? document.getElementById(listId) : null;
+  if (!zone || !input) return;
+
+  // Trigger system picker on click or keyboard activation
+  const openPicker = () => input.click();
+  zone.addEventListener('click', openPicker);
+  zone.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      openPicker();
+    }
+  });
+
+  // Highlight dropzone when dragging files over it
+  ['dragenter', 'dragover'].forEach(ev =>
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      zone.classList.add('drag');
+    })
+  );
+
+  // Remove highlight when leaving or dropping
+  ['dragleave', 'drop'].forEach(ev =>
+    zone.addEventListener(ev, (e) => {
+      e.preventDefault();
+      zone.classList.remove('drag');
+    })
+  );
+
+  // Assign dropped files to input and trigger change
+  zone.addEventListener('drop', (e) => {
+    input.files = e.dataTransfer?.files || input.files;
+    input.dispatchEvent(new Event('change', { bubbles:true }));
+  });
+
+  // Update UI when files are selected (optional list of file names)
+  input.addEventListener('change', () => {
+    if (list) {
+      list.innerHTML = '';
+      [...(input.files || [])].forEach(f => {
+        const li = document.createElement('li');
+        li.textContent = `${f.name} (${(f.size / 1024).toFixed(1)} KB)`;
+        list.appendChild(li);
+      });
+    }
+
+    // Update selected filename in decrypt panel
+    if (inputId === 'decFile') {
+      const nameEl = document.getElementById('decFileName');
+      if (nameEl) nameEl.textContent = input.files?.[0]?.name || '';
+    }
+  });
 }
 
 
@@ -1478,18 +1636,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const panicBtn = $('#btnPanic');
   if (panicBtn) panicBtn.addEventListener('click', panicClear);
 
-  // Drag & drop support for decrypt
-  document.addEventListener('dragover', (e) => e.preventDefault());
-  document.addEventListener('drop', (e) => {
-    e.preventDefault();
-    if (!$('#panelDecrypt').hidden) {
-      const file = e.dataTransfer?.files?.[0];
-      if (file && (file.name.endsWith(FILE_SINGLE_EXT) || file.name.endsWith(FILE_BUNDLE_EXT))) {
-        $('#decFile').files = e.dataTransfer.files;
-        setLive('Envelope loaded. Click “Decrypt”.');
-      }
-    }
-  });
+  // Dropzones (tap/click selection + drag-and-drop)
+  wireDrop('encDrop','encFiles','encFileList');
+  wireDrop('decDrop','decFile');
 
   // Initialize
   init();
