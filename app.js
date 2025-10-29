@@ -1336,6 +1336,20 @@ function resetEncryptUI(preservePassword = false) {
   // Optional: Clear file list UI
   const list = $('#encFileList');
   if (list) setText(list, '');
+
+  // --- resetEncryptUI ---
+  try {
+    const btn = $('#btnEncrypt');
+    const pw = ($('#encPassword').value || '').trim();
+    const text = ($('#encText').value || '').trim();
+    const files = $('#encFiles').files;
+    const ok = (pw.length > 0) && (text.length > 0 || (files && files.length > 0));
+
+    btn.disabled = !ok;
+    if (btn.disabled) btn.setAttribute('aria-disabled', 'true');
+    else btn.removeAttribute('aria-disabled');
+  } catch {}
+
 }
 
 
@@ -1361,6 +1375,19 @@ function resetDecryptUI(opts = {}) {
     try { $('#decFile').value = ''; } catch {}
     try { setText('#decFileName',''); } catch {}
   }
+
+  // --- resetDecryptUI ---
+  try {
+    const btn = $('#btnDecrypt');
+    const pw = ($('#decPassword').value || '').trim();
+    const file = ($('#decFile').files || [])[0];
+    const ok = (pw.length > 0) && !!file;
+
+    btn.disabled = !ok;
+    if (btn.disabled) btn.setAttribute('aria-disabled', 'true');
+    else btn.removeAttribute('aria-disabled');
+  } catch {}
+
 }
 
 
@@ -1886,6 +1913,34 @@ async function doEncrypt() {
     if (bundle) wipeBytes(bundle);
   }
 }
+
+function updateEncryptButtonState() {
+  const btn = $('#btnEncrypt');
+  if (!btn) return;
+
+  const pw = $('#encPassword').value.trim();
+  const text = $('#encText').value.trim();
+  const files = $('#encFiles').files;
+
+  const hasPassword = pw.length > 0;
+  const hasInput = (text.length > 0) || (files && files.length > 0);
+
+  btn.disabled = !(hasPassword && hasInput);
+}
+
+function updateDecryptButtonState() {
+  const btn = $('#btnDecrypt');
+  if (!btn) return;
+
+  const pw = $('#decPassword').value.trim();
+  const f = $('#decFile').files?.[0] || null;
+
+  const hasPassword = pw.length > 0;
+  const hasFile = !!f;
+
+  btn.disabled = !(hasPassword && hasFile);
+}
+
 
 
 
@@ -2752,6 +2807,13 @@ document.addEventListener('DOMContentLoaded', () => {
     resetDecryptUI();
     setLive('Decryption UI cleared.');
   });
+
+  // Action reset
+  $('#encPassword').addEventListener('input', updateEncryptButtonState);
+  $('#encText').addEventListener('input', updateEncryptButtonState);
+  $('#encFiles').addEventListener('change', updateEncryptButtonState);
+  $('#decPassword').addEventListener('input', updateDecryptButtonState);
+  $('#decFile').addEventListener('change', updateDecryptButtonState);
 
   // Main actions
   $('#btnEncrypt').addEventListener('click', doEncrypt);
