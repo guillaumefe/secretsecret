@@ -1308,48 +1308,66 @@ function renderStrength(pw) {
 /**
  * Reset encryption panel inputs and progress.
  */
-function resetEncryptUI(preservePassword = false) {
+function resetEncryptUI(opts = {}) {
+  const {
+    preservePassword = false, // by default, clear the password on Encrypt
+    preserveInputs   = false, // text/files inputs
+  } = opts;
+
+  // 1) Clear Encrypt-specific outputs and state
+  try { clearNode('#encResults'); } catch {}
+  try { setText('#encHash', ''); } catch {}
+  try { setText('#encPlainHash', ''); } catch {}
+  try { setText('#pwdStrength', ''); } catch {}
+  try { setProgress(encBar, 0); } catch {}
+
+  // 2) Clear inputs (text/files) if not preserved
+  if (!preserveInputs) {
+    try { $('#encText').value = ''; } catch {}
+    try { $('#encFiles').value = ''; } catch {}
+    try { setText('#encFileList', ''); } catch {}
+  }
+
+  // 3) Password: clear if not preserved, always re-hide field and reset toggle
   if (!preservePassword) {
     try { $('#encPassword').value = ''; } catch {}
   }
-  $('#encText').value = '';
-  $('#encFiles').value = '';
-  clearNode('#encResults');
-  setText('#encHash', '');
-  setText('#encPlainHash', '');
-  setText('#pwdStrength', '');
-  setProgress(encBar, 0);
-
-  // Hide output section if visible, but DO NOT remove its DOM so bundle + hash remain across tabs
-  const out = $('#encOutputs');
-  if (out) {
-    out.classList.add('hidden');
-    out.classList.remove('visible');
-  }
-
-  // Hide encryption progress container (progress bars should not be visible unless active)
   try {
+    const pw = $('#encPassword'); if (pw) pw.type = 'password';
+    const t = $('#encPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
+  } catch {}
+
+  // 4) Hide Encrypt UI sections (outputs, progress)
+  try {
+    const out = $('#encOutputs');
+    if (out) { out.classList.add('hidden'); out.classList.remove('visible'); }
     const encProgress = document.querySelector('#encBar')?.parentElement;
     if (encProgress) encProgress.style.display = 'none';
   } catch {}
 
-  // Optional: Clear file list UI
-  const list = $('#encFileList');
-  if (list) setText(list, '');
-
-  // --- resetEncryptUI ---
+  // 5) Revoke object URLs and remove any blob links/buttons in encResults
   try {
-    const btn = $('#btnEncrypt');
+    for (const url of [...__urlsToRevoke]) { try { URL.revokeObjectURL(url); } catch {} __urlsToRevoke.delete(url); }
+    const resEl = document.querySelector('#encResults');
+    if (resEl) {
+      resEl.querySelectorAll('a[href^="blob:"]').forEach(a => { try { a.remove(); } catch {} });
+      resEl.querySelectorAll('button').forEach(b => { try { b.remove(); } catch {} });
+    }
+  } catch (e) { logWarn('[resetEncryptUI] revoke anchors warn', e); }
+
+  // 6) Recompute Encrypt button state
+  try {
     const pw = ($('#encPassword').value || '').trim();
     const text = ($('#encText').value || '').trim();
     const files = $('#encFiles').files;
     const ok = (pw.length > 0) && (text.length > 0 || (files && files.length > 0));
-
+    const btn = $('#btnEncrypt');
     btn.disabled = !ok;
-    if (btn.disabled) btn.setAttribute('aria-disabled', 'true');
-    else btn.removeAttribute('aria-disabled');
+    if (btn.disabled) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
   } catch {}
 
+  // 7) Accessibility live message
+  try { setLive('Encryption UI cleared.'); } catch {}
 }
 
 
@@ -1357,38 +1375,67 @@ function resetEncryptUI(preservePassword = false) {
  * Reset decryption panel inputs and progress.
  */
 function resetDecryptUI(opts = {}) {
-  const { preservePassword = true, preserveFile = true } = opts;
+  const {
+    preservePassword = false, // by default, clear the password on Decrypt
+    preserveFile     = false, // selected .cbox/.cboxbundle
+  } = opts;
 
-  // clear previous outputs only (results, text, integrity, errors)
+  // 1) Clear Decrypt-specific outputs and state
   try { clearNode('#decResults'); } catch {}
-  try { setText('#decText',''); } catch {}
-  try { setText('#decIntegrity',''); } catch {}
-  try { setText('#decFileErr',''); } catch {}
+  try { setText('#decText', ''); } catch {}
+  try { setText('#decIntegrity', ''); } catch {}
+  try { setText('#decFileErr', ''); } catch {}
+  try { setProgress(decBar, 0); } catch {}
 
-  // keep password unless explicitly told otherwise
-  if (!preservePassword) {
-    try { $('#decPassword').value = ''; } catch {}
-  }
-
-  // keep chosen file unless explicitly told otherwise
+  // 2) File input: clear if not preserved (+ filename label)
   if (!preserveFile) {
     try { $('#decFile').value = ''; } catch {}
     try { setText('#decFileName',''); } catch {}
   }
 
-  // --- resetDecryptUI ---
+  // 3) Password: clear if not preserved, always re-hide field and reset toggle
+  if (!preservePassword) {
+    try { $('#decPassword').value = ''; } catch {}
+  }
   try {
-    const btn = $('#btnDecrypt');
+    const pw = $('#decPassword'); if (pw) pw.type = 'password';
+    const t = $('#decPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
+  } catch {}
+
+  // 4) Hide Decrypt UI sections (results text, progress)
+  try {
+    const decResults = document.getElementById('decResults');
+    const decTextEl  = document.getElementById('decText');
+    if (decResults) decResults.classList.add('hidden');
+    if (decTextEl) decTextEl.hidden = true;
+    const decProgress = document.querySelector('#decBar')?.parentElement;
+    if (decProgress) decProgress.style.display = 'none';
+  } catch {}
+
+  // 5) Revoke object URLs and remove any blob links/buttons in decResults
+  try {
+    for (const url of [...__urlsToRevoke]) { try { URL.revokeObjectURL(url); } catch {} __urlsToRevoke.delete(url); }
+    const resEl = document.querySelector('#decResults');
+    if (resEl) {
+      resEl.querySelectorAll('a[href^="blob:"]').forEach(a => { try { a.remove(); } catch {} });
+      resEl.querySelectorAll('button').forEach(b => { try { b.remove(); } catch {} });
+    }
+  } catch (e) { logWarn('[resetDecryptUI] revoke anchors warn', e); }
+
+  // 6) Recompute Decrypt button state
+  try {
     const pw = ($('#decPassword').value || '').trim();
     const file = ($('#decFile').files || [])[0];
     const ok = (pw.length > 0) && !!file;
-
+    const btn = $('#btnDecrypt');
     btn.disabled = !ok;
-    if (btn.disabled) btn.setAttribute('aria-disabled', 'true');
-    else btn.removeAttribute('aria-disabled');
+    if (btn.disabled) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
   } catch {}
 
+  // 7) Accessibility live message
+  try { setLive('Decryption UI cleared.'); } catch {}
 }
+
 
 
 /**
@@ -1447,6 +1494,7 @@ function selectContentTab(which) {
   clearNode('#encResults');
   setText('#encHash', '');
   setText('#encPlainHash', '');
+  updateEncryptButtonState();
 }
 
 
@@ -1524,7 +1572,7 @@ async function init() {
     if ($('#btnEncrypt')) $('#btnEncrypt').disabled = true;
     if ($('#btnDecrypt')) $('#btnDecrypt').disabled = true;
 
-    setLive('Initializing…');
+    setLive('Optimizing...');
     
     if (!cryptoRuntimeOk()) {
       setLive('This browser lacks required crypto/worker features.');
@@ -1584,6 +1632,9 @@ async function init() {
     const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
     if (be) { be.removeAttribute('aria-disabled'); be.disabled = false; }
     if (bd) { bd.removeAttribute('aria-disabled'); bd.disabled = false; }
+
+    updateEncryptButtonState();
+    updateDecryptButtonState();
 
   } catch (e) {
     setLive('This device cannot load Argon2/WASM. Encryption disabled.');
@@ -1918,28 +1969,45 @@ function updateEncryptButtonState() {
   const btn = $('#btnEncrypt');
   if (!btn) return;
 
-  const pw = $('#encPassword').value.trim();
-  const text = $('#encText').value.trim();
-  const files = $('#encFiles').files;
+  const pw = ($('#encPassword').value || '').trim();
 
-  const hasPassword = pw.length > 0;
-  const hasInput = (text.length > 0) || (files && files.length > 0);
+  // Check active content type
+  const textPanelVisible  = !$('#encPanelText').hidden;
+  const filesPanelVisible = !$('#encPanelFiles').hidden;
 
-  btn.disabled = !(hasPassword && hasInput);
+  let hasInput = false;
+  if (textPanelVisible) {
+    hasInput = ($('#encText').value || '').trim().length > 0;
+  } else if (filesPanelVisible) {
+    const files = $('#encFiles').files;
+    hasInput = !!(files && files.length > 0);
+  }
+
+  const enabled = pw.length > 0 && hasInput;
+
+  btn.disabled = !enabled;
+  if (enabled) btn.removeAttribute('aria-disabled');
+  else btn.setAttribute('aria-disabled', 'true');
 }
+
 
 function updateDecryptButtonState() {
   const btn = $('#btnDecrypt');
   if (!btn) return;
 
-  const pw = $('#decPassword').value.trim();
-  const f = $('#decFile').files?.[0] || null;
+  const pw = ($('#decPassword')?.value || '').trim();
+  const file = ($('#decFile')?.files || [])[0];
 
-  const hasPassword = pw.length > 0;
-  const hasFile = !!f;
+  const enabled = pw.length > 0 && !!file;
 
-  btn.disabled = !(hasPassword && hasFile);
+  btn.disabled = !enabled;
+  if (enabled) {
+    btn.removeAttribute('aria-disabled');
+  } else {
+    btn.setAttribute('aria-disabled', 'true');
+  }
 }
+
 
 function maskPasswordField(inputSel, toggleSel) {
   const p = (typeof inputSel === 'string') ? document.querySelector(inputSel) : inputSel;
@@ -2669,7 +2737,7 @@ function panicClear() {
     setText('#decIntegrity', '');
     setProgress(encBar, 0);
     setProgress(decBar, 0);
-    setLive('All local state cleared. Decryption results removed.');
+    setLive('All local state cleared.');
 
     for (const url of __urlsToRevoke) {
       try { URL.revokeObjectURL(url); } catch {}
@@ -2770,6 +2838,7 @@ function genPassphrase() {
   maskPasswordField('#encPassword', '#encPwdToggle');
   renderStrength(p.value);
   setLive('Passphrase generated.');
+  updateEncryptButtonState();
 }
 
 /**
@@ -2809,12 +2878,12 @@ document.addEventListener('DOMContentLoaded', () => {
   // Panel clears
   $('#btnClearEncrypt').addEventListener('click', () => {
        resetEncryptUI();
-       setLive('Encryption UI cleared.');
+       setLive('UI cleared.');
      });
     
   $('#btnClearDecrypt').addEventListener('click', () => {
     resetDecryptUI();
-    setLive('Decryption UI cleared.');
+    setLive('UI cleared.');
   });
 
   // Action reset
