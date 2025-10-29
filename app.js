@@ -1,5 +1,12 @@
 // ===== Constants and parameters =====
 
+// eff_large_wordlist.json is generated at build time from the EFF list
+import WORDS from './eff_large_wordlist.json' assert { type: 'json' };
+
+// Build-time flag: set to false in hard-CSP builds
+// When false → strict worker only → any CSP/WASM failure is a hard failure
+const ALLOW_PERMISSIVE_FALLBACK = true;
+
 const ARGON2_JS_PATH   = './argon2-bundled.min.js';
 const ARGON2_WASM_PATH = './argon2.wasm';
 const WORDLIST_PATH = './eff_large_wordlist.txt'; // UTF-8 wordlist, 1 word per line (may have indexes)
@@ -111,13 +118,13 @@ const DEBUG = location.hostname === 'localhost';
 function logError(...args) { if (DEBUG) { try { console.error(...args); } catch {} } }
 function logWarn (...args) { if (DEBUG) { try { console.warn (...args); } catch {} } }
 function logInfo (...args) { if (DEBUG) { try { console.info (...args); } catch {} } }
-function userError(msg) {
-  alert(msg || 'An unexpected error occurred.');
-}
-function handleOpError(ctx, err) {
-  if (DEBUG) { console.error(`[${ctx}]`, err); }
-  // Neutral and consistent UX message (no sensitive leak)
-  userError(`${ctx} failed or file is corrupted.`);
+function showErrorBanner(text) {
+  const el = document.getElementById('errBanner');
+  if (!el) return;
+  setText(el, text || 'An unexpected error occurred.');
+  el.hidden = false;
+  // auto-hide after a short period if you like
+  setTimeout(() => { try { el.hidden = true; setText(el, ''); } catch {} }, 8000);
 }
 
 /**
@@ -180,6 +187,22 @@ function chooseCaps() {
   return { maxInput, minMemMiB, maxMemMiB, maxParallel };
 }
 
+/**
+ * Uniform timing delay + generic messaging for sensitive failures.
+ * Mitigates timing side-channels and avoids revealing specific error causes.
+ */
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+async function secureFail(ctx) {
+  await sleep(400); // fixed minimum latency for failure paths
+
+  // Generic error message to reduce oracle surface
+  setLive(`${ctx} failed or file is corrupted.`);
+  showErrorBanner(`${ctx} failed or file is corrupted.`);
+}
+
 
 
 // ===== Trusted Types Safe DOM Helpers =====
@@ -234,8 +257,8 @@ function setLive(msg) {
 /**
  * Update a CSS progress bar and its ARIA now value.
  */
-function setProgress(barSel, val) {
-  const el = document.querySelector(barSel);
+function setProgress(target, val) {
+  const el = (typeof target === 'string') ? document.querySelector(target) : target;
   if (!el) return;
   const v = clamp(val, 0, 100);
 
@@ -428,7 +451,7 @@ async function startArgonWorker(url) {
       }
     };
 
-    // Optionnel : capturer les erreurs de désérialisation de message
+    // Optional: capture message deserialization errors
     w.onmessageerror = (e) => {
       if (!settled) {
         settled = true;
@@ -445,21 +468,21 @@ async function startArgonWorker(url) {
 /**
  * Attempt strict worker first; auto-fallback to permissive only when strictly necessary.
  */
-async function getArgonWorker() {
-  try {
-    return await startArgonWorker('./argon-worker.js'); // strict
-  } catch (err) {
-    // If it doesn't look like a CSP/WASM capability failure, permissive won't help.
-    if (!looksLikeWasmCspError(err)) {
-      throw err;
-    }
+ async function getArgonWorker() {
+   try {
+     return await startArgonWorker('./argon-worker.js'); // strict
+   } catch (err) {
+     // If it doesn't look like a CSP/WASM capability failure, permissive won't help.
+     if (!looksLikeWasmCspError(err)) throw err;
+     // Hard-disable permissive fallback if the build flag is off
+     if (!ALLOW_PERMISSIVE_FALLBACK) throw err;
 
-    // Last-chance: try permissive worker (served with its own relaxed CSP).
-    // No flags or query params control this: it's purely environmental.
-    try {
-      console.warn('[argon2] Strict worker blocked by CSP/WASM; attempting permissive worker…');
-      return await startArgonWorker('./argon-worker-permissive.js');
-    } catch (err2) {
+     // Last-chance: try permissive worker (served with its own relaxed CSP).
+     // No flags or query params control this: it's purely environmental.
+     try {
+       console.warn('[argon2] Strict worker blocked by CSP/WASM; attempting permissive worker…');
+       return await startArgonWorker('./argon-worker-permissive.js');
+     } catch (err2) {
       // If permissive also fails, surface the original context + secondary error.
       const combo = new Error(
         'permissive_fallback_failed: strict=' +
@@ -609,10 +632,16 @@ function cooldownButton(btnSel, ms) {
   if (!btn) return;
   const saved = btn.textContent;
   btn.disabled = true;
+  btn.setAttribute('aria-disabled', 'true');
   let left = Math.ceil(ms / 1000);
   const id = setInterval(() => {
     setText(btn, `${saved} (${left--}s)`);
-    if (left < 0) { clearInterval(id); btn.disabled = false; setText(btn, saved); }
+    if (left < 0) {
+      clearInterval(id);
+      btn.disabled = false;
+      btn.removeAttribute('aria-disabled');
+      setText(btn, saved);
+    }
   }, 1000);
 }
 
@@ -687,7 +716,8 @@ async function sealFixedChunk({ password, payloadChunk, chunkIndex, totalChunks,
   const metaObj = {
     enc_v: 4, algo: 'AES-GCM',
     iv: b64(iv), salt: b64(salt),
-    kdf: { kdf: 'Argon2id', v: 1, mMiB: params.mMiB, t: params.t, p: params.p }
+    kdf: { kdf: 'Argon2id', v: 1, mMiB: params.mMiB, t: params.t, p: params.p },
+    bundleId: params.bundleId // <— anti-replay binding
   };
   const aad = metaAAD(metaObj);
 
@@ -712,7 +742,7 @@ async function sealFixedChunk({ password, payloadChunk, chunkIndex, totalChunks,
  * Open and authenticate a sealed fixed-size chunk.
  * Returns { meta, innerMeta, fixedChunk } if successful.
  */
-async function openFixedChunk({ password, bytes }) {
+async function openFixedChunk({ password, bytes, expectedBundleId }) {
   if (bytes.length < 9) throw new EnvelopeError('format', 'Invalid envelope');
   if (TD.decode(bytes.subarray(0, 5)) !== 'CBOX4') throw new EnvelopeError('magic', 'Unknown format');
 
@@ -721,30 +751,45 @@ async function openFixedChunk({ password, bytes }) {
   if (metaEnd > bytes.length) throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
 
   const metaBytes = bytes.subarray(9, metaEnd);
-  if (metaBytes.length > 4096)
-    throw new EnvelopeError('meta_big', 'Metadata too large');
+  if (metaBytes.length > 4096) throw new EnvelopeError('meta_big', 'Metadata too large');
+
   let meta;
-  try { meta = JSON.parse(TD.decode(metaBytes)); }
-  catch { throw new EnvelopeError('meta_parse', 'Malformed metadata'); }
+  try {
+    meta = JSON.parse(TD.decode(metaBytes));
+  } catch {
+    throw new EnvelopeError('meta_parse', 'Malformed metadata');
+  }
 
   const salt = b64d(meta.salt || '');
   const iv   = b64d(meta.iv || '');
 
   if (salt.length !== 16) throw new EnvelopeError('salt_len', 'Bad salt length');
   if (iv.length   !== 12) throw new EnvelopeError('iv_len',   'Bad IV length');
-  
-  const k    = meta.kdf || {};
-  if (k.kdf !== 'Argon2id') throw new EnvelopeError('kdf', 'Unsupported KDF');
-  validateArgon({ mMiB: k.mMiB, t: k.t, p: k.p });
 
-  if (salt.length !== 16) throw new EnvelopeError('salt_len', 'Bad salt length');
-  if (iv.length   !== 12) throw new EnvelopeError('iv_len',   'Bad IV length');
+  // Version & algorithm pinning
+  if (meta.enc_v !== 4) throw new EnvelopeError('enc_v', 'Unsupported envelope version');
+  if (meta.algo !== 'AES-GCM') throw new EnvelopeError('algo', 'Unsupported AEAD');
+
+  // Enforce anti-replay if caller provided an expected bundleId
+  if (expectedBundleId !== undefined) {
+    if (typeof meta.bundleId !== 'string' || meta.bundleId !== expectedBundleId) {
+      throw new EnvelopeError('bundle_mismatch', 'BundleId mismatch');
+    }
+  }
+
+  const k = meta.kdf || {};
+  if (k.kdf !== 'Argon2id') throw new EnvelopeError('kdf', 'Unsupported KDF');
+  if (k.v !== 1)            throw new EnvelopeError('kdf_v', 'Unsupported KDF version');
+  validateArgon({ mMiB: k.mMiB, t: k.t, p: k.p });
 
   const keyBytes = await deriveArgon2id(password, salt, { mMiB: k.mMiB, t: k.t, p: k.p });
   const key      = await importAesKey(keyBytes);
 
   const cipher = bytes.subarray(metaEnd);
-  const clear  = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv, additionalData: metaBytes, tagLength: 128 }, key, cipher));
+  const clear  = new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv, additionalData: metaBytes, tagLength: 128 },
+    key, cipher
+  ));
   wipeBytes(keyBytes);
 
   if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
@@ -754,8 +799,11 @@ async function openFixedChunk({ password, bytes }) {
 
   const innerMetaBytes = clear.subarray(4, innerEnd);
   let innerMeta;
-  try { innerMeta = JSON.parse(TD.decode(innerMetaBytes)); }
-  catch { throw new EnvelopeError('inner_parse', 'Malformed inner meta'); }
+  try {
+    innerMeta = JSON.parse(TD.decode(innerMetaBytes));
+  } catch {
+    throw new EnvelopeError('inner_parse', 'Malformed inner meta');
+  }
 
   const fixedPayload = clear.subarray(innerEnd, innerEnd + FIXED_CHUNK_SIZE);
   const out = new Uint8Array(fixedPayload.length);
@@ -860,11 +908,74 @@ function buildZip(files) {
 function readU16(dv, off) { if (off + 2 > dv.byteLength) throw new EnvelopeError('zip_bounds', 'U16 OOB'); return dv.getUint16(off, true); }
 function readU32(dv, off) { if (off + 4 > dv.byteLength) throw new EnvelopeError('zip_bounds', 'U32 OOB'); return dv.getUint32(off, true); }
 
+// parseEOCDAndCentralDirectory
+// Validates EOCD + Central Directory (store-only). Ensures CD and LFH offsets are coherent.
+// Throws on any structural issue; returns a minimal name→LFH offset index for optional use.
+function parseEOCDAndCentralDirectory(u8) {
+  const EOCD_SIG = 0x06054b50;
+  const CD_SIG   = 0x02014b50;
+  const LFH_SIG  = 0x04034b50;
+
+  const searchStart = Math.max(0, u8.length - (65535 + 22));
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+
+  let eocdOff = -1;
+  for (let i = u8.length - 22; i >= searchStart; i--) {
+    if (dv.getUint32(i, true) === EOCD_SIG) { eocdOff = i; break; }
+  }
+  if (eocdOff < 0) throw new EnvelopeError('zip_eocd', 'EOCD not found');
+
+  const totalEntries = dv.getUint16(eocdOff + 10, true);
+  const cdSize       = dv.getUint32(eocdOff + 12, true);
+  const cdOffset     = dv.getUint32(eocdOff + 16, true);
+
+  if (cdOffset + cdSize > u8.length) {
+    throw new EnvelopeError('zip_cd_bounds', 'Central Directory exceeds buffer');
+  }
+
+  const index = new Map();
+  let p = cdOffset;
+  for (let n = 0; n < totalEntries; n++) {
+    if (p + 46 > u8.length) throw new EnvelopeError('zip_cd_short', 'CDH truncated');
+    if (dv.getUint32(p, true) !== CD_SIG) throw new EnvelopeError('zip_cd_sig', 'Bad CDH signature');
+
+    const compMethod   = dv.getUint16(p + 10, true);
+    const nameLen      = dv.getUint16(p + 28, true);
+    const extraLen     = dv.getUint16(p + 30, true);
+    const commentLen   = dv.getUint16(p + 32, true);
+    const relOffsetLFH = dv.getUint32(p + 42, true);
+
+    if (compMethod !== 0) throw new EnvelopeError('zip_cd_method', 'Compression not supported');
+
+    const nameStart = p + 46;
+    const nameEnd   = nameStart + nameLen;
+    const nextCD    = nameEnd + extraLen + commentLen;
+    if (nextCD > u8.length) throw new EnvelopeError('zip_cd_oob', 'CDH OOB');
+
+    if (relOffsetLFH + 30 > u8.length) throw new EnvelopeError('zip_lfh_oob', 'LFH OOB');
+    if (dv.getUint32(relOffsetLFH, true) !== LFH_SIG) throw new EnvelopeError('zip_lfh_sig', 'Bad LFH signature');
+
+    const nameBytes = u8.subarray(nameStart, nameEnd);
+    const name = TD.decode(nameBytes);
+    index.set(name, relOffsetLFH);
+
+    p = nextCD;
+  }
+
+  if ((p - cdOffset) !== cdSize) {
+    throw new EnvelopeError('zip_cd_size', 'Central Directory size mismatch');
+  }
+  return index;
+}
+
 /**
  * Strict store-only ZIP extractor with hard bounds and path hygiene.
  * Throws on unsupported features (compression, data descriptor, ZIP64, etc.).
  */
 async function extractZipEntriesStrict(u8) {
+  // Validate EOCD + Central Directory coherence first
+  const cdIndex = parseEOCDAndCentralDirectory(u8); // throws on invalid structures
+
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   const entries = [];
   let i = 0;
@@ -1022,51 +1133,28 @@ let wordlist    = null;
  */
 async function loadWordlist() {
   try {
-    const res = await fetch(WORDLIST_PATH, { cache: 'no-store' });
-    if (!res.ok) throw new Error('wordlist missing');
-    const text = await res.text();
-
-    const lines = text.split(/\r?\n/);
+    // Use the bundled words directly (no network fetch, supply-chain risk reduced)
     const tmp = [];
     const seen = new Set();
 
-    // Detect if majority of non-empty lines begin with a numeric code
-    let indexedCount = 0, sampleCount = 0;
-    for (const ln of lines) {
-      const s = ln.trim();
-      if (!s) continue;
-      const first = s.split(/\s+/)[0];
-      sampleCount++;
-      if (/^\d+$/.test(first)) indexedCount++;
-      if (sampleCount >= 20) break;
-    }
-    const isIndexed = indexedCount > sampleCount * 0.6;
-
-    for (const ln of lines) {
-      const s = ln.trim();
-      if (!s) continue;
-
-      let tok;
-      const parts = s.split(/\s+/);
-      if (isIndexed && parts.length >= 2 && /^\d+$/.test(parts[0])) {
-        tok = parts.slice(1).join(' ');
-      } else {
-        tok = s;
-      }
-
-      tok = tok.normalize('NFKC').toLowerCase().trim();
+    // WORDS expected to be an array of words (strings).
+    // We still defensively normalize & dedupe in case the build artifact varies.
+    for (const raw of WORDS) {
+      if (typeof raw !== 'string') continue;
+      const tok = raw.normalize('NFKC').toLowerCase().trim();
       if (!tok) continue;
       if (!seen.has(tok)) { seen.add(tok); tmp.push(tok); }
     }
 
+    // Same validation as before
     if (tmp.length < 2048) throw new Error('wordlist too small');
 
     wordlist = tmp;
     __WORDSET__ = new Set(wordlist);
     __WORDLOG2__ = Math.log2(Math.max(1, wordlist.length));
   } catch (e) {
-    // Graceful degradation — keep the app usable
-    logWarn('Wordlist unavailable, generator/strength will degrade:', e);
+    // Graceful degradation — keep the app usable without generator/strength hints
+    logWarn('Bundled wordlist unavailable, generator/strength will degrade:', e);
     wordlist = null;
     __WORDSET__ = undefined;
     __WORDLOG2__ = undefined;
@@ -1314,7 +1402,12 @@ async function init() {
       const guessedMiB = clamp(jitterMemory(512), caps.minMemMiB, caps.maxMemMiB);
       const guessedP = clamp(Math.min((navigator.hardwareConcurrency || 2), HEALTHY_P_MAX), 1, caps.maxParallel);
     
-      tunedParams = { mMiB: guessedMiB, t: 5, p: guessedP };
+      // clamp to global hard mins/maxes BEFORE enabling UI
+      tunedParams = {
+        mMiB: clamp(guessedMiB, ARGON_MIN_MIB, ARGON_MAX_MIB),
+        t:    clamp(5,           ARGON_MIN_T,   ARGON_MAX_T),
+        p:    clamp(guessedP,    HEALTHY_P_MIN, HEALTHY_P_MAX)
+      };
       window.__MAX_INPUT_BYTES_DYNAMIC = caps.maxInput;
     
       setLive(`Auto (fallback): ${tunedParams.mMiB} MiB, t=${tunedParams.t}, p=${tunedParams.p}`);
@@ -1398,7 +1491,7 @@ async function doEncrypt() {
     clearNode('#encResults'); setText('#encHash',''); setText('#encPlainHash','');
 
     const pw = $('#encPassword').value || '';
-    if (!pw) { userError('Please provide a passphrase.'); return; }
+    if (!pw) throw new EnvelopeError('input', 'missing');
     const password = pw.normalize('NFKC');
 
     // Source selection: text or files
@@ -1407,12 +1500,12 @@ async function doEncrypt() {
     const textMode = !$('#encPanelText').hidden;
     if (textMode) {
       const raw = $('#encText').value;
-      if (!raw) { userError('Enter some text.'); return; }
+      if (!raw) throw new EnvelopeError('input', 'missing');
       payloadBytes = TE.encode(raw);
       sourceKind = 'text';
     } else {
       const files = Array.from($('#encFiles').files || []);
-      if (files.length === 0) { userError('Choose at least one file.'); return; }
+      if (files.length === 0) throw new EnvelopeError('input', 'missing');
       let total = 0; const items = [];
       for (const f of files) {
         const buf = new Uint8Array(await f.arrayBuffer());
@@ -1442,6 +1535,10 @@ async function doEncrypt() {
     const chunks        = chunkFixed(payloadBytes);
     const totalChunks   = chunks.length;
 
+    // Anti-replay: one random bundleId per encryption session
+    const bundleIdBytes = crypto.getRandomValues(new Uint8Array(16));
+    const bundleId = b64(bundleIdBytes);
+    
     // Whole-plaintext hash (kept for integrity binding; not shown in UI)
     const wholeHashHex = await sha256Hex(payloadBytes);
 
@@ -1458,8 +1555,14 @@ async function doEncrypt() {
       perChunkHashes.push(await sha256Hex(slice));
 
       const part = await sealFixedChunk({
-        password, payloadChunk: c, chunkIndex: i, totalChunks, totalPlainLen, params: tunedParams
+        password,
+        payloadChunk: c,
+        chunkIndex: i,
+        totalChunks,
+        totalPlainLen,
+        params: { ...tunedParams, bundleId } // <— propagate bundleId
       });
+
       sealedParts.push({ name: `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: part });
 
       setProgress(encBar, 15 + Math.floor(70 * (i + 1) / totalChunks));
@@ -1470,11 +1573,12 @@ async function doEncrypt() {
     const manifestInner = {
       v: 1,
       kind: 'manifest',
+      bundleId, // <— redundant copy (not trusted alone; real binding is via AAD)
       chunkSize: FIXED_CHUNK_SIZE,
       totalPlainLen,
       totalChunks,
       chunkHashes: perChunkHashes,
-      wholePlainHash: wholeHashHex,           // verified on decrypt, not displayed
+      wholePlainHash: wholeHashHex,
       source: { kind: sourceKind, files: fileList || null },
       createdAt: new Date().toISOString()
     };
@@ -1493,7 +1597,7 @@ async function doEncrypt() {
         chunkIndex: i,
         totalChunks: manChunksClear.length,
         totalPlainLen: manifestBytes.length,
-        params: tunedParams
+        params: { ...tunedParams, bundleId }
       });
       manSealedParts.push({ name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: sealed });
       if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
@@ -1517,13 +1621,14 @@ async function doEncrypt() {
     const manIndexSealed = [];
     
     for (let i = 0; i < manIndexChunks.length; i++) {
+      const chunk = padToFixed(manIndexChunks[i]);
       const sealed = await sealFixedChunk({
         password,
-        payloadChunk: padToFixed(manIndexChunks[i]),
+        payloadChunk: chunk,
         chunkIndex: i,
         totalChunks: manIndexChunks.length,
         totalPlainLen: manIndexBytes.length,
-        params: tunedParams
+        params: { ...tunedParams, bundleId }
       });
       manIndexSealed.push({
         name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
@@ -1573,7 +1678,7 @@ async function doEncrypt() {
     setLive('Encryption complete (bundle bound by manifest index).');
   } catch (err) {
     logError(err);
-    handleOpError('Encryption', err);
+    await secureFail('Encryption');
     setProgress(encBar, 0);
     clearPasswords();
   } finally {
@@ -1633,18 +1738,34 @@ async function decodeChunked(u8, chunkSize = 64 * 1024) {
 async function tryRenderOrDownload(bytes, containerSel, textSel) {
   const isUtf8Text = looksLikeUtf8Text(bytes);
   if (isUtf8Text) {
-     // Very large text? Don’t render; offer a download instead.
-     if (bytes.length > MAX_PREVIEW) {
-       addDownload(containerSel, new Blob([bytes], { type: 'application/octet-stream' }), 'decrypted.txt', 'Download text');
-       setText(textSel, 'Large text content — download provided.');
-       return;
-     }
-     // Decode incrementally to avoid UI stalls.
-     const t = await decodeChunked(bytes);
-     setText(textSel, t);
-     addDownload(containerSel, new Blob([t], { type: 'text/plain;charset=utf-8' }), 'decrypted.txt', 'Download text');
+    // Very large text? Don’t render; offer a download instead.
+    if (bytes.length > MAX_PREVIEW) {
+      // keep bytes (no full decode), but mark as text for correct file handling
+      addDownload(
+        containerSel,
+        new Blob([bytes], { type: 'text/plain;charset=utf-8' }),
+        'decrypted.txt',
+        'Download text'
+      );
+      setText(textSel, 'Large text content — download provided.');
+      return;
+    }
+    // Decode incrementally to avoid UI stalls.
+    const t = await decodeChunked(bytes);
+    setText(textSel, t);
+    addDownload(
+      containerSel,
+      new Blob([t], { type: 'text/plain;charset=utf-8' }),
+      'decrypted.txt',
+      'Download text'
+    );
   } else {
-    addDownload(containerSel, new Blob([bytes], { type: 'application/octet-stream' }), 'decrypted.bin', 'Download file');
+    addDownload(
+      containerSel,
+      new Blob([bytes], { type: 'application/octet-stream' }),
+      'decrypted.bin',
+      'Download file'
+    );
   }
 }
 
@@ -1667,10 +1788,9 @@ async function doDecrypt() {
     // UX rate-limit
     const gate = allow('decrypt');
     if (!gate.ok) {
-      userError(`Too many attempts in a short period. Please wait ~${Math.ceil(gate.wait/1000)}s.`);
       cooldownButton('#btnDecrypt', gate.wait);
-      setProgress(decBar, 0);
-      return;
+      setProgress(decBar, 0); // instant visual reset
+      throw new EnvelopeError('rate_limit', 'cooldown');
     }
 
     setProgress(decBar, 10);
@@ -1685,11 +1805,11 @@ async function doDecrypt() {
     clearNode('#decResults'); setText('#decText',''); setText('#decIntegrity','');
 
     const pw = $('#decPassword').value || '';
-    if (!pw) { userError('Please provide the passphrase.'); return; }
+    if (!pw) throw new EnvelopeError('input', 'missing');
     const password = pw.normalize('NFKC');
 
     const f = $('#decFile').files?.[0];
-    if (!f) { userError('Choose a .cbox or .cboxbundle file.'); return; }
+    if (!f)  throw new EnvelopeError('input', 'missing');
     const name = f.name.toLowerCase();
 
     if (name.endsWith(FILE_SINGLE_EXT)) {
@@ -1731,9 +1851,7 @@ async function doDecrypt() {
     }
 
     if (!name.endsWith(FILE_BUNDLE_EXT)) {
-      userError('Unsupported file type.');
-      setProgress(decBar, 0);
-      return;
+      throw new EnvelopeError('input', 'unsupported');
     }
 
     // Read ZIP and extract strict entries
@@ -1767,6 +1885,8 @@ async function doDecrypt() {
       .filter(e => /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i.test(e.name))
       .sort((a, b) => a.name.localeCompare(b.name));
     
+    let expectedBundleId = null; // learned from first MANIFEST_INDEX part
+    
     if (idxEntries.length === 0) {
       throw new EnvelopeError('no_manifest_index', 'Manifest index missing');
     }
@@ -1777,6 +1897,20 @@ async function doDecrypt() {
     
     for (let i = 0; i < idxEntries.length; i++) {
       const opened = await openFixedChunk({ password, bytes: idxEntries[i].bytes });
+
+      // Learn bundleId from the first index part; enforce on the rest
+      const bi = opened.meta && opened.meta.bundleId;
+      if (i === 0) {
+        if (typeof bi !== 'string' || bi.length === 0) {
+          throw new EnvelopeError('bundle_missing', 'Missing bundleId');
+        }
+        expectedBundleId = bi;
+      } else {
+        if (bi !== expectedBundleId) {
+          throw new EnvelopeError('bundle_mix', 'Mixed bundleId across manifest index parts');
+        }
+      }
+
       const inner  = opened.innerMeta;
     
       // Strict structural checks
@@ -1860,7 +1994,18 @@ async function doDecrypt() {
       const entry = byName.get(`MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
       if (!entry) throw new EnvelopeError('missing_manifest_part', `Manifest chunk ${i} missing`);
 
-      const opened = await openFixedChunk({ password, bytes: entry.bytes });
+      const opened = await openFixedChunk({
+        password,
+        bytes: entry.bytes,
+        expectedBundleId
+      });
+
+      // Enforce same bundleId across MANIFEST parts
+      const bm = opened.meta && opened.meta.bundleId;
+      if (bm !== expectedBundleId) {
+        throw new EnvelopeError('bundle_mismatch', `Manifest chunk ${i}: bundleId mismatch`);
+      }
+      
       const inner  = opened.innerMeta;
 
       if (inner.kind !== 'fixed') throw new EnvelopeError('man_part_kind',  `Manifest chunk ${i}: unexpected type`);
@@ -1948,7 +2093,18 @@ async function doDecrypt() {
       const entry = byName.get(`part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
       if (!entry) throw new EnvelopeError('missing_part', `Chunk ${i} missing`);
 
-      const opened = await openFixedChunk({ password, bytes: entry.bytes });
+      const opened = await openFixedChunk({
+        password,
+        bytes: entry.bytes,
+        expectedBundleId
+      });
+
+      // Enforce same bundleId across DATA parts
+      const bd = opened.meta && opened.meta.bundleId;
+      if (bd !== expectedBundleId) {
+        throw new EnvelopeError('bundle_mismatch', `Chunk ${i}: bundleId mismatch`);
+      }
+
       const inner  = opened.innerMeta;
 
       if (inner.kind !== 'fixed') throw new EnvelopeError('part_kind',  `Chunk ${i}: unexpected type`);
@@ -1998,7 +2154,7 @@ async function doDecrypt() {
     try { $('#decFile').value = ''; setText('#decFileName',''); } catch {}
   } catch (err) {
     logError(err);
-    handleOpError('Decryption', err);
+    await secureFail('Decryption');
     setProgress(decBar, 0);
     clearPasswords();
   } finally {
