@@ -89,7 +89,7 @@ header{
   width:30px; height:30px;
   border-radius:8px;
   background:linear-gradient(135deg,var(--accent),var(--accent-2));
-  background-image: url('./favicon-64.png');
+  background-image: url('./favicon-32.png');
 }
 h1{ margin:0; font-size:1.1rem }
 
