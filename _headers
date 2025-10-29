@@ -1,0 +1,3 @@
+/argon-worker-permissive.js
+  Content-Security-Policy: script-src 'self' 'wasm-unsafe-eval'
+
