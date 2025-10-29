@@ -324,3 +324,80 @@ fieldset.row{ /* safe default if you prefer not to add a class */
 .bar.p-100 { width:100% }
 
 .visible { display:block !important }
+
+/* ================= Error Banner ================= */
+.banner{
+  display:block;
+  background:var(--card);
+  color:var(--fg);
+  border:1px solid var(--border);
+  border-left-width:6px;                 /* repère visuel */
+  border-radius:12px;
+  padding:12px 14px;
+  box-shadow:var(--shadow);
+  margin:4px 0 8px;
+  line-height:1.4;
+  position:relative;
+}
+
+/* Variantes de statut (tu peux en ajouter d'autres si besoin) */
+.banner.error{
+  border-left-color:var(--err);
+}
+.banner.warn{
+  border-left-color:var(--warn);
+}
+.banner.ok{
+  border-left-color:var(--accent-2);
+}
+
+/* Petit pictogramme (optionnel) via pseudo-élément */
+.banner::before{
+  content:"";
+  position:absolute;
+  left:12px; top:50%;
+  transform:translateY(-50%);
+  width:10px; height:10px;
+  border-radius:50%;
+  background:currentColor;
+  opacity:.15;
+}
+
+/* Contenu textuel décalé si tu utilises le dot ci-dessus */
+.banner > *{
+  margin:0;
+  padding-left:0;
+}
+.banner p{ margin:0 }                     /* sécurité */
+.banner strong{ font-weight:700 }
+
+/* Bouton close optionnel si tu en ajoutes un plus tard */
+.banner .close{
+  position:absolute;
+  right:10px; top:8px;
+  border:none;
+  background:transparent;
+  color:var(--muted);
+  cursor:pointer;
+  padding:6px;
+  border-radius:8px;
+}
+.banner .close:focus-visible{
+  outline:3px solid var(--focus);
+  outline-offset:2px;
+}
+
+/* Respecte les préférences d’animations de l’utilisateur */
+@media (prefers-reduced-motion: no-preference){
+  .banner{
+    animation: slide-down .18s ease-out both;
+  }
+}
+@keyframes slide-down{
+  from{ transform:translateY(-6px); opacity:0 }
+  to  { transform:translateY(0);    opacity:1 }
+}
+
+/* L’élément sera masqué par l’attribut hidden que tu toggles en JS */
+.banner[hidden]{ display:none !important }
+
