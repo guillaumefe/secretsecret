@@ -3619,12 +3619,27 @@ function wireDrop(zoneId, inputId, listId){
   if (!zone || !input) return;
 
   // Trigger system picker on click or keyboard activation
-  const openPicker = () => input.click();
-  zone.addEventListener('click', openPicker);
+  const isNativeLabel = zone.tagName === 'LABEL' && zone.getAttribute('for') === inputId;
+
+  if (!isNativeLabel) {
+    const openPicker = () => {
+      const wasHidden = input.hasAttribute('hidden');
+      if (wasHidden) input.removeAttribute('hidden');     // dé-cache temporairement
+  
+      if (typeof input.showPicker === 'function') input.showPicker();
+      else input.click();
+  
+      if (wasHidden) input.setAttribute('hidden', '');    // re-cache
+    };
+    zone.addEventListener('click', openPicker);
+  }
+  
+  // Accessibilité clavier : Enter/Espace
   zone.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
-      openPicker();
+      if (typeof input.showPicker === 'function') input.showPicker();
+      else input.click();
     }
   });
 
