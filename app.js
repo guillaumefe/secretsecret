@@ -30,6 +30,72 @@ const ARGON_MAX_T        = 10;
 // Max amount of text we render directly in the UI (1 MiB)
 const MAX_PREVIEW = 1 * 1024 * 1024;
 
+let encBusy = false;
+
+// ===== Trusted Types setup (default + worker-url) ===============================
+// CSP expectations:
+//   require-trusted-types-for 'script';
+//   trusted-types default worker-url;
+// Policy goals:
+//   - Block createHTML / createScript (no innerHTML/eval injection).
+//   - Only allow same-origin ScriptURLs for Web Workers and modules.
+//   - Support GitHub Pages subfolder deployments.
+// ==============================================================================
+
+(function setupTrustedTypes() {
+  // If Trusted Types are not supported, nothing to do (older browsers).
+  if (!window.trustedTypes) return;
+
+  // Shared validator for allowed ScriptURLs
+  const allowScriptURL = (url) => {
+    // Resolve relative paths correctly, including subfolder deployments
+    const u = new URL(url, location.href);
+
+    // 1) Enforce same-origin URLs only
+    if (u.origin !== location.origin) {
+      throw new TypeError('TrustedTypes: only same-origin ScriptURL allowed');
+    }
+
+    // 2) Whitelist only the expected JS assets
+    const p = u.pathname;
+    const allowed =
+      p.endsWith('/app.js') ||
+      p.endsWith('/argon-worker.js') ||
+      p.endsWith('/argon-worker-permissive.js') ||
+      p.endsWith('/argon2-bundled.min.js');
+
+    if (!allowed) {
+      throw new TypeError('TrustedTypes: ScriptURL path not whitelisted: ' + p);
+    }
+
+    return u.toString(); // Safe normalized ScriptURL string
+  };
+
+  // Create the "default" policy if not already defined
+  try {
+    if (!trustedTypes.defaultPolicy) {
+      trustedTypes.createPolicy('default', {
+        createHTML()   { throw new TypeError('TrustedTypes: createHTML blocked'); },
+        createScript() { throw new TypeError('TrustedTypes: createScript blocked'); },
+        createScriptURL: allowScriptURL,
+      });
+    }
+  } catch (e) {
+    try { console.warn('[TT] default policy not installed:', e); } catch {}
+  }
+
+  // Create a dedicated "worker-url" policy (allowed by CSP)
+  try {
+    trustedTypes.createPolicy('worker-url', {
+      createScriptURL: allowScriptURL,
+    });
+  } catch (e) {
+    try { console.warn('[TT] worker-url policy not installed (may already exist):', e); } catch {}
+  }
+})();
+
+
+
 // ===== Utilities =====
 
 /**
@@ -124,6 +190,31 @@ function showErrorBanner(text) {
   setTimeout(() => { try { el.hidden = true; setText(el, ''); } catch {} }, 8000);
 }
 
+// === EnvelopeError (global) ===
+(() => {
+  if (typeof globalThis.EnvelopeError === 'function') return;
+  class EnvelopeError extends Error {
+    constructor(code, message, opts = {}) {
+      if (opts && 'cause' in opts) {
+        try { super(message, { cause: opts.cause }); }
+        catch { super(message); this.cause = opts.cause; }
+      } else {
+        super(message);
+      }
+      this.name = 'EnvelopeError';
+      Object.defineProperties(this, {
+        code:     { value: code, enumerable: true, writable: true },
+        fileName: { value: opts.fileName, enumerable: !!opts.fileName, writable: true },
+        meta:     { value: opts.meta, enumerable: !!opts.meta, writable: true },
+      });
+      if (opts.cause && !('cause' in this)) {
+        Object.defineProperty(this, 'cause', { value: opts.cause, enumerable: true });
+      }
+    }
+  }
+  globalThis.EnvelopeError = EnvelopeError;
+})();
+
 /**
  * Clear password inputs and strength readout for hygiene.
  */
@@ -192,12 +283,71 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function secureFail(ctx) {
+async function secureFail(ctx, overrideMsg) {
   await sleep(400); // fixed minimum latency for failure paths
 
-  // Generic error message to reduce oracle surface
-  setLive(`${ctx} failed or file is corrupted.`);
-  showErrorBanner(`${ctx} failed or file is corrupted.`);
+  // Generic message par défaut, mais on autorise un override ciblé
+  const msg = overrideMsg || `${ctx} failed or file is corrupted.`;
+  logInfo('[secureFail]', { ctx, msg });
+  setLive(msg);
+  showErrorBanner(msg);
+}
+
+function normalizeEncError(err) {
+  try {
+    const code = err && err.code;
+    const name = err && err.name;
+    const raw  = (err && (err.msg || err.message)) || '';
+    const text = (raw || '').toString();
+    
+    // — cas connus / fréquents —
+    if (code === 'input_large' || /Total input too large/i.test(text))
+      return 'Total input too large for this device.';
+
+    if (code === 'too_many_entries' || /too many files|central directory/i.test(text))
+      return 'Trop de fichiers dans le lot.';
+
+    if (code === 'zip_crc' || /CRC mismatch/i.test(text))
+      return 'Erreur d’intégrité (CRC) dans le bundle. Réessayez avec un lot plus petit.';
+
+    if (code === 'oom' || /out of memory|heap out of memory|Cannot allocate memory/i.test(text))
+      return 'Mémoire insuffisante. Fermez d’autres onglets ou scindez le lot.';
+
+    if (/QuotaExceededError|No space left on device|ENOSPC/i.test(text))
+      return 'Plus d’espace disponible (quota navigateur / stockage).';
+
+    if (code === 'aborted' || name === 'AbortError' || /user aborted|AbortError/i.test(text))
+      return 'Opération interrompue par l’utilisateur.';
+
+    if (/writer.*closed|stream.*locked|already.*locked/i.test(text))
+      return 'Flux de sortie fermé/indisponible pendant le chiffrement.';
+
+    if (/Maximum call stack size exceeded/i.test(text))
+      return 'Pile d’appels saturée (trop de fichiers ou structure trop profonde).';
+
+    if (/NetworkError|ERR_NETWORK|Failed to fetch/i.test(text))
+      return 'Erreur réseau pendant le chiffrement.';
+
+    // Dernier recours
+    logError('[DEBUG]', err);
+    return 'Encryption failed or file is corrupted.';
+  } catch {
+    logError('[DEBUG]', err);
+    return 'Encryption failed or file is corrupted.';
+  }
+}
+
+function preflightInputs(files) {
+  const total = files.reduce((s,f)=>s+ (f.size||0), 0);
+  const count = files.length;
+  const dm = navigator.deviceMemory || 4; // en GiB – très grossier
+
+  // Heuristiques prudentes
+  const maxBytes = Math.min(1.5e9, dm * 0.6 * 1024*1024*1024); // ~60% de la RAM annoncée, plafonné ~1.5GB
+  const maxCount = 2000;
+
+  if (count > maxCount) throw new EnvelopeError('too_many_entries', `Too many files (${count})`);
+  if (total > maxBytes)  throw new EnvelopeError('input_large', 'Total input too large for this device');
 }
 
 
@@ -253,9 +403,15 @@ function setText(selOrEl, text) {
 /**
  * Custom error type for envelope/ZIP/KDF related errors.
  */
-class EnvelopeError extends Error {
-  constructor(code, message) { super(message); this.name = 'EnvelopeError'; this.code = code; }
-}
++class EnvelopeError extends Error {
+    constructor(code, message, opts) {
+      // support native Error cause (Chrome/Firefox)
+      super(message, opts && opts.cause ? { cause: opts.cause } : undefined);
+      this.name = 'EnvelopeError';
+      this.code = code;
+      if (opts?.fileName) this.fileName = opts.fileName;
+    }
+  }
 
 
 
@@ -408,7 +564,42 @@ function timingSafeEqual(a, b) {
   return out === 0;
 }
 
+/* ******************************************************
+ * HKDF helpers (one-time master → subkeys/IVs)
+ *  - hkdfExpand: WebCrypto HKDF-Expand (SHA-256)
+ *  - hkdfSplit : derive encryption and IV subkeys from master
+ ****************************************************** */
+async function hkdfExpand(baseKeyBytes, saltBytes, infoBytes, outLen) {
+  const ikm = await crypto.subtle.importKey('raw', baseKeyBytes, 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: saltBytes, info: infoBytes },
+    ikm, outLen * 8
+  );
+  return new Uint8Array(bits);
+}
 
+async function hkdfSplit(master32, bundleSalt) {
+  const kEnc32 = await hkdfExpand(master32, bundleSalt, TE.encode('cbox/kEnc'), 32);
+  const kIv32  = await hkdfExpand(master32, bundleSalt, TE.encode('cbox/kIv'),  32);
+  return { kEnc32, kIv32 };
+}
+
+/* ******************************************************
+ * Deterministic 96-bit IV per chunk via HKDF
+ *  - Stable for (kIv32, bundleId, chunkIndex)
+ ****************************************************** */
+async function deriveIv96(kIv32, bundleId, chunkIndex) {
+  const prefix = TE.encode('cbox/iv/');
+  const bid    = TE.encode(bundleId);
+  const info   = new Uint8Array(prefix.length + bid.length + 4);
+
+  let p = 0;
+  info.set(prefix, p); p += prefix.length;
+  info.set(bid,    p); p += bid.length;
+  new DataView(info.buffer, info.byteOffset + p, 4).setUint32(0, chunkIndex >>> 0, false);
+
+  return hkdfExpand(kIv32, new Uint8Array(0), info, 12); // 96-bit IV
+}
 
 // ===== Worker selection (strict vs permissive) =====
 //
@@ -462,16 +653,36 @@ async function startArgonWorker(url) {
             abs.pathname.endsWith('/argon-worker.js') ||
             abs.pathname.endsWith('/argon-worker-permissive.js');
           if (!okOrigin || !okPath) {
-            throw new TypeError('Rejected Worker ScriptURL');
+            throw new EnvelopeError('worker_url_blocked', 'Rejected Worker ScriptURL', { fileName: abs.pathname });
           }
           return abs.toString();
         }
       })) || { createScriptURL: (u) => u }; // Fallback when Trusted Types is unavailable
  
-      w = new Worker(workerPolicy.createScriptURL(url));
+      try {
+          w = new Worker(workerPolicy.createScriptURL(url));
+      } catch (e) {
+          // Erreur de construction du Worker (CSP/TT/URL)
+          throw new EnvelopeError('worker_init', 'Failed to construct Argon2 worker', { cause: e, fileName: url });
+      }
+
+      w.onerror = (ev) => {
+        if (settled) return;
+        settled = true;
+        reject(new EnvelopeError('worker_runtime', 'Worker runtime error', { cause: ev.error || ev, fileName: url }));
+      };
+      
+      w.onmessageerror = (ev) => {
+        if (settled) return;
+        settled = true;
+        reject(new EnvelopeError('worker_runtime', 'Worker message error', { cause: ev.error || ev, fileName: url }));
+      };
+      
     } catch (syncErr) {
       // CSP/TT/URL can block synchronously
-      reject(syncErr);
+      reject(syncErr instanceof EnvelopeError
+        ? syncErr
+        : new EnvelopeError('worker_init', 'Failed to start Argon2 worker', { cause: syncErr, fileName: url }));
       return;
     }
 
@@ -755,63 +966,86 @@ function validateArgon({ mMiB, t, p }) {
   if (!Number.isFinite(p)    || p    < HEALTHY_P_MIN || p    > HEALTHY_P_MAX) throw new EnvelopeError('arg_parallel', 'Unsupported Argon2 parallelism');
 }
 
-/**
- * Seal a fixed-size chunk using AES-GCM with AAD-bound metadata.
- * Returns a new Uint8Array containing [MAGIC | metaLenBE | meta | cipher].
- */
-async function sealFixedChunk({ password, payloadChunk, chunkIndex, totalChunks, totalPlainLen, params }) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv   = crypto.getRandomValues(new Uint8Array(12));
+/* ******************************************************
+ * sealFixedChunkDet
+ *  - Encrypt a fixed-size chunk with AES-GCM (bundle-level keys)
+ ****************************************************** */
+async function sealFixedChunkDet({
+  kEncKey, kIv32, bundleId, payloadChunk, chunkIndex, totalChunks, totalPlainLen
+}) {
+  const ivU8 = new Uint8Array(await deriveIv96(kIv32, bundleId, chunkIndex));
 
-  // Inner meta is prepended length + JSON + fixed payload
   const innerMeta = { v: 1, kind: 'fixed', fixedSize: FIXED_CHUNK_SIZE, chunkIndex, totalChunks, totalPlainLen };
   const innerMetaBytes = TE.encode(JSON.stringify(innerMeta));
-  const header4        = u32be(innerMetaBytes.length);
-  const plainPre       = new Uint8Array(4 + innerMetaBytes.length + FIXED_CHUNK_SIZE);
+  const header4 = u32be(innerMetaBytes.length);
+  const plainPre = new Uint8Array(4 + innerMetaBytes.length + FIXED_CHUNK_SIZE);
   plainPre.set(header4, 0);
   plainPre.set(innerMetaBytes, 4);
-  const fixed = padToFixed(payloadChunk);
-  plainPre.set(fixed, 4 + innerMetaBytes.length);
+  plainPre.set(payloadChunk, 4 + innerMetaBytes.length);
 
   const metaObj = {
     enc_v: 4, algo: 'AES-GCM',
-    iv: b64(iv), salt: b64(salt),
-    kdf: { kdf: 'Argon2id', v: 1, mMiB: params.mMiB, t: params.t, p: params.p },
-    bundleId: params.bundleId // <— anti-replay binding
+    iv: b64(ivU8),                     // informational only
+    salt: null,
+    kdf: { kdf: 'HKDF', v: 1, from: 'Argon2id-once' },
+    bundleId
   };
   const aad = metaAAD(metaObj);
 
-  const keyBytes = await deriveArgon2id(password, salt, params);
-  const key      = await importAesKey(keyBytes);
-  const ct       = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, key, plainPre));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: ivU8, additionalData: aad, tagLength: 128 },
+    kEncKey, plainPre
+  ));
 
-  const metaBytes = aad;
-  const head = new Uint8Array(MAGIC.length + 4 + metaBytes.length);
+  const head = new Uint8Array(MAGIC.length + 4 + aad.length);
   head.set(MAGIC, 0);
-  new DataView(head.buffer, MAGIC.length, 4).setUint32(0, metaBytes.length, false);
-  head.set(metaBytes, MAGIC.length + 4);
+  new DataView(head.buffer, MAGIC.length, 4).setUint32(0, aad.length, false);
+  head.set(aad, MAGIC.length + 4);
 
   const out = new Uint8Array(head.length + ct.length);
   out.set(head, 0); out.set(ct, head.length);
 
-  wipeBytes(keyBytes); wipeBytes(salt); wipeBytes(iv); wipeBytes(fixed); wipeBytes(plainPre);
+  try { plainPre.fill(0); } catch {}
   return out;
 }
 
-/**
- * Open and authenticate a sealed fixed-size chunk.
- * Returns { meta, innerMeta, fixedChunk } if successful.
- */
-async function openFixedChunk({ password, bytes, expectedBundleId }) {
-  if (bytes.length < 9) throw new EnvelopeError('format', 'Invalid envelope');
-  if (TD.decode(bytes.subarray(0, 5)) !== 'CBOX4') throw new EnvelopeError('magic', 'Unknown format');
 
-  const metaLen = new DataView(bytes.buffer, bytes.byteOffset + 5, 4).getUint32(0, false);
-  const metaEnd = 9 + metaLen;
-  if (metaEnd > bytes.length) throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
+/* ******************************************************
+ * openFixedChunkDet
+ *  - Decrypts a fixed-size chunk using bundle-level:
+ *      - kEncKey (AES-256-GCM)
+ *      - kIv32 (HKDF IV key) to rebuild IV deterministically
+ *  - Verifies bundleId and inner meta
+ ****************************************************** */
+async function openFixedChunkDet({ kEncKey, kIv32, bytes, expectedBundleId, chunkIndex }) {
+  /* ******************************************************
+   * Strict header: MAGIC + meta length field guard
+   ****************************************************** */
+  const MAGIC_LEN = MAGIC.length;
+  if (bytes.length < MAGIC_LEN + 4) {
+    throw new EnvelopeError('format', 'Invalid envelope');
+  }
+  const magicView = bytes.subarray(0, MAGIC_LEN);
+  for (let i = 0; i < MAGIC_LEN; i++) {
+    if (magicView[i] !== MAGIC[i]) {
+      throw new EnvelopeError('magic', 'Unknown format');
+    }
+  }
 
-  const metaBytes = bytes.subarray(9, metaEnd);
-  if (metaBytes.length > 4096) throw new EnvelopeError('meta_big', 'Metadata too large');
+  /* ******************************************************
+   * Metadata (AAD) parsing
+   ****************************************************** */
+  const metaLen   = new DataView(bytes.buffer, bytes.byteOffset + MAGIC_LEN, 4).getUint32(0, false);
+  const metaStart = MAGIC_LEN + 4;
+  const metaEnd   = metaStart + metaLen;
+  if (metaEnd > bytes.length) {
+    throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
+  }
+
+  const metaBytes = bytes.subarray(metaStart, metaEnd);
+  if (metaBytes.length > 4096) {
+    throw new EnvelopeError('meta_big', 'Metadata too large');
+  }
 
   let meta;
   try {
@@ -820,37 +1054,27 @@ async function openFixedChunk({ password, bytes, expectedBundleId }) {
     throw new EnvelopeError('meta_parse', 'Malformed metadata');
   }
 
-  const salt = b64d(meta.salt || '');
-  const iv   = b64d(meta.iv || '');
-
-  if (salt.length !== 16) throw new EnvelopeError('salt_len', 'Bad salt length');
-  if (iv.length   !== 12) throw new EnvelopeError('iv_len',   'Bad IV length');
-
-  // Version & algorithm pinning
-  if (meta.enc_v !== 4) throw new EnvelopeError('enc_v', 'Unsupported envelope version');
-  if (meta.algo !== 'AES-GCM') throw new EnvelopeError('algo', 'Unsupported AEAD');
-
-  // Enforce anti-replay if caller provided an expected bundleId
-  if (expectedBundleId !== undefined) {
-    if (typeof meta.bundleId !== 'string' || meta.bundleId !== expectedBundleId) {
-      throw new EnvelopeError('bundle_mismatch', 'BundleId mismatch');
-    }
+  if (meta.enc_v !== 4 || meta.algo !== 'AES-GCM') {
+    throw new EnvelopeError('algo', 'Unsupported AEAD');
+  }
+  if (expectedBundleId !== undefined && meta.bundleId !== expectedBundleId) {
+    throw new EnvelopeError('bundle_mismatch', 'BundleId mismatch');
   }
 
-  const k = meta.kdf || {};
-  if (k.kdf !== 'Argon2id') throw new EnvelopeError('kdf', 'Unsupported KDF');
-  if (k.v !== 1)            throw new EnvelopeError('kdf_v', 'Unsupported KDF version');
-  validateArgon({ mMiB: k.mMiB, t: k.t, p: k.p });
+  /* ******************************************************
+   * Deterministic IV for this chunk
+   ****************************************************** */
+  const ivU8 = await deriveIv96(kIv32, meta.bundleId || '', chunkIndex >>> 0);
 
-  const keyBytes = await deriveArgon2id(password, salt, { mMiB: k.mMiB, t: k.t, p: k.p });
-  const key      = await importAesKey(keyBytes);
-
+  /* ******************************************************
+   * Decrypt and parse inner prelude
+   ****************************************************** */
   const cipher = bytes.subarray(metaEnd);
   const clear  = new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv, additionalData: metaBytes, tagLength: 128 },
-    key, cipher
+    { name: 'AES-GCM', iv: ivU8, additionalData: metaBytes, tagLength: 128 },
+    kEncKey,
+    cipher
   ));
-  wipeBytes(keyBytes);
 
   if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
   const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
@@ -873,6 +1097,106 @@ async function openFixedChunk({ password, bytes, expectedBundleId }) {
   return { meta, innerMeta, fixedChunk: out };
 }
 
+/* ******************************************************
+ * openFixedChunk (legacy, password-based per envelope)
+ *  - Supports single .cbox path with per-envelope Argon2id
+ *  - Reads KDF params from metadata (meta.kdf) or falls back to tunedParams
+ *  - Returns { meta, innerMeta, fixedChunk }
+ ****************************************************** */
+async function openFixedChunk({ password, bytes, params }) {
+  if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
+
+  /* ******************************************************
+   * Strict header: MAGIC + meta length field guard
+   ****************************************************** */
+  const MAGIC_LEN = MAGIC.length;
+  if (bytes.length < MAGIC_LEN + 4) {
+    throw new EnvelopeError('format', 'Invalid envelope');
+  }
+  const magicView = bytes.subarray(0, MAGIC_LEN);
+  for (let i = 0; i < MAGIC_LEN; i++) {
+    if (magicView[i] !== MAGIC[i]) {
+      throw new EnvelopeError('magic', 'Unknown format');
+    }
+  }
+
+  /* ******************************************************
+   * Metadata (AAD) parsing
+   ****************************************************** */
+  const metaLen   = new DataView(bytes.buffer, bytes.byteOffset + MAGIC_LEN, 4).getUint32(0, false);
+  const metaStart = MAGIC_LEN + 4;
+  const metaEnd   = metaStart + metaLen;
+  if (metaEnd > bytes.length) {
+    throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
+  }
+
+  const metaBytes = bytes.subarray(metaStart, metaEnd);
+  if (metaBytes.length > 4096) {
+    throw new EnvelopeError('meta_big', 'Metadata too large');
+  }
+
+  let meta;
+  try {
+    meta = JSON.parse(TD.decode(metaBytes));
+  } catch {
+    throw new EnvelopeError('meta_parse', 'Malformed metadata');
+  }
+
+  if (meta.enc_v !== 4 || meta.algo !== 'AES-GCM') {
+    throw new EnvelopeError('algo', 'Unsupported AEAD');
+  }
+  if (!meta.kdf || meta.kdf.kdf !== 'Argon2id') {
+    throw new EnvelopeError('kdf', 'Unsupported KDF');
+  }
+  if (!meta.salt) {
+    throw new EnvelopeError('salt', 'Missing KDF salt');
+  }
+
+  /* ******************************************************
+   * Per-envelope Argon2id → AES-GCM key
+   ****************************************************** */
+  const kdfParams = {
+    mMiB: Number(meta.kdf.mMiB ?? params?.mMiB ?? tunedParams?.mMiB),
+    t:    Number(meta.kdf.t    ?? params?.t    ?? tunedParams?.t),
+    p:    Number(meta.kdf.p    ?? params?.p    ?? tunedParams?.p)
+  };
+  validateArgon(kdfParams);
+
+  const salt    = b64d(meta.salt);
+  const keyBytes = await deriveArgon2id(password, salt, kdfParams);
+  const key      = await importAesKey(keyBytes);
+
+  /* ******************************************************
+   * Decrypt and parse inner prelude
+   ****************************************************** */
+  const cipher = bytes.subarray(metaEnd);
+  const clear  = new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: b64d(meta.iv), additionalData: metaBytes, tagLength: 128 },
+    key,
+    cipher
+  ));
+
+  if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
+  const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
+  const innerEnd = 4 + innerLen;
+  if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner meta');
+
+  const innerMetaBytes = clear.subarray(4, innerEnd);
+  let innerMeta;
+  try {
+    innerMeta = JSON.parse(TD.decode(innerMetaBytes));
+  } catch {
+    throw new EnvelopeError('inner_parse', 'Malformed inner meta');
+  }
+
+  const fixedPayload = clear.subarray(innerEnd, innerEnd + FIXED_CHUNK_SIZE);
+  const out = new Uint8Array(fixedPayload.length);
+  out.set(fixedPayload);
+
+  try { clear.fill(0); } catch {}
+  try { keyBytes.fill(0); } catch {}
+  return { meta, innerMeta, fixedChunk: out };
+}
 
 
 // ===== Minimal ZIP (store-only) =====
@@ -898,6 +1222,15 @@ const CRC_TABLE = (() => {
  */
 function crc32(u8) {
   let c = 0xFFFFFFFF;
+  for (let i = 0; i < u8.length; i++) {
+    c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  }
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// --- CRC32 incremental update (util pour stream) ---
+function crc32Update(crc, u8) {
+  let c = crc ^ 0xFFFFFFFF;
   for (let i = 0; i < u8.length; i++) {
     c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
   }
@@ -1017,7 +1350,11 @@ function parseEOCDAndCentralDirectory(u8) {
 
     const nameBytes = u8.subarray(nameStart, nameEnd);
     const name = TD.decode(nameBytes);
-    index.set(name, relOffsetLFH);
+    const gpbf   = dv.getUint16(p + 8,  true);
+    const crc    = dv.getUint32(p + 16, true);
+    const csize  = dv.getUint32(p + 20, true);
+    const usize  = dv.getUint32(p + 24, true);
+    index.set(name, { lfhOffset: relOffsetLFH, gpbf, crc, compSize: csize, size: usize });    
 
     p = nextCD;
   }
@@ -1052,13 +1389,11 @@ async function extractZipEntriesStrict(u8) {
     const versionNeeded = readU16(dv, i + 4);
     const gpFlags       = readU16(dv, i + 6);
     const method        = readU16(dv, i + 8);
-    const compSize      = readU32(dv, i + 18);
-    const uncompSize    = readU32(dv, i + 22);
+    let   compSize      = readU32(dv, i + 18);
+    let   uncompSize    = readU32(dv, i + 22);
     const nameLen       = readU16(dv, i + 26);
     const extraLen      = readU16(dv, i + 28);
 
-    if ((gpFlags & 0x0008) !== 0)
-      throw new EnvelopeError('zip_dd', 'Data descriptor not allowed');
     if (method !== 0)
       throw new EnvelopeError('zip_method', 'Compression method not supported');
 
@@ -1067,6 +1402,19 @@ async function extractZipEntriesStrict(u8) {
     const nameEnd    = nameStart + nameLen;
     const extraStart = nameEnd;
     const extraEnd   = extraStart + extraLen;
+    const nameBytes  = u8.subarray(nameStart, nameEnd);
+    const name       = TD.decode(nameBytes);
+
+    // En mode data-descriptor, on écrase comp/uncomp/CRC avec ceux du CD
+    let declaredCRC  = readU32(dv, i + 14);
+    if ((gpFlags & 0x0008) !== 0) {
+      const cd = cdIndex.get(name);
+      if (!cd) throw new EnvelopeError('zip_cd_missing', 'CD entry not found for DD file');
+      compSize    = cd.compSize;
+      uncompSize  = cd.size;
+      declaredCRC = cd.crc;
+    }
+
     const dataStart  = extraEnd;
     const dataEnd    = dataStart + compSize;
 
@@ -1082,15 +1430,12 @@ async function extractZipEntriesStrict(u8) {
     if (totalDeclared > LIMIT_TOTAL)
       throw new EnvelopeError('zip_total', 'ZIP total size exceeds limit');
 
-    const nameBytes = u8.subarray(nameStart, nameEnd);
-    const name = TD.decode(nameBytes);
     if (name.includes('..') || name.startsWith('/') || name.includes('\\'))
       throw new EnvelopeError('zip_path', 'Suspicious entry name');
 
     const data = u8.subarray(dataStart, dataEnd);
 
-    // CRC-32 verification (LFH)
-    const declaredCRC = readU32(dv, i + 14);
+    // CRC-32 verification
     const actualCRC = crc32(data);
     if (declaredCRC !== actualCRC) {
       throw new EnvelopeError('zip_crc', 'CRC mismatch in ZIP entry');
@@ -1098,7 +1443,17 @@ async function extractZipEntriesStrict(u8) {
 
     entries.push({ name, bytes: new Uint8Array(data) });
 
-    i = dataEnd;
+    // En DD, il peut y avoir un data descriptor juste après dataEnd
+    if ((gpFlags & 0x0008) !== 0) {
+      // Descriptor avec signature 0x08074b50 → 16 octets (4+4+4+4)
+      // On le *tolère*, mais pas nécessaire de le revalider ici
+      const sig = (dataEnd + 4 <= LIMIT) ? readU32(dv, dataEnd) : 0;
+      if (sig === 0x08074b50) i = dataEnd + 16;
+      else i = dataEnd; // signature absente tolérée (certains writers)
+    } else {
+      i = dataEnd;
+    }
+
     if (entries.length > 2000)
       throw new EnvelopeError('zip_toomany', 'Too many entries');
   }
@@ -1109,6 +1464,176 @@ async function extractZipEntriesStrict(u8) {
   return entries;
 }
 
+// --- Sink minimaliste : accumulateur de segments ---
+class SegmentsSink {
+  constructor() {
+    this.parts = [];
+    this.size = 0;
+  }
+  async write(u8) {
+    const copy = (u8 instanceof Uint8Array) ? u8.slice() : new Uint8Array(u8);
+    this.parts.push(copy);
+    this.size += copy.length;          // <-- important: taille du COPIÉ
+  }
+  toUint8Array() {
+    const out = new Uint8Array(this.size);
+    let p = 0;
+    for (const part of this.parts) { out.set(part, p); p += part.length; }
+    return out;
+  }
+}
+
+// --- ZIP store-only en flux (sans data-descriptor) ---
+class StoreZipWriter {
+  constructor(sink) {
+    this.sink = sink;
+    this.offset = 0;
+    this.centrals = [];
+  }
+
+  // helpers (si pas déjà présents)
+  _u16(v){ const b=new Uint8Array(2); new DataView(b.buffer).setUint16(0,v,true); return b; }
+  _u32(v){ const b=new Uint8Array(4); new DataView(b.buffer).setUint32(0,v,true); return b; }
+  _str(s){ return new TextEncoder().encode(s); }
+  _concat(...parts){ const n=parts.reduce((a,p)=>a+p.length,0); const out=new Uint8Array(n); let o=0; for(const p of parts){ out.set(p,o); o+=p.length; } return out; }
+  _crc32 = (function(){ // table + incrementale (si vous avez déjà une fn crc32Update, utilisez-la)
+    const tbl=new Uint32Array(256).map((_,i)=>{let c=i; for(let k=0;k<8;k++) c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1); return c>>>0;});
+    return (crc,u8)=>{ crc^=0xFFFFFFFF; for(let i=0;i<u8.length;i++) crc=tbl[(crc^u8[i])&0xFF]^(crc>>>8); return (crc^0xFFFFFFFF)>>>0; };
+  })();
+
+  async addFile(name, size, crc32, bytesProducer) {
+    const nameBytes = TE.encode(String(name).replaceAll('\\','/'));
+    const { time, date } = dosDT();
+  
+    const useKnownSizes = (typeof size === 'number' && typeof crc32 === 'number');
+  
+    // --- 1) Local File Header ---
+    const gpbf   = useKnownSizes ? 0x0000 : 0x0008;  // bit 3 = data descriptor
+    const method = 0x0000;                           // store
+    const LFH = [
+      u32le(0x04034b50), u16le(20), u16le(gpbf), u16le(method),
+      u16le(time), u16le(date),
+      u32le(useKnownSizes ? crc32 : 0),
+      u32le(useKnownSizes ? size  : 0),
+      u32le(useKnownSizes ? size  : 0),
+      u16le(nameBytes.length), u16le(0)
+    ];
+    for (const part of LFH) { await this.sink.write(part); }
+    await this.sink.write(nameBytes);
+  
+    const lfhOffset = this.offset;
+    const headerLen = LFH.reduce((a,p)=>a+p.length,0) + nameBytes.length;
+    this.offset += headerLen;
+  
+    // --- 2) Stream data ---
+    let runningCRC = 0 >>> 0;
+    let written    = 0 >>> 0;
+    for await (const chunk of bytesProducer()) {
+      const u8 = (chunk instanceof Uint8Array) ? chunk : new Uint8Array(chunk);
+      runningCRC = crc32Update(runningCRC, u8);
+      written = (written + u8.length) >>> 0;
+      await this.sink.write(u8);
+      this.offset += u8.length;
+    }
+  
+    // Si on avait des tailles connues, "written" doit matcher "size"
+    if (useKnownSizes && written !== size) {
+      throw new EnvelopeError('zip_stream_size', `Size changed while writing "${name}" (expected ${size}, got ${written})`, { fileName: name });
+    }
+  
+    // --- 3) Data descriptor si nécessaire ---
+    if (!useKnownSizes) {
+      const DD = [
+        u32le(0x08074b50),             // signature (recommandée)
+        u32le(runningCRC),
+        u32le(written),
+        u32le(written)
+      ];
+      for (const part of DD) { await this.sink.write(part); }
+      this.offset += DD.reduce((a,p)=>a+p.length,0);
+    }
+  
+    // --- 4) Enregistrer pour le Central Directory ---
+    const finalCRC  = useKnownSizes ? crc32 : runningCRC;
+    const finalSize = useKnownSizes ? size  : written;
+    const CDH = [
+      u32le(0x02014b50), u16le(20), u16le(20),
+      u16le(gpbf), u16le(method),
+      u16le(time), u16le(date),
+      u32le(finalCRC),
+      u32le(finalSize), u32le(finalSize),
+      u16le(nameBytes.length), u16le(0), u16le(0), u16le(0), u16le(0),
+      u32le(0), u32le(lfhOffset)  // rel offset LFH
+    ];
+    this.centrals.push({ CDH, nameBytes });
+    // avancer l’offset
+    this.offset = dataOffset + size;
+  }
+
+  async finish() {
+    // Central directory
+    let centralSize = 0;
+    for (const {CDH, nameBytes} of this.centrals) {
+      for (const part of CDH) { await this.sink.write(part); centralSize += part.length; }
+      await this.sink.write(nameBytes); centralSize += nameBytes.length;
+    }
+    const centralOffset = this.offset;
+    this.offset += centralSize;
+
+    // EOCD
+    const EOCD = [
+      u32le(0x06054b50), u16le(0), u16le(0),
+      u16le(this.centrals.length), u16le(this.centrals.length),
+      u32le(centralSize), u32le(centralOffset), u16le(0)
+    ];
+    for (const part of EOCD) { await this.sink.write(part); }
+
+    // Si le sink est bufferisé (SegmentsSink), on renvoie l’U8 final.
+    // Sinon (FileStreamSink), on tente .close() et on renvoie null.
+    if (typeof this.sink.toUint8Array === 'function') {
+      return this.sink.toUint8Array();
+    }
+    if (typeof this.sink.close === 'function') {
+      try { await this.sink.close(); } catch {}
+    }
+    return null;
+  }  
+}
+
+// Adaptateur File System Access → même interface { write(u8) } que SegmentsSink
+class FileStreamSink {
+  constructor(fsWritable) { this.w = fsWritable; }
+  async write(u8) {
+    if (!(u8 instanceof Uint8Array)) u8 = new Uint8Array(u8);
+    await this.w.write(u8);            // l’API prend sa propre copie en interne
+  }
+  async close() {
+    try { await this.w.close(); } catch {}
+  }
+}
+
+
+// Choisit automatiquement le meilleur sink : FS (O(1)) sinon mémoire (SegmentsSink)
+async function getBundleSink(suggestedName = 'secret.cboxbundle') {
+  if (window.showSaveFilePicker) {
+    try {
+      const handle = await showSaveFilePicker({
+        suggestedName,
+        types: [{ description: 'Cipher bundle', accept: { 'application/octet-stream': [FILE_BUNDLE_EXT] } }]
+      });
+      const writable = await handle.createWritable();
+      const sink = new FileStreamSink(writable);
+      return { sink, kind: 'fs', close: () => sink.close() };
+    } catch (e) {
+      logWarn('[sink] SaveFilePicker cancelled or failed, falling back to memory', e);
+      const sink = new SegmentsSink();
+      return { sink, kind: 'mem', close: null };
+    }
+  }
+  // pas de FS API : fallback mémoire
+  const sink = new SegmentsSink();
+  return { sink, kind: 'mem', close: null };
+}
 
 
 // ===== Manifest (authenticated) =====
@@ -1158,6 +1683,101 @@ async function sealManifest({ password, params, chunkHashes, totalPlainLen }) {
   return out;
 }
 
+/* ******************************************************
+ * sealBundleHeaderWithPassword
+ *  - Small password-based header to bootstrap bundle keys
+ *  - Inner JSON: { v:1, kind:'bundle_header', bundleId, bundleSaltB64 }
+ ****************************************************** */
+async function sealBundleHeaderWithPassword({ password, params, bundleId, bundleSaltB64 }) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv   = crypto.getRandomValues(new Uint8Array(12));
+
+  const inner = { v: 1, kind: 'bundle_header', bundleId, bundleSaltB64 };
+  const innerBytes = TE.encode(JSON.stringify(inner));
+  const header4    = u32be(innerBytes.length);
+  const plainPre   = new Uint8Array(4 + innerBytes.length);
+  plainPre.set(header4, 0);
+  plainPre.set(innerBytes, 4);
+
+  const metaObj = {
+    enc_v: 4, algo: 'AES-GCM',
+    iv: b64(iv), salt: b64(salt),
+    kdf: { kdf: 'Argon2id', v: 1, mMiB: params.mMiB, t: params.t, p: params.p }
+  };
+  const aad = metaAAD(metaObj);
+
+  const keyBytes = await deriveArgon2id(password, salt, params);
+  const key      = await importAesKey(keyBytes);
+  const ct       = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, key, plainPre
+  ));
+
+  const head = new Uint8Array(MAGIC.length + 4 + aad.length);
+  head.set(MAGIC, 0);
+  new DataView(head.buffer, MAGIC.length, 4).setUint32(0, aad.length, false);
+  head.set(aad, MAGIC.length + 4);
+
+  const out = new Uint8Array(head.length + ct.length);
+  out.set(head, 0); out.set(ct, head.length);
+
+  wipeBytes(keyBytes); wipeBytes(salt); wipeBytes(iv); wipeBytes(plainPre);
+  return out;
+}
+
+/* ******************************************************
+ * openBundleHeaderWithPassword
+ *  - Open password-based header and return { bundleId, bundleSaltB64 }
+ ****************************************************** */
+async function openBundleHeaderWithPassword({ password, bytes, params }) {
+  if (bytes.length < 9) throw new EnvelopeError('format', 'Invalid envelope');
+
+  // MAGIC check
+  const magicView = bytes.subarray(0, MAGIC.length);
+  for (let i = 0; i < MAGIC.length; i++) {
+    if (magicView[i] !== MAGIC[i]) throw new EnvelopeError('magic', 'Unknown format');
+  }
+
+  const metaLen = new DataView(bytes.buffer, bytes.byteOffset + 5, 4).getUint32(0, false);
+  const metaEnd = 9 + metaLen;
+  if (metaEnd > bytes.length) throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
+
+  const metaBytes = bytes.subarray(9, metaEnd);
+  if (metaBytes.length > 4096) throw new EnvelopeError('meta_big', 'Metadata too large');
+
+  let meta;
+  try { meta = JSON.parse(TD.decode(metaBytes)); }
+  catch { throw new EnvelopeError('meta_parse', 'Malformed metadata'); }
+
+  if (meta.enc_v !== 4 || meta.algo !== 'AES-GCM') throw new EnvelopeError('algo', 'Unsupported AEAD');
+  if (!meta.salt) throw new EnvelopeError('salt', 'Missing KDF salt');
+
+  const salt = b64d(meta.salt);
+  const keyBytes = await deriveArgon2id(password, salt, params);
+  const key      = await importAesKey(keyBytes);
+
+  const cipher = bytes.subarray(metaEnd);
+  const clear  = new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: b64d(meta.iv), additionalData: metaBytes, tagLength: 128 },
+    key, cipher
+  ));
+
+  if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
+  const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
+  const innerEnd = 4 + innerLen;
+  if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner meta');
+
+  let inner;
+  try { inner = JSON.parse(TD.decode(clear.subarray(4, innerEnd))); }
+  catch { throw new EnvelopeError('inner_parse', 'Malformed inner JSON'); }
+  finally { try { clear.fill(0); } catch {} }
+
+  if (inner.kind !== 'bundle_header' || typeof inner.bundleId !== 'string' || typeof inner.bundleSaltB64 !== 'string') {
+    throw new EnvelopeError('bad_header', 'Invalid bundle header');
+  }
+
+  wipeBytes(keyBytes);
+  return { bundleId: inner.bundleId, bundleSaltB64: inner.bundleSaltB64 };
+}
 
 
 // ===== Heuristic UTF-8 detection =====
@@ -1670,299 +2290,521 @@ function chunkFixedGeneric(u8) {
   return chunks.length ? chunks : [ new Uint8Array(0) ];
 }
 
+async function computeCrcAndSizeFromFile(file) {
+  let crc = 0xFFFFFFFF ^ 0xFFFFFFFF; // just pour type
+  crc = 0xFFFFFFFF; // standard init
+  let size = 0;
+  const reader = file.stream().getReader();
+  while (true) {
+    const {value, done} = await reader.read();
+    if (done) break;
+    const u8 = value instanceof Uint8Array ? value : new Uint8Array(value);
+    crc = CRC_TABLE ? (function(c,u){ // inline update
+      for (let i=0;i<u.length;i++) c = CRC_TABLE[(c ^ u[i]) & 0xFF] ^ (c >>> 8);
+      return c;
+    })(crc, u8) : crc32Update(crc, u8);
+    size += u8.length;
+  }
+  crc = (crc ^ 0xFFFFFFFF) >>> 0;
+  return { crc, size };
+}
+
+function fileChunkProducer(file) {
+  return async function* () {
+    const r = file.stream().getReader();
+    try {
+      while (true) {
+        const { value, done } = await r.read();
+        if (done) break;
+        yield (value instanceof Uint8Array) ? value : new Uint8Array(value);
+      }
+    } catch (e) {
+      // → fait remonter un code + le nom du fichier + la cause d’origine
+      throw new EnvelopeError('input_stream', `Error while reading "${file.name}"`, { cause: e, fileName: file.name });
+    } finally {
+      try { r.releaseLock?.(); } catch {}
+    }
+  };
+}
 
 // ===== Encrypt flow =====
 
-/**
- * Encrypt text or files into a manifest-bound multi-part envelope bundle (.cboxbundle),
- * or a single .cbox if only one chunk.
- */
+/* ******************************************************
+ * doEncrypt
+ *  - Text mode: single Argon2 (bundle) → HKDF → sealFixedChunkDet
+ *  - Files mode (streaming): streaming pipeline (Store ZIP → fixed chunks → AES-GCM Det)
+ *  - Outputs: .cboxbundle (ZIP store-only) en O(1) RAM si File System Access est dispo
+ ****************************************************** */
 async function doEncrypt() {
-  let payloadBytes = null, bundle = null;
+  let payloadBytes = null;
+  let bundleBytes  = null; // memory fallback only
   try {
     logInfo('[enc] start');
-    try { logInfo('[enc] tracked URLs before', { tracked: __urlsToRevoke ? __urlsToRevoke.size : 'n/a' }); } catch {}
 
-    // Show encryption progress only while running
-    try {
-      const encProgress = document.querySelector('#encBar')?.parentElement;
-      if (encProgress) encProgress.style.display = 'block';
-    } catch {}
-
+    // Show progress bar during run
+    try { const p = document.querySelector('#encBar')?.parentElement; if (p) p.style.display = 'block'; } catch {}
     setProgress(encBar, 5);
 
-    // Only clear OUTPUTS — keep inputs AND password !
+    // Clear only outputs (keep inputs + password)
     clearNode('#encResults');
     setText('#encHash','');
     setText('#encPlainHash','');
-    logInfo('[enc] outputs cleared');
 
     const pw = $('#encPassword').value || '';
     if (!pw) throw new EnvelopeError('input', 'missing');
     const password = pw.normalize('NFKC');
 
-    // Source selection: text or files
-    let sourceKind = '';
-    let fileList   = null;
+    // Input source: text or files?
     const textMode = !$('#encPanelText').hidden;
     if (textMode) {
+      /* ******************************************************
+       * TEXT MODE — One-time KDF and deterministic chunk sealing
+       ****************************************************** */
       const raw = $('#encText').value;
       if (!raw) throw new EnvelopeError('input', 'missing');
       payloadBytes = TE.encode(raw);
-      sourceKind = 'text';
-    } else {
-      const files = Array.from($('#encFiles').files || []);
-      if (files.length === 0) throw new EnvelopeError('input', 'missing');
-      let total = 0; const items = [];
-      for (const f of files) {
-        const buf = new Uint8Array(await f.arrayBuffer());
-        const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
-        total += buf.length;
-        if (total > maxIn) {
-          throw new EnvelopeError('input_large', 'Total input too large for this device');
-        }
-        items.push({ name: f.name, bytes: buf, type: f.type || 'application/octet-stream' });
+
+      if (payloadBytes.length > (window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES)) {
+        throw new EnvelopeError('input_large', 'Input too large for this device');
       }
-      fileList = items.map(x => ({
-        name: x.name,
-        size: x.bytes.length,
-        type: x.type || 'application/octet-stream'
-      }));
-      if (items.length === 1) {
-        payloadBytes = items[0].bytes;
-      } else {
-        const zip = buildZip(items.map(p => ({ name: p.name, bytes: p.bytes })));
-        items.forEach(p => wipeBytes(p.bytes));
-        payloadBytes = zip;
+
+      const totalPlainLen = payloadBytes.length;
+      const chunks = chunkFixed(payloadBytes);
+      const totalChunks = chunks.length;
+
+      // Anti-replay binding and bundle-level KDF
+      const bundleIdBytes = crypto.getRandomValues(new Uint8Array(16));
+      const bundleId = b64(bundleIdBytes);
+
+      /* ******************************************************
+       * One-time bundle KDF (Argon2id once → HKDF split)
+       ****************************************************** */
+      const bundleSalt = crypto.getRandomValues(new Uint8Array(16));
+      const master32   = await deriveArgon2id(password, bundleSalt, tunedParams);
+      const { kEnc32, kIv32 } = await hkdfSplit(master32, bundleSalt);
+      const K_ENC = await importAesKey(kEnc32);
+
+      /* ******************************************************
+       * Chunk sealing (deterministic IVs via HKDF, no per-chunk Argon2)
+       ****************************************************** */
+      const sealedParts = [];
+      const perChunkHashes = [];
+      setProgress(encBar, 15);
+
+      // Compute whole-plaintext hash once
+      const wholeHashHex = await sha256Hex(payloadBytes);
+
+      for (let i = 0; i < totalChunks; i++) {
+        const c = chunks[i];
+        const isLast   = (i === totalChunks - 1);
+        const sliceEnd = isLast ? (totalPlainLen - (FIXED_CHUNK_SIZE * (totalChunks - 1))) : FIXED_CHUNK_SIZE;
+        const slice    = c.subarray(0, sliceEnd);
+
+        perChunkHashes.push(await sha256Hex(slice));
+
+        const part = await sealFixedChunkDet({
+          kEncKey: K_ENC,
+          kIv32,
+          bundleId,
+          payloadChunk: c,
+          chunkIndex: i,
+          totalChunks,
+          totalPlainLen
+        });
+
+        sealedParts.push({
+          name: `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
+          bytes: part
+        });
+
+        setProgress(encBar, 15 + Math.floor(50 * (i + 1) / totalChunks));
+        if ((i & 1) === 0) await new Promise(r => setTimeout(r, 0));
       }
-      sourceKind = 'files';
+
+      /* ******************************************************
+       * MANIFEST (includes bundleSaltB64) sealed with bundle keys
+       ****************************************************** */
+      const manifestInner = {
+        v: 1, kind: 'manifest',
+        bundleId,
+        bundleSaltB64: b64(bundleSalt),
+        chunkSize: FIXED_CHUNK_SIZE,
+        totalPlainLen,
+        totalChunks,
+        chunkHashes: perChunkHashes,
+        wholePlainHash: wholeHashHex,
+        source: { kind: 'text', files: null },
+        createdAt: new Date().toISOString()
+      };
+      const manifestBytes  = TE.encode(JSON.stringify(manifestInner));
+      const manChunksClear = chunkFixedGeneric(manifestBytes);
+      const manSealedParts = [];
+      for (let i = 0; i < manChunksClear.length; i++) {
+        const sealed = await sealFixedChunkDet({
+          kEncKey: K_ENC,
+          kIv32,
+          bundleId,
+          payloadChunk: padToFixed(manChunksClear[i]),
+          chunkIndex: i,
+          totalChunks: manChunksClear.length,
+          totalPlainLen: manifestBytes.length
+        });
+        manSealedParts.push({
+          name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
+          bytes: sealed
+        });
+      }
+
+      /* ******************************************************
+       * MANIFEST_INDEX sealed with bundle keys
+       ****************************************************** */
+      const manChunkHashes = [];
+      for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
+      const manifestIndexInner = {
+        v: 1, kind: 'manifest_index',
+        totalChunks: manChunksClear.length,
+        totalLen: manifestBytes.length,
+        chunkSize: FIXED_CHUNK_SIZE,
+        chunkHashes: manChunkHashes
+      };
+      const manIndexBytes  = TE.encode(JSON.stringify(manifestIndexInner));
+      const manIndexChunks = chunkFixedGeneric(manIndexBytes);
+      const manIndexSealed = [];
+      for (let i = 0; i < manIndexChunks.length; i++) {
+        const sealed = await sealFixedChunkDet({
+          kEncKey: K_ENC,
+          kIv32,
+          bundleId,
+          payloadChunk: padToFixed(manIndexChunks[i]),
+          chunkIndex: i,
+          totalChunks: manIndexChunks.length,
+          totalPlainLen: manIndexBytes.length
+        });
+        manIndexSealed.push({
+          name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
+          bytes: sealed
+        });
+      }
+
+      // Header d’amorçage chiffré au mot de passe (pour récupérer bundleId + bundleSaltB64)
+      const headerBytes = await sealBundleHeaderWithPassword({
+        password,
+        params: tunedParams,
+        bundleId,
+        bundleSaltB64: b64(bundleSalt)
+      });
+      const headerEntry = { name: `BUNDLE_HEADER${FILE_SINGLE_EXT}`, bytes: headerBytes };
+
+      /* ******************************************************
+      * Build bundle ZIP (store-only) and present download
+      ****************************************************** */
+      const filesOut = [ headerEntry, ...sealedParts, ...manSealedParts, ...manIndexSealed ];
+      const bundleZip = buildZip(filesOut);
+
+      // wipe sealed parts memory
+      try { for (const f of filesOut) f?.bytes?.fill?.(0); } catch {}
+
+      // *** wipe keying material (bytes) ***
+      try { master32.fill(0); } catch {}
+      try { kEnc32.fill(0); } catch {}
+      try { kIv32.fill(0); } catch {}
+
+      const outBlob = new Blob([bundleZip], { type: 'application/octet-stream' });
+      addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
+
+      const bundleHash = await sha256Hex(bundleZip);
+      renderBundleHash('#encHash', bundleHash);
+
+      setProgress(encBar, 100);
+      setLive('Encryption complete.');
+      const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
+      return;
     }
 
-    if (payloadBytes.length > (window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES)) {
-      throw new EnvelopeError('input_large', 'Input too large for this device');
+    /* ******************************************************
+     * FILES MODE (STREAMING) — utilise le StoreZipWriter + File System Access
+     ****************************************************** */
+    const files = Array.from($('#encFiles').files || []);
+    if (files.length === 0) throw new EnvelopeError('input', 'missing');
+
+    // DoS bound on announced sizes
+    {
+      const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
+      let totalAnnounce = 0;
+      for (const f of files) {
+        totalAnnounce += f.size|0;
+        if (totalAnnounce > maxIn) throw new EnvelopeError('input_large', 'Total input too large for this device');
+      }
     }
-    logInfo('[enc] input prepared', {
-      sourceKind,
-      totalPlainLen: payloadBytes.length,
-      textMode
+
+    // 1) Choose output sink: O(1) via File System Access si dispo, sinon mémoire
+    const { sink, close, kind } = await getBundleSink('secret' + FILE_BUNDLE_EXT);
+
+    // 2) Run streaming encryption → écrit .cboxbundle directement
+    const res = await encryptMultiFilesStreaming({
+      files,
+      password,
+      tunedParams,
+      outSink: sink
     });
 
-    const totalPlainLen = payloadBytes.length;
-    const chunks        = chunkFixed(payloadBytes);
-    const totalChunks   = chunks.length;
-    logInfo('[enc] chunked', { totalChunks, chunkSize: FIXED_CHUNK_SIZE, totalPlainLen });
+    // 3) UI result selon le sink
+    if (kind === 'fs') {
+      await close?.();
+      setText('#encHash','');
+      setLive('Encryption complete (saved to disk).');
+      const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
+      setProgress(encBar, 100);
+      return;
+    } else {
+      bundleBytes = res.bundleU8 || (typeof sink.toUint8Array === 'function' ? sink.toUint8Array() : null);
+      if (!bundleBytes) throw new Error('No bundle bytes available');
 
-    // Random bundleId
-    const bundleIdBytes = crypto.getRandomValues(new Uint8Array(16));
-    const bundleId = b64(bundleIdBytes);
-
-    const wholeHashHex = await sha256Hex(payloadBytes);
-
-    setProgress(encBar, 15);
-    const sealedParts    = [];
-    const perChunkHashes = [];
-    for (let i = 0; i < totalChunks; i++) {
-      const c = chunks[i];
-      const isLast   = (i === totalChunks - 1);
-      const sliceEnd = isLast ? (totalPlainLen - (FIXED_CHUNK_SIZE * (totalChunks - 1))) : FIXED_CHUNK_SIZE;
-      const slice    = c.subarray(0, sliceEnd);
-
-      perChunkHashes.push(await sha256Hex(slice));
-
-      const part = await sealFixedChunk({
-        password,
-        payloadChunk: c,
-        chunkIndex: i,
-        totalChunks,
-        totalPlainLen,
-        params: { ...tunedParams, bundleId }
-      });
-
-      sealedParts.push({ name: `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: part });
-
-      setProgress(encBar, 15 + Math.floor(70 * (i + 1) / totalChunks));
-      if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
-    }
-
-    // MANIFEST chunks
-    const manifestInner = {
-      v: 1,
-      kind: 'manifest',
-      bundleId,
-      chunkSize: FIXED_CHUNK_SIZE,
-      totalPlainLen,
-      totalChunks,
-      chunkHashes: perChunkHashes,
-      wholePlainHash: wholeHashHex,
-      source: { kind: sourceKind, files: fileList || null },
-      createdAt: new Date().toISOString()
-    };
-    const manifestBytes  = TE.encode(JSON.stringify(manifestInner));
-    const manChunksClear = chunkFixedGeneric(manifestBytes); // slices
-    const manSealedParts = [];
-    for (let i = 0; i < manChunksClear.length; i++) {
-      const padded = padToFixed(manChunksClear[i]);
-      const sealed = await sealFixedChunk({
-        password,
-        payloadChunk: padded,
-        chunkIndex: i,
-        totalChunks: manChunksClear.length,
-        totalPlainLen: manifestBytes.length,
-        params: { ...tunedParams, bundleId }
-      });
-      manSealedParts.push({ name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`, bytes: sealed });
-    }
-
-    // Authenticated manifest index
-    const manChunkHashes = [];
-    for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
-    const manifestIndexInner = {
-      v: 1,
-      kind: 'manifest_index',
-      totalChunks: manChunksClear.length,
-      totalLen: manifestBytes.length,
-      chunkSize: FIXED_CHUNK_SIZE,
-      chunkHashes: manChunkHashes
-    };
-    const manIndexBytes  = TE.encode(JSON.stringify(manifestIndexInner));
-    const manIndexChunks = chunkFixedGeneric(manIndexBytes);
-    const manIndexSealed = [];
-    for (let i = 0; i < manIndexChunks.length; i++) {
-      const chunk = padToFixed(manIndexChunks[i]);
-      const sealed = await sealFixedChunk({
-        password,
-        payloadChunk: chunk,
-        chunkIndex: i,
-        totalChunks: manIndexChunks.length,
-        totalPlainLen: manIndexBytes.length,
-        params: { ...tunedParams, bundleId }
-      });
-      manIndexSealed.push({
-        name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
-        bytes: sealed
-      });
-    }
-
-    const filesOut = [
-      ...sealedParts,
-      ...manSealedParts,
-      ...manIndexSealed
-    ];
-    logInfo('[enc] filesOut', { count: filesOut.length });
-
-    let bundleZip;
-    try {
-      bundleZip = buildZip(filesOut);
-      logInfo('[enc] buildZip ok', { zipBytes: bundleZip.length });
-    } catch (e) {
-      logError('[enc] buildZip failed', e);
-      throw e;
-    }
-
-    // Wipe & drop buffers now that everything is in the ZIP
-    try {
-      for (const f of filesOut) { f?.bytes?.fill?.(0); }
-    } catch {}
-    filesOut.length = 0;
-    sealedParts.length = 0;
-    manSealedParts.length = 0;
-    manIndexSealed.length = 0;
-
-    bundle = bundleZip;
-
-    let outBlob;
-    try {
-      outBlob = new Blob([bundleZip], { type: 'application/octet-stream' });
-      logInfo('[enc] Blob created', { blobSize: outBlob.size });
-    } catch (e) {
-      logError('[enc] Blob creation failed', e, { zipBytes: bundleZip?.length||null });
-      throw e;
-    }
-
-    try {
+      const outBlob = new Blob([bundleBytes], { type: 'application/octet-stream' });
       addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
-      logInfo('[enc] addDownload ok', { tracked: __urlsToRevoke?.size });
-    } catch (e) {
-      logError('[enc] addDownload failed', e);
-      throw e;
+
+      const bundleHash = await sha256Hex(bundleBytes);
+      renderBundleHash('#encHash', bundleHash);
+
+      setProgress(encBar, 100);
+      setLive('Encryption complete.');
+      const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
+      return;
     }
-
-    const bundleHash = await sha256Hex(bundleZip);
-
-    // Fancy SHA UI
-    const hashContainer = document.querySelector('#encHash');
-    if (hashContainer) {
-      clearNode(hashContainer);
-
-      const label = document.createElement('div');
-      label.className = 'muted';
-      setText(label, 'Bundle SHA-256:');
-
-      const codeWrap = document.createElement('div');
-      codeWrap.style.display = 'flex';
-      codeWrap.style.alignItems = 'center';
-      codeWrap.style.gap = '8px';
-      codeWrap.style.marginTop = '6px';
-
-      const shaCode = document.createElement('code');
-      shaCode.style.fontFamily = 'monospace, monospace';
-      shaCode.style.padding = '6px 8px';
-      shaCode.style.borderRadius = '8px';
-      shaCode.style.background = 'rgba(255,255,255,0.02)';
-      shaCode.textContent = bundleHash;
-
-      const copyBtn = document.createElement('button');
-      copyBtn.className = 'btn secondary';
-      copyBtn.type = 'button';
-      setText(copyBtn, 'Copy');
-      copyBtn.onclick = async () => {
-        try {
-          await navigator.clipboard.writeText(bundleHash);
-          setLive('Bundle SHA copied to clipboard.');
-        } catch {
-          setLive('Copy failed.');
-        }
-      };
-
-      codeWrap.appendChild(shaCode);
-      codeWrap.appendChild(copyBtn);
-      hashContainer.appendChild(label);
-      hashContainer.appendChild(codeWrap);
-    }
-
-    const out = $('#encOutputs');
-    if (out) {
-      out.classList.remove('hidden');
-      out.classList.add('visible');
-      const firstBtn = out.querySelector('button');
-      if (firstBtn) firstBtn.focus();
-    }
-
-    setProgress(encBar, 100);
-    setLive('Encryption complete (bundle bound by manifest index).');
-    logInfo('[enc] success');
 
   } catch (err) {
-    logError('[enc] failed', err);
-    await secureFail('Encryption');
-    setProgress(encBar, 0);
-    clearPasswords();
-  } finally {
-    try {
-      const encProgress = document.querySelector('#encBar')?.parentElement;
-      if (encProgress) encProgress.style.display = 'none';
-    } catch {}
+      await secureFail('Encryption', normalizeEncError(err));
+      setProgress(encBar, 0);
+    } finally {
+      try { const p = document.querySelector('#encBar')?.parentElement; if (p) p.style.display = 'none'; } catch {}
+      if (payloadBytes) wipeBytes(payloadBytes);
+      if (bundleBytes)  wipeBytes(bundleBytes);
+      encBusy = false;
+    }
+}
 
-    try { logInfo('[enc] finally: tracked URLs', { tracked: __urlsToRevoke?.size }); } catch {}
-    try {
-      const resEl = document.querySelector('#encResults');
-      const blobs = resEl ? resEl.querySelectorAll('a[href^="blob:"]').length : 0;
-      logInfo('[enc] finally: blobs in #encResults', { blobs });
-    } catch {}
+// petit helper d’UI pour afficher le hash avec un bouton copier
+function renderBundleHash(containerSel, hex) {
+  const host = document.querySelector(containerSel);
+  if (!host) return;
+  clearNode(host);
+  const label = document.createElement('div');
+  label.className = 'muted';
+  setText(label, 'Bundle SHA-256:');
+  const wrap = document.createElement('div');
+  wrap.style.display = 'flex'; wrap.style.alignItems = 'center'; wrap.style.gap = '8px'; wrap.style.marginTop = '6px';
+  const code = document.createElement('code'); code.style.fontFamily = 'monospace, monospace'; code.style.padding = '6px 8px'; code.style.borderRadius = '8px'; code.style.background = 'rgba(255,255,255,0.02)'; code.textContent = hex;
+  const btn = document.createElement('button'); btn.className = 'btn secondary'; btn.type='button'; setText(btn,'Copy'); btn.onclick = async()=>{ try{ await navigator.clipboard.writeText(hex); setLive('Bundle SHA copied to clipboard.'); } catch { setLive('Copy failed.'); } };
+  wrap.appendChild(code); wrap.appendChild(btn);
+  host.appendChild(label); host.appendChild(wrap);
+}
 
-    if (payloadBytes) wipeBytes(payloadBytes);
-    if (bundle) wipeBytes(bundle);
+/**
+ * Construit le ZIP clair en flux (store-only), l’alimente dans le chiffrage par chunks,
+ * et écrit le bundle (.cboxbundle) en flux (store-only) au fil de l’eau.
+ * Renvoie {bundleU8, manifest, manifestIndex}.
+ */
+async function encryptMultiFilesStreaming({ files, password, tunedParams, outSink }) {
+  // 0) Writer de BUNDLE (sortie) : on utilise celui fourni (FS ou mémoire)
+  const bundleSink   = outSink || new SegmentsSink();
+  const bundleWriter = new StoreZipWriter(bundleSink);
+
+  /* ******************************************************
+  * One-time KDF at bundle start (files streaming)
+  ****************************************************** */
+  const bundleIdBytes = crypto.getRandomValues(new Uint8Array(16));
+  const bundleId = b64(bundleIdBytes);
+
+  const bundleSalt = crypto.getRandomValues(new Uint8Array(16));
+  const master32   = await deriveArgon2id(password, bundleSalt, tunedParams);
+  const { kEnc32, kIv32 } = await hkdfSplit(master32, bundleSalt);
+  const K_ENC = await importAesKey(kEnc32);
+  
+  /* ******************************************************
+   * Write password-based bootstrap header into bundle
+   ****************************************************** */
+  const headerBytes = await sealBundleHeaderWithPassword({
+    password,
+    params: tunedParams,
+    bundleId,
+    bundleSaltB64: b64(bundleSalt)
+  });
+  const headerCrc = crc32(headerBytes);
+  await bundleWriter.addFile(`BUNDLE_HEADER${FILE_SINGLE_EXT}`, headerBytes.length, headerCrc, async function*(){ yield headerBytes; });
+  try { headerBytes.fill(0); } catch {}
+
+  // 2) Construire le ZIP clair *en flux* et, en parallèle, le découper/chiffrer
+  //    On va produire des parts chiffrées part-000000.cbox directement dans le bundle.
+  //    Pour ça, on a besoin d’un “chunker clair” qui accumule FIXED_CHUNK_SIZE.
+  let plainTotalLen = 0;
+  let partIndex = 0;
+  const perChunkHashes = [];
+
+  let pending = new Uint8Array(0);
+
+  async function flushSealChunk(fixedChunk, isLastChunk, totalChunksEstimateUnknown=false) {
+    const sliceEnd = isLastChunk
+      ? (plainTotalLen - (FIXED_CHUNK_SIZE * (partIndex)))
+      : FIXED_CHUNK_SIZE;
+
+    const innerSlice = fixedChunk.subarray(0, sliceEnd);
+    perChunkHashes.push(await sha256Hex(innerSlice));
+
+    const sealed = await sealFixedChunkDet({
+      kEncKey: K_ENC, kIv32,
+      bundleId,
+      payloadChunk: fixedChunk,
+      chunkIndex: partIndex,
+      totalChunks: 0,
+      totalPlainLen: plainTotalLen
+    });    
+
+    // Ajouter l’entrée part-XXXXXX.cbox dans le bundle (store-only) immédiatement
+    const entryName = `part-${String(partIndex).padStart(6,'0')}${FILE_SINGLE_EXT}`;
+    const crc = crc32(sealed);
+    await bundleWriter.addFile(entryName, sealed.length, crc, async function*(){ yield sealed; });
+
+    // scrub
+    try { sealed.fill(0); } catch {}
+    partIndex++;
   }
+
+  // 2a) Mécanique de chunking clair → FIXED_CHUNK_SIZE
+  async function feedPlain(u8, done=false) {
+    if (u8.length === 0 && !done) return;
+    // concat pending + u8
+    if (pending.length === 0) {
+      pending = u8;
+    } else {
+      const merged = new Uint8Array(pending.length + u8.length);
+      merged.set(pending, 0); merged.set(u8, pending.length);
+      pending = merged;
+    }
+    // extraire les blocs fixes
+    while (pending.length >= FIXED_CHUNK_SIZE) {
+      const block = pending.subarray(0, FIXED_CHUNK_SIZE);
+      const pad = padToFixed(block); // block est déjà de taille fixe, padToFixed garde identique
+      await flushSealChunk(pad, false);
+      pending = pending.subarray(FIXED_CHUNK_SIZE);
+    }
+    // si fin de flux : sceller le dernier (même si 0)
+    /* ******************************************************
+    * feedPlain: flush last chunk only if needed
+    ****************************************************** */
+    if (done) {
+      if (pending.length > 0 || plainTotalLen === 0) {
+        // note: keep a single empty chunk only if total is 0
+        const last = padToFixed(pending);
+        await flushSealChunk(last, true);
+      }
+      pending = new Uint8Array(0);
+    }
+  }
+
+  // 2b) Construire le ZIP clair “en flux” et l’envoyer vers feedPlain
+  //     (deux passes par fichier pour CRC+taille, puis data)
+  const sourceFilesMeta = [];
+  const zipPlainWriter = new StoreZipWriter({
+    write: async (u8) => {
+      plainTotalLen += u8.length;
+      await feedPlain(u8, false);
+    }
+  });
+
+  // stream en mode data-descriptor
+  for (const f of files) {
+    sourceFilesMeta.push({ name: f.name });
+  }
+
+  // écriture des entrées locales + data, le tout pousse dans feedPlain()
+  for (const f of files) {
+    // size/crc = null → le writer passera en data-descriptor
+    await zipPlainWriter.addFile(f.name, null, null, fileChunkProducer(f));
+  }
+
+  // écrire CD + EOCD du ZIP clair (dans le pipe aussi)
+  const zipPlainFinalBytes = await zipPlainWriter.finish();
+  // finish() peut renvoyer null si le sink “stream” directement.
+  if (zipPlainFinalBytes && zipPlainFinalBytes.length) {
+    await feedPlain(zipPlainFinalBytes, false);
+  }
+  // signaler fin au chunker
+  await feedPlain(new Uint8Array(0), true);
+
+  // 3) MANIFEST + INDEX (petits → RAM ok)
+  /* ******************************************************
+  * MANIFEST sealing (streaming path) with bundle-level keys
+  ****************************************************** */
+  const manifestInner = {
+    v: 1,
+    kind: 'manifest',
+    bundleId,
+    bundleSaltB64: b64(bundleSalt),
+    chunkSize: FIXED_CHUNK_SIZE,
+    totalPlainLen: plainTotalLen,
+    totalChunks: partIndex,
+    chunkHashes: perChunkHashes,
+    wholePlainHash: null,
+    source: { kind: 'files', files: sourceFilesMeta },
+    createdAt: new Date().toISOString()
+  };
+
+  const manifestBytes  = TE.encode(JSON.stringify(manifestInner));
+  const manChunksClear = chunkFixedGeneric(manifestBytes);
+  for (let i = 0; i < manChunksClear.length; i++) {
+    const sealed = await sealFixedChunkDet({
+      kEncKey: K_ENC,
+      kIv32,
+      bundleId,
+      payloadChunk: padToFixed(manChunksClear[i]),
+      chunkIndex: i,
+      totalChunks: manChunksClear.length,
+      totalPlainLen: manifestBytes.length
+    });
+    const name = `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
+    const crc  = crc32(sealed);
+    await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed; });
+    try { sealed.fill(0); } catch {}
+  }
+
+  /* ******************************************************
+ * MANIFEST_INDEX sealing (streaming path) with bundle-level keys
+ ****************************************************** */
+const manChunkHashes = [];
+for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
+const manifestIndexInner = {
+  v: 1, kind: 'manifest_index',
+  totalChunks: manChunksClear.length,
+  totalLen: manifestBytes.length,
+  chunkSize: FIXED_CHUNK_SIZE,
+  chunkHashes: manChunkHashes
+};
+const manIndexBytes  = TE.encode(JSON.stringify(manifestIndexInner));
+const manIndexChunks = chunkFixedGeneric(manIndexBytes);
+
+for (let i = 0; i < manIndexChunks.length; i++) {
+  const sealed = await sealFixedChunkDet({
+    kEncKey: K_ENC,
+    kIv32,
+    bundleId,
+    payloadChunk: padToFixed(manIndexChunks[i]),
+    chunkIndex: i,
+    totalChunks: manIndexChunks.length,
+    totalPlainLen: manIndexBytes.length
+  });
+  const name = `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
+  const crc  = crc32(sealed);
+  await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed; });
+  try { sealed.fill(0); } catch {}
+}
+
+/* ******************************************************
+ * Finalize bundle ZIP
+ ****************************************************** */
+const bundleU8 = await bundleWriter.finish();
+try { pending.fill(0); } catch {}
+return { bundleU8, manifest: manifestInner, manifestIndex: manifestIndexInner };
+
 }
 
 function updateEncryptButtonState() {
@@ -2115,14 +2957,18 @@ async function tryRenderOrDownload(bytes, containerSel, textSel) {
 
 // ===== Decrypt flow (manifest + strict checks) =====
 
-/**
- * Decrypt a .cbox (single) or .cboxbundle (multipart) file and verify integrity
- * against the authenticated manifest. Implements basic UX rate-limit.
- */
+/* ******************************************************
+ * doDecrypt
+ *  - Single .cbox: openFixedChunk (password) → preview or download
+ *  - .cboxbundle:
+ *      • Open BUNDLE_HEADER.cbox (password) → (bundleId, bundleSaltB64)
+ *      • Derive K_ENC/kIv32 once (Argon2id → HKDF)
+ *      • Open MANIFEST_INDEX with openFixedChunkDet (bundle keys)
+ *      • Open MANIFEST with openFixedChunkDet (bundle keys) + verify against INDEX
+ *      • Decrypt data parts with openFixedChunkDet (bundle keys) and stream plaintext to disk (O(1) RAM)
+ ****************************************************** */
 async function doDecrypt() {
   let zipU8 = null;
-  let recovered = null;
-
   let entries = null;
   let decryptBtn = null;
   let prevDisabled = false;
@@ -2130,7 +2976,7 @@ async function doDecrypt() {
   try {
     logInfo('[dec] start');
 
-    // Clear previous decryption outputs (keep user password so retry is easy)
+    // Clear previous outputs (keep password and selected file for retry UX)
     logInfo('[dec] reset UI outputs');
     resetDecryptUI({ preservePassword: true, preserveFile: true });
 
@@ -2168,7 +3014,7 @@ async function doDecrypt() {
     clearNode('#decResults'); setText('#decText', ''); setText('#decIntegrity', '');
     logInfo('[dec] outputs cleared');
 
-    // Read inputs
+    // Inputs
     const pw = $('#decPassword').value || '';
     if (!pw) {
       logWarn('[dec] missing password');
@@ -2176,7 +3022,6 @@ async function doDecrypt() {
       setProgress(decBar, 0);
       try { const decProgress = document.querySelector('#decBar')?.parentElement; if (decProgress) decProgress.style.display = 'none'; } catch {}
       try { document.getElementById('decPassword')?.focus(); } catch {}
-      // restore button state and bail out cleanly
       try { if (decryptBtn) { decryptBtn.disabled = !!prevDisabled; if (!prevDisabled) decryptBtn.removeAttribute('aria-disabled'); } } catch {}
       logInfo('[dec] abort: no password');
       return;
@@ -2197,7 +3042,7 @@ async function doDecrypt() {
 
     const name = f.name.toLowerCase();
 
-    // Inputs validated, ensure progress visible
+    // Ensure progress visible
     try {
       const decProgress = document.querySelector('#decBar')?.parentElement;
       if (decProgress) { decProgress.style.display = 'block'; logInfo('[dec] progress shown'); }
@@ -2206,7 +3051,9 @@ async function doDecrypt() {
     const fSize = f.size|0;
     logInfo('[dec] input file', { name, size: fSize });
 
-    // -------- Single fixed-chunk .cbox path --------
+    /* ******************************************************
+     * Single fixed-chunk .cbox path (unchanged)
+     ****************************************************** */
     if (name.endsWith(FILE_SINGLE_EXT)) {
       logInfo('[dec] mode=single .cbox');
       const env    = new Uint8Array(await f.arrayBuffer());
@@ -2235,7 +3082,7 @@ async function doDecrypt() {
       const payload  = fixed.subarray(0, sliceEnd);
       logInfo('[dec] single payload', { sliceEnd });
 
-      // Let tryRenderOrDownload decide (text/html preview vs download)
+      // Preview or download
       await tryRenderOrDownload(payload, '#decResults', '#decText');
       setText('#decIntegrity', `Single-chunk decrypted. Size: ${payload.length} bytes.`);
       try { opened.fixedChunk.fill(0); } catch {}
@@ -2245,7 +3092,6 @@ async function doDecrypt() {
       setLive('Decryption complete.');
       logInfo('[dec] single decryption success');
 
-      // Reveal results and hide progress container after success
       try {
         const decResults = document.getElementById('decResults');
         const decTextEl  = document.getElementById('decText');
@@ -2267,7 +3113,9 @@ async function doDecrypt() {
       return;
     }
 
-    // -------- Bundle (.cboxbundle) path --------
+    /* ******************************************************
+     * Bundle (.cboxbundle) path — boot with HEADER → derive keys → open INDEX → open MANIFEST (Det) → stream data
+     ****************************************************** */
     if (!name.endsWith(FILE_BUNDLE_EXT)) {
       logWarn('[dec] unsupported file extension', { name });
       throw new EnvelopeError('input', 'unsupported');
@@ -2278,7 +3126,7 @@ async function doDecrypt() {
     entries = await extractZipEntriesStrict(zipU8);
     logInfo('[dec] zip parsed', { entries: entries.length });
 
-    // Build a name index and detect duplicates
+    // Build name index and detect duplicates
     const byName = new Map(entries.map(e => [e.name, e]));
     if (byName.size !== entries.length) {
       logWarn('[dec] duplicate entry names detected');
@@ -2287,10 +3135,12 @@ async function doDecrypt() {
 
     // Only allow expected entry name patterns
     const allowed = [
+      /^BUNDLE_HEADER\.cbox$/i,
       /^part-\d{6}\.cbox$/i,
       /^MANIFEST\.part-\d{6}\.cbox$/i,
       /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i
     ];
+
     let unexpected = 0;
     for (const e of entries) {
       const ok = allowed.some(rx => rx.test(e.name));
@@ -2301,52 +3151,54 @@ async function doDecrypt() {
       throw new EnvelopeError('zip_extra', `Unexpected entry in bundle`);
     }
 
-    // Count categories for logs
-    const countParts   = entries.filter(e=>/^part-\d{6}\.cbox$/i.test(e.name)).length;
-    const countMan     = entries.filter(e=>/^MANIFEST\.part-\d{6}\.cbox$/i.test(e.name)).length;
-    const countManIdx  = entries.filter(e=>/^MANIFEST_INDEX\.part-\d{6}\.cbox$/i.test(e.name)).length;
-    logInfo('[dec] entry categories', { dataParts: countParts, manifestParts: countMan, manifestIndexParts: countManIdx });
-
     // Free raw ZIP buffer early
     try { zipU8.fill(0); } catch {}
     zipU8 = null;
 
-    // ---- 1) MANIFEST via INDEX (multi-part) + PARTS ----
+    /* ******************************************************
+    * 1) Bootstrap: open password-based BUNDLE_HEADER.cbox
+    ****************************************************** */
+    const headerEntry = entries.find(e => /^BUNDLE_HEADER\.cbox$/i.test(e.name));
+    if (!headerEntry) {
+      logWarn('[dec] missing bootstrap header');
+      throw new EnvelopeError('no_header', 'Missing bundle header');
+    }
+    const header = await openBundleHeaderWithPassword({
+      password,
+      bytes: headerEntry.bytes,
+      params: tunedParams
+    });
+    const expectedBundleId = header.bundleId;
+
+    // Derive bundle keys once (Argon2 → HKDF) from header.bundleSaltB64
+    const bundleSalt_fromHeader = b64d(header.bundleSaltB64);
+    const master32   = await deriveArgon2id(password, bundleSalt_fromHeader, tunedParams);
+    const { kEnc32, kIv32 } = await hkdfSplit(master32, bundleSalt_fromHeader);
+    const K_ENC = await importAesKey(kEnc32);
+
+    /* ******************************************************
+    * 2) Open MANIFEST_INDEX with bundle-level keys (Det)
+    ****************************************************** */
     const idxEntries = entries
       .filter(e => /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i.test(e.name))
       .sort((a, b) => a.name.localeCompare(b.name));
-    logInfo('[dec] idxEntries', { count: idxEntries.length });
-
-    let expectedBundleId = null; // learned from first MANIFEST_INDEX part
     if (idxEntries.length === 0) {
       logWarn('[dec] no manifest index');
       throw new EnvelopeError('no_manifest_index', 'Manifest index missing');
     }
 
-    // Decrypt & rebuild the index buffer
     let idxLen = null;
     const idxSlices = [];
     for (let i = 0; i < idxEntries.length; i++) {
-      const opened = await openFixedChunk({ password, bytes: idxEntries[i].bytes });
-
-      const bi = opened.meta && opened.meta.bundleId;
-      if (i === 0) {
-        if (typeof bi !== 'string' || bi.length === 0) {
-          logWarn('[dec] bundleId missing on index part 0');
-          throw new EnvelopeError('bundle_missing', 'Missing bundleId');
-        }
-        expectedBundleId = bi;
-        logInfo('[dec] learned bundleId for index', { bundleIdPrefix: String(bi).slice(0, 8) });
-      } else {
-        if (bi !== expectedBundleId) {
-          logWarn('[dec] mixed bundleId in index', { i });
-          throw new EnvelopeError('bundle_mix', 'Mixed bundleId across manifest index parts');
-        }
-      }
+      const opened = await openFixedChunkDet({
+        kEncKey: K_ENC,
+        kIv32,
+        bytes: idxEntries[i].bytes,
+        expectedBundleId,
+        chunkIndex: i
+      });
 
       const inner = opened.innerMeta;
-      logInfo('[dec] index part meta', { i, kind: inner.kind, idx: inner.chunkIndex, total: inner.totalChunks, totalPlainLen: inner.totalPlainLen });
-
       if (inner.kind !== 'fixed') throw new EnvelopeError('idx_part', `Manifest index part ${i}: unexpected type`);
       if (inner.chunkIndex !== i) throw new EnvelopeError('idx_part', `Manifest index part ${i}: wrong index`);
       if (inner.totalChunks !== idxEntries.length) throw new EnvelopeError('idx_part', `Manifest index part ${i}: totalChunks mismatch`);
@@ -2374,26 +3226,16 @@ async function doDecrypt() {
       try { opened.fixedChunk.fill(0); } catch {}
     }
 
+    // Rebuild and parse manIndex JSON
     const idxBuf = new Uint8Array(idxLen);
     let offset = 0;
     for (const s of idxSlices) { idxBuf.set(s, offset); offset += s.length; }
-
     let manIndex;
     try {
       manIndex = JSON.parse(TD.decode(idxBuf));
-      logInfo('[dec] parsed manifest index', {
-        kind: manIndex?.kind,
-        totalChunks: manIndex?.totalChunks,
-        totalLen: manIndex?.totalLen,
-        chunkSize: manIndex?.chunkSize
-      });
-    } catch (e) {
-      logError('[dec] index parse error', e);
-      throw new EnvelopeError('index_parse', 'Malformed manifest index');
     } finally {
       try { idxBuf.fill(0); } catch {}
       for (const s of idxSlices) { try { s.fill(0); } catch {} }
-      idxSlices.length = 0;
     }
 
     if (manIndex.kind !== 'manifest_index') throw new EnvelopeError('index_kind', 'Unexpected manifest index kind');
@@ -2411,26 +3253,28 @@ async function doDecrypt() {
       }
     }
 
-    // Decrypt + verify each MANIFEST part
+    /* ******************************************************
+     * 3) Open MANIFEST with bundle-level keys (Det) and verify against INDEX
+     ****************************************************** */
     let manifestRecovered = new Uint8Array(mLen);
     let mWritten = 0;
+
     for (let i = 0; i < mTotal; i++) {
       const entry = byName.get(`MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
-      if (!entry) { logWarn('[dec] missing manifest part', { i }); throw new EnvelopeError('missing_manifest_part', `Manifest chunk ${i} missing`); }
-
-      const opened = await openFixedChunk({
-        password,
-        bytes: entry.bytes,
-        expectedBundleId
-      });
-
-      const bm = opened.meta && opened.meta.bundleId;
-      if (bm !== expectedBundleId) {
-        logWarn('[dec] bundleId mismatch in manifest part', { i });
-        throw new EnvelopeError('bundle_mismatch', `Manifest chunk ${i}: bundleId mismatch`);
+      if (!entry) {
+        logWarn('[dec] missing manifest part', { i });
+        throw new EnvelopeError('missing_manifest_part', `Manifest chunk ${i} missing`);
       }
 
-      const inner  = opened.innerMeta;
+      const opened = await openFixedChunkDet({
+        kEncKey: K_ENC,
+        kIv32,
+        bytes: entry.bytes,
+        expectedBundleId,
+        chunkIndex: i
+      });
+
+      const inner = opened.innerMeta;
       if (inner.kind !== 'fixed') throw new EnvelopeError('man_part_kind',  `Manifest chunk ${i}: unexpected type`);
       if (inner.chunkIndex !== i) throw new EnvelopeError('man_part_idx',   `Manifest chunk ${i}: wrong index`);
       if (inner.totalChunks !== mTotal) throw new EnvelopeError('man_part_total', `Manifest chunk ${i}: totalChunks mismatch`);
@@ -2438,8 +3282,14 @@ async function doDecrypt() {
 
       const isLast   = (i === mTotal - 1);
       const sliceEnd = isLast ? (mLen - (FIXED_CHUNK_SIZE * (mTotal - 1))) : FIXED_CHUNK_SIZE;
-      const slice    = opened.fixedChunk.subarray(0, sliceEnd);
+      if (sliceEnd < 0 || sliceEnd > FIXED_CHUNK_SIZE) {
+        logWarn('[dec] invalid manifest slice size', { i, sliceEnd });
+        throw new EnvelopeError('man_slice_size', `Manifest part ${i}: invalid slice size`);
+      }
 
+      const slice = opened.fixedChunk.subarray(0, sliceEnd);
+
+      // Integrity against MANIFEST_INDEX
       const h = await sha256Hex(slice);
       const expected = manIndex.chunkHashes[i];
       if (!timingSafeEqual(h, expected)) {
@@ -2452,9 +3302,12 @@ async function doDecrypt() {
       try { opened.fixedChunk.fill(0); } catch {}
 
       setProgress(decBar, 10 + Math.floor(10 * (i + 1) / mTotal));
-      if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
+      if ((i & 1) === 0) await new Promise(r => setTimeout(r, 0));
     }
-    if (mWritten !== mLen) { logWarn('[dec] manifest rebuild size mismatch', { mWritten, mLen }); throw new EnvelopeError('man_rebuild_size', 'Incorrect manifest reconstructed size'); }
+    if (mWritten !== mLen) {
+      logWarn('[dec] manifest rebuild size mismatch', { mWritten, mLen });
+      throw new EnvelopeError('man_rebuild_size', 'Incorrect manifest reconstructed size');
+    }
 
     let manifest;
     try {
@@ -2484,44 +3337,93 @@ async function doDecrypt() {
         throw new EnvelopeError('bad_hash', `Invalid hash at manifest index ${i}`);
       }
     }
-    if (!/^[0-9a-f]{64}$/i.test(manifest.wholePlainHash || '')) throw new EnvelopeError('bad_whole_hash', 'Invalid wholePlainHash');
+    if (manifest.wholePlainHash != null && !/^[0-9a-f]{64}$/i.test(manifest.wholePlainHash)) {
+      throw new EnvelopeError('bad_whole_hash', 'Invalid wholePlainHash');
+    }
 
-    // ---- 2) Validate indices (data parts) ----
+    // Optional sanity: manifest salt must match header salt
+    if (manifest.bundleSaltB64 !== header.bundleSaltB64) {
+      throw new EnvelopeError('bad_manifest', 'Manifest salt does not match header');
+    }
+
+    /* ******************************************************
+     * Validate indices (data parts)
+     ****************************************************** */
     const { idxs, max } = validateIndexSetFromNames(entries);
     logInfo('[dec] data index set', { count: idxs.length, max });
     if ((max + 1) !== manifest.totalChunks) throw new EnvelopeError('total_mismatch', 'totalChunks mismatch');
 
-    // ---- 3) Decrypt and verify each data chunk ----
-    const totalLen = manifest.totalPlainLen | 0;
-    recovered = new Uint8Array(totalLen);
-    let written = 0;
+    /* ******************************************************
+     * Stream plaintext output: File System Access (O(1) RAM) or memory fallback
+     ****************************************************** */
+    async function getPlainSink(suggestedName = 'files.zip') {
+      if (window.showSaveFilePicker) {
+        const handle = await showSaveFilePicker({
+          suggestedName,
+          types: [{
+            description: 'Decrypted Output',
+            accept: { 'application/octet-stream': ['.zip', '.bin', '.txt'] }
+          }]
+        });
+        const writable = await handle.createWritable();
+        return new FileStreamSink(writable);
+      }
+      return new SegmentsSink(); // memory fallback
+    }
 
+    // Suggested output filename
+    const outName =
+    (manifest?.source?.kind === 'files' && Array.isArray(manifest.source.files) && manifest.source.files.length > 1)
+        ? 'files.zip'
+        : (manifest?.source?.kind === 'text'
+            ? 'decrypted.txt'
+            : (manifest?.source?.files?.[0]?.name || 'decrypted.bin'));
+
+    const plainSink = await getPlainSink(outName);
+
+    /* ******************************************************
+     * Decrypt, verify and stream each data chunk
+     ****************************************************** */
+    let written = 0;
     for (let i = 0; i < manifest.totalChunks; i++) {
       const entry = byName.get(`part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
       if (!entry) { logWarn('[dec] missing data chunk', { i }); throw new EnvelopeError('missing_part', `Chunk ${i} missing`); }
 
-      const opened = await openFixedChunk({
-        password,
+      // Open with bundle-level keys (no per-chunk Argon2)
+      const opened = await openFixedChunkDet({
+        kEncKey: K_ENC,
+        kIv32,
         bytes: entry.bytes,
-        expectedBundleId
+        expectedBundleId,
+        chunkIndex: i
       });
-
-      const bd = opened.meta && opened.meta.bundleId;
-      if (bd !== expectedBundleId) {
-        logWarn('[dec] bundleId mismatch in data part', { i });
-        throw new EnvelopeError('bundle_mismatch', `Chunk ${i}: bundleId mismatch`);
-      }
 
       const inner  = opened.innerMeta;
       if (inner.kind !== 'fixed') throw new EnvelopeError('part_kind',  `Chunk ${i}: unexpected type`);
       if (inner.chunkIndex !== i) throw new EnvelopeError('part_idx',   `Chunk ${i}: wrong internal index`);
-      if (inner.totalChunks !== manifest.totalChunks)     throw new EnvelopeError('part_total', `Chunk ${i}: totalChunks mismatch`);
-      if (inner.totalPlainLen !== manifest.totalPlainLen) throw new EnvelopeError('part_len',   `Chunk ${i}: totalPlainLen mismatch`);
 
-      const isLast   = (i === manifest.totalChunks - 1);
-      const sliceEnd = isLast ? (manifest.totalPlainLen - (FIXED_CHUNK_SIZE * (manifest.totalChunks - 1))) : FIXED_CHUNK_SIZE;
+      const isLastPart = (i === manifest.totalChunks - 1);
+      if (inner.totalChunks && inner.totalChunks !== manifest.totalChunks) {
+        throw new EnvelopeError('part_total', `Chunk ${i}: totalChunks mismatch`);
+      }
+      if (inner.totalPlainLen) {
+        if (isLastPart) {
+          if (inner.totalPlainLen !== manifest.totalPlainLen) {
+            throw new EnvelopeError('part_len', `Chunk ${i}: totalPlainLen mismatch (last)`);
+          }
+        } else {
+          if (inner.totalPlainLen > manifest.totalPlainLen) {
+            throw new EnvelopeError('part_len', `Chunk ${i}: totalPlainLen exceeds manifest`);
+          }
+        }
+      }
+
+      const sliceEnd = isLastPart
+        ? (manifest.totalPlainLen - (FIXED_CHUNK_SIZE * (manifest.totalChunks - 1)))
+        : FIXED_CHUNK_SIZE;
       const slice    = opened.fixedChunk.subarray(0, sliceEnd);
 
+      // Per-chunk integrity check
       const h = await sha256Hex(slice);
       const expected = manifest.chunkHashes[i];
       if (!timingSafeEqual(h, expected)) {
@@ -2529,71 +3431,66 @@ async function doDecrypt() {
         throw new EnvelopeError('hash_mismatch', `Chunk ${i}: unexpected hash`);
       }
 
-      recovered.set(slice, i * FIXED_CHUNK_SIZE);
+      await plainSink.write(slice);
       written += slice.length;
+
       try { opened.fixedChunk.fill(0); } catch {}
 
       setProgress(decBar, 20 + Math.floor(70 * (i + 1) / manifest.totalChunks));
-      if ((i & 1) === 0) { await new Promise(r => setTimeout(r, 0)); }
+      if ((i & 1) === 0) await new Promise(r => setTimeout(r, 0));
     }
 
-    if (written !== manifest.totalPlainLen) {
-      logWarn('[dec] rebuilt total size mismatch', { written, expected: manifest.totalPlainLen });
-      throw new EnvelopeError('rebuild_size', 'Incorrect reconstructed size');
+    if (typeof plainSink.close === 'function') {
+      try { await plainSink.close(); } catch {}
     }
 
-    // ---- 4) Verify whole-plaintext hash (silent in UI) ----
-    const whole = await sha256Hex(recovered);
-    const ok = timingSafeEqual(whole, manifest.wholePlainHash);
-    logInfo('[dec] whole hash check', { ok });
-    setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
+    // Wipe keying material (bytes)
+    try { master32.fill(0); } catch {}
+    try { kEnc32.fill(0); } catch {}
+    try { kIv32.fill(0); } catch {}
 
-    // ---- 5) Render / download ----
-    let handled = false;
-    if (manifest?.source?.kind === 'files' && Array.isArray(manifest.source.files)) {
-      if (manifest.source.files.length === 1) {
-        // Single original file: restore original name + MIME
-        const meta0 = manifest.source.files[0] || {};
-        const safeName = String(meta0.name || 'file').replace(/[\/\\]/g, '');
-        const mime = meta0.type || 'application/octet-stream';
-        addDownload(
-          '#decResults',
-          new Blob([recovered], { type: mime }),
-          safeName,
-          'Download file'
-        );
-        handled = true;
-        logInfo('[dec] rendered single file download', { name: safeName, mime });
+    /* ******************************************************
+     * Present results (memory fallback or saved-to-disk)
+     ****************************************************** */
+    if (plainSink instanceof SegmentsSink) {
+      const u8 = plainSink.toUint8Array();
+      const mime =
+        (manifest?.source?.kind === 'files' && manifest.source.files?.length > 1)
+          ? 'application/zip'
+          : (manifest?.source?.kind === 'text'
+              ? 'text/plain;charset=utf-8'
+              : (manifest?.source?.files?.[0]?.type || 'application/octet-stream'));
+
+      if (manifest?.source?.kind === 'text') {
+        // Affiche le texte dans #decText (jusqu’à MAX_PREVIEW) ET ajoute un bouton Download .txt
+        await tryRenderOrDownload(u8, '#decResults', '#decText');
       } else {
-        // Multi-file: you encrypted a ZIP at source -> return ZIP
-        addDownload(
-          '#decResults',
-          new Blob([recovered], { type: 'application/zip' }),
-          'files.zip',
-          'Download archive'
-        );
-        handled = true;
-        logInfo('[dec] rendered multi-file zip download');
+        addDownload('#decResults', new Blob([u8], { type: mime }), outName, 'Download');
+        const decResults = document.getElementById('decResults');
+        if (decResults) decResults.classList.remove('hidden');
       }
-    }
 
-    if (!handled) {
-      // Fallback: render text/HTML if it looks like text; else generic download
-      const looksText = looksLikeUtf8Text(recovered);
-      logInfo('[dec] rendering generic', { looksText, bytes: recovered.length });
-      await tryRenderOrDownload(recovered, '#decResults', '#decText');
+      // Whole-file hash verification (only possible in memory fallback)
+      if (manifest.wholePlainHash) {
+        const whole = await sha256Hex(u8);
+        const ok = timingSafeEqual(whole, manifest.wholePlainHash);
+        logInfo('[dec] whole hash check', { ok });
+        setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
+      } else {
+        setText('#decIntegrity', 'Integrity: chunk-level verified.');
+      }
+    } else {
+      // Saved directly to disk
+      setText('#decIntegrity', 'Integrity: chunk-level verified (saved to disk).');
+      const decResults = document.getElementById('decResults');
+      if (decResults) decResults.classList.remove('hidden');
     }
 
     setProgress(decBar, 100);
     setLive('Decryption complete.');
     logInfo('[dec] success');
 
-    // Reveal results and hide progress container after success
     try {
-      const decResults = document.getElementById('decResults');
-      const decTextEl  = document.getElementById('decText');
-      if (decResults) decResults.classList.remove('hidden');
-      if (decTextEl && (decTextEl.textContent || '').trim() !== '') decTextEl.hidden = false;
       const decProgress = document.querySelector('#decBar')?.parentElement;
       if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (done)'); }
     } catch (e) { logWarn('[dec] results reveal warn', e); }
@@ -2608,6 +3505,7 @@ async function doDecrypt() {
     }
 
     try { $('#decFile').value = ''; setText('#decFileName', ''); } catch {}
+
   } catch (err) {
     // Log with extra metadata when possible
     const meta = { name: (err && err.name) || null, code: (err && err.code) || null, msg: (err && err.message) || String(err) };
@@ -2615,13 +3513,12 @@ async function doDecrypt() {
     await secureFail('Decryption');
     setProgress(decBar, 0);
     clearPasswords();
-    // always hide progress container on error
     try {
       const decProgress = document.querySelector('#decBar')?.parentElement;
       if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (error)'); }
     } catch (e) { logWarn('[dec] progress hide warn (error)', e); }
   } finally {
-    // ---- UI restore (anti double-click) ----
+    // Restore button state
     try {
       if (decryptBtn) {
         decryptBtn.disabled = !!prevDisabled;
@@ -2630,27 +3527,21 @@ async function doDecrypt() {
       }
     } catch (e) { logWarn('[dec] btn restore warn', e); }
 
-    // Ensure progress is hidden on any exit path
+    // Ensure progress hidden on exit
     try {
       const decProgress = document.querySelector('#decBar')?.parentElement;
       if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (finally)'); }
     } catch (e) { logWarn('[dec] progress hide warn (finally)', e); }
 
-    // ---- Wipe encrypted chunk buffers (from ZIP or direct .cbox) ----
+    // Wipe encrypted chunk buffers (from ZIP or direct .cbox)
     try {
       let wiped = 0;
       for (const e of entries || []) { if (e?.bytes?.fill) { e.bytes.fill(0); wiped++; } }
       logInfo('[dec] wiped encrypted buffers', { wiped });
     } catch (e) { logWarn('[dec] wipe buffers warn', e); }
 
-    // ---- Drop references so GC can reclaim ----
+    // Drop references so GC can reclaim
     entries = null;
-
-    // ---- Existing memory wipes ----
-    if (zipU8)     { wipeBytes(zipU8); logInfo('[dec] wiped zipU8'); }
-    if (recovered) { logInfo('[dec] recovered bytes length', { bytes: recovered.length }); wipeBytes(recovered); logInfo('[dec] wiped recovered'); }
-    zipU8 = null;
-    recovered = null;
 
     // Keep results visible only if there is content; otherwise keep hidden
     try {
@@ -2664,53 +3555,6 @@ async function doDecrypt() {
     } catch (e) { logWarn('[dec] final visibility warn', e); }
   }
 }
-
-
-// ===== Trusted Types: strong default policy + GitHub Pages compatibility =====
-//
-// Keep `require-trusted-types-for 'script'` in the page CSP.
-// This policy:
-//  - blocks createHTML / createScript (no innerHTML/eval injection)
-//  - only allows same-origin ScriptURL
-//  - supports relative paths and subfolders (GitHub Pages)
-
-(function setupTrustedTypes() {
-  if (!window.trustedTypes || trustedTypes.defaultPolicy) return;
-  try {
-    trustedTypes.createPolicy('default', {
-      createHTML(_html) {
-        throw new TypeError('Blocked createHTML by default Trusted Types policy');
-      },
-      createScript(_js) {
-        throw new TypeError('Blocked createScript by default Trusted Types policy');
-      },
-      createScriptURL(url) {
-        // Correctly resolves relative paths and GitHub Pages subfolders
-        const u = new URL(url, location.href);
-
-        // 1) Require same origin
-        if (u.origin !== location.origin) {
-          throw new TypeError('Only same-origin ScriptURL allowed');
-        }
-
-        // 2) Whitelist allowed JS files (works with subfolders)
-        const allowed =
-          u.pathname.endsWith('/app.js') ||
-          u.pathname.endsWith('/argon-worker.js') ||
-          u.pathname.endsWith('/argon-worker-permissive.js') ||
-          u.pathname.endsWith('/argon2-bundled.min.js');
-
-        if (!allowed) {
-          throw new TypeError('ScriptURL path not whitelisted: ' + u.pathname);
-        }
-
-        return u.toString();
-      }
-    });
-  } catch (e) {
-    logWarn && logWarn('Trusted Types default policy not installed:', e);
-  }
-})();
 
 
 
@@ -2894,7 +3738,31 @@ document.addEventListener('DOMContentLoaded', () => {
   $('#decFile').addEventListener('change', updateDecryptButtonState);
 
   // Main actions
-  $('#btnEncrypt').addEventListener('click', doEncrypt);
+  $('#btnEncrypt').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+  
+    // Préflight fichiers (si tu l’as ajouté)
+    const files = $('#encFiles')?.files;
+    try {
+      if (files && files.length) preflightInputs([...files]);
+    } catch (err) {
+      await secureFail('Encryption', normalizeEncError(err));
+      btn.disabled = false;
+      return;
+    }
+  
+    encBusy = true;            // <— active le flag ici
+    try {
+      await doEncrypt();       // <— doEncrypt() ne touche plus à encBusy
+    } finally {
+      encBusy = false;         // <— reset ici
+      btn.disabled = false;
+    }
+  });
+  
+  
   $('#btnDecrypt').addEventListener('click', doDecrypt);
 
   // Panic / Clear all
@@ -2931,6 +3799,22 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     });
   });
+
+  // ——— Garde global pour traiter seulement si un chiffrement est en cours
+  let encBusy = false;
+  
+  window.addEventListener('unhandledrejection', async (ev) => {
+    if (!encBusy) return;
+    logError('[enc] unhandledrejection', ev.reason);
+    await secureFail('Encryption', normalizeEncError(ev.reason));
+  });
+  
+  window.addEventListener('error', async (ev) => {
+    if (!encBusy) return;
+    logError('[enc] window error', ev.error || ev.message);
+    const e = ev.error || new Error(String(ev.message));
+    await secureFail('Encryption', normalizeEncError(e));
+  });  
 
   // Initialize
   init();

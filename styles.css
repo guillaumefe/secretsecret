@@ -232,7 +232,8 @@
   /* =========================================================
      Sticky action bar
      ========================================================= */
-  .actionbar{ position:sticky; bottom:var(--safe-b); padding-top:6px; background: #FFF }
+  .actionbar{ position:sticky; bottom:var(--safe-b); padding-top:6px; background: var(--bg) }
+
   .actionbar .buttons{
     background:var(--card);
     border:1px solid var(--border);
@@ -364,3 +365,95 @@
     padding:0 4px; margin-bottom:8px;
   }
   
+  /* =========================================================
+   Accessibility Layer (A11y)
+   - Utilitaires SR-only, focus visibles, erreurs, contrastes,
+     préférences utilisateurs, etc.
+   - À coller tel quel à la fin de styles.css
+   ========================================================= */
+
+/* 1) Texte uniquement pour lecteurs d’écran */
+.sr-only,
+.visually-hidden{
+  position:absolute !important;
+  width:1px; height:1px;
+  padding:0; margin:-1px;
+  overflow:hidden; clip:rect(0,0,0,0);
+  white-space:nowrap; border:0;
+}
+
+/* 2) Skip link déjà présent : s’assurer qu’il est très visible au focus */
+.skip:focus{
+  position:fixed; left:var(--pad); top:var(--pad);
+  z-index:9999; background:var(--card);
+  border:2px solid var(--focus); border-radius:8px;
+  padding:8px 12px;
+}
+
+/* 3) Anneaux de focus clairs et cohérents */
+:focus-visible{
+  outline:3px solid var(--focus);
+  outline-offset:2px;
+}
+.seg [role="tab"]:focus-visible,
+[role="tabpanel"]:focus-visible,
+summary:focus-visible,
+.drop:focus-visible,
+.btn:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible{
+  outline:3px solid var(--focus);
+  outline-offset:2px;
+  border-radius:8px;
+}
+
+/* 4) États de validation annoncés (aria-invalid) */
+input[aria-invalid="true"],
+textarea[aria-invalid="true"],
+select[aria-invalid="true"]{
+  border-color: var(--err);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--err) 35%, transparent);
+}
+
+/* 5) Régions occupées (aria-busy) — curseur et feedback visuel léger */
+[aria-busy="true"]{
+  cursor: progress;
+}
+[aria-busy="true"] .btn.primary{ filter: saturate(.8); opacity:.85 }
+
+/* 6) Progressbars : titre caché + largeur animable sans motion violente */
+.progress .bar{
+  transition: width .25s linear;
+}
+@media (prefers-reduced-motion: reduce){
+  .progress .bar{ transition: none }
+}
+
+/* 7) Détails/Résumé : cible focus claire */
+details > summary{
+  list-style: none;
+}
+details > summary::-webkit-details-marker{ display:none }
+
+/* 8) Zones de dépôt (labels cliquables) : garder lisibles au clavier */
+.drop{
+  position: relative;
+}
+.drop[aria-disabled="true"]{
+  opacity:.6; cursor:not-allowed;
+}
+
+/* 9) Contraste forcé (Windows High Contrast) */
+@media (forced-colors: active){
+  *{ forced-color-adjust: auto }
+  .seg [aria-selected="true"]{ border-color: Highlight; }
+  .btn:focus-visible,
+  .drop:focus-visible,
+  [role="tab"]:focus-visible,
+  [role="tabpanel"]:focus-visible,
+  summary:focus-visible{ outline: 2px solid Highlight; }
+}
+
+/* 10) Footer landmark clair (déjà en HTML via role=contentinfo) */
+/* (rien à ajouter ici mais on garde le bloc pour clarté) */
