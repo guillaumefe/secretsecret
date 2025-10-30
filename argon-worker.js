@@ -16,30 +16,53 @@
 
 let loaded = false;
 
-// Emscripten module object used by argon2 glue code.
-// The main thread will pass URLs; we wire locateFile to the exact wasm URL.
+// Emscripten module
 self.Module = self.Module || {};
 
 self.onmessage = async (e) => {
   const { cmd, payload } = e.data || {};
+
   try {
-    // ---- Initialization: load argon2 glue + probe WASM availability ----
+    // =============== INIT =================
     if (cmd === 'init') {
-      // Use explicit URLs from the main thread when provided; otherwise defaults.
       const jsURL   = (payload && payload.jsURL)   || '/argon2-bundled.min.js';
       const wasmURL = (payload && payload.wasmURL) || '/argon2.wasm';
 
-      // Ensure the Emscripten glue resolves the .wasm file to the correct path.
+      // Correct resolution of .wasm, no blob/data:
       self.Module.locateFile = (path) =>
         path.endsWith('.wasm') ? wasmURL : path;
 
-      // Load the Argon2 glue (uses instantiateStreaming if available).
-      // Under strict CSP this must be same-origin and free of eval requirements.
+      // Enforce safe WASM instantiation under strict CSP
+      self.Module.instantiateWasm = (imports, onSuccess) => {
+        (async () => {
+          try {
+            if ('instantiateStreaming' in WebAssembly) {
+              const res = await fetch(wasmURL, { credentials: 'same-origin' });
+              if (!res.ok) throw new Error(`HTTP ${res.status}`);
+              const { instance, module } = await WebAssembly.instantiateStreaming(res, imports);
+              onSuccess(instance);
+              return { instance, module };
+            }
+          } catch (e) {
+            console.warn('[argon2] streaming failed; fallback to ArrayBuffer:', e);
+          }
+
+          const bytes = await (await fetch(wasmURL, { credentials: 'same-origin' })).arrayBuffer();
+          const { instance, module } = await WebAssembly.instantiate(bytes, imports);
+          onSuccess(instance);
+          return { instance, module };
+        })();
+
+        return {}; // Emscripten will resolve via promise
+      };
+
+      // Load argon2 JS wrapper (same-origin)
       importScripts(jsURL);
 
-      // Quick probe: compute a tiny Argon2 hash to ensure WASM is ready.
+      // Probe tiny Argon2 hash to ensure WASM ready
       const salt = new Uint8Array(16);
       const pass = new Uint8Array(1);
+
       const res = await self.argon2.hash({
         pass,
         salt,
@@ -51,21 +74,18 @@ self.onmessage = async (e) => {
       });
       if (!res || !res.hash) throw new Error('WASM probe failed');
 
-      // Best-effort wipe of probe inputs
-      try { salt.fill(0); } catch {}
-      try { pass.fill(0); } catch {}
+      try { salt.fill(0); pass.fill(0); } catch {}
 
       loaded = true;
       self.postMessage({ ok: true, cmd: 'init' });
       return;
     }
 
-    // ---- KDF: Argon2id(passBytes, salt) -> 32-byte key ----
+    // =============== KDF =================
     if (cmd === 'kdf') {
       if (!loaded) throw new Error('Argon2 not loaded');
       const { passBytes, salt, mMiB, t, p } = payload;
 
-      // Compute Argon2id with provided parameters.
       const res = await self.argon2.hash({
         pass: new Uint8Array(passBytes),
         salt: new Uint8Array(salt),
@@ -76,35 +96,27 @@ self.onmessage = async (e) => {
         type: self.argon2.ArgonType.Argon2id
       });
 
-      // Create a fresh transferable buffer for the key (avoid retaining argon2's internal buffer).
+      // Copy into clean transferable buffer
       const out = new Uint8Array(res.hash.byteLength);
       out.set(new Uint8Array(res.hash));
 
-      // Best-effort wipe of the intermediate result and inputs.
+      // Best-effort wipes
       try { new Uint8Array(res.hash).fill(0); } catch {}
       try { new Uint8Array(passBytes).fill(0); } catch {}
       try { new Uint8Array(salt).fill(0); } catch {}
 
-      // If the wrapper ever exposes cleanup hooks, call them here (safe no-ops otherwise).
-      // Example skeleton:
-      // try {
-      //   if (self.argon2 && typeof self.argon2._clear === 'function') {
-      //     self.argon2._clear();
-      //   }
-      // } catch {}
-
-      // Transfer the key buffer to the main thread (zero-copy move).
+      // Zero-copy transfer to main
       self.postMessage({ ok: true, cmd: 'kdf', key: out }, [ out.buffer ]);
 
-      // Encourage early cleanup (the main thread also calls terminate()).
+      // Terminate worker after result (ephemeral model)
       try { self.close(); } catch {}
       return;
     }
 
-    // ---- Unknown command fallback ----
+    // =============== Unknown =================
     self.postMessage({ ok: false, error: 'Unknown command' });
+
   } catch (err) {
-    // Return a neutral error (details remain in devtools if opened).
     self.postMessage({ ok: false, error: (err && err.message) || String(err) });
   }
 };
