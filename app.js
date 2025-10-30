@@ -1566,8 +1566,6 @@ class StoreZipWriter {
       u32le(0), u32le(lfhOffset)  // rel offset LFH
     ];
     this.centrals.push({ CDH, nameBytes });
-    // avancer l’offset
-    this.offset = dataOffset + size;
   }
 
   async finish() {
