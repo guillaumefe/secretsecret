@@ -2407,8 +2407,7 @@ async function doEncrypt() {
           payloadChunk: c,
           chunkIndex: i,
           totalChunks,
-          totalPlainLen,
-          domain: 'data'
+          totalPlainLen
         });
 
         sealedParts.push({
@@ -2446,8 +2445,7 @@ async function doEncrypt() {
           payloadChunk: padToFixed(manChunksClear[i]),
           chunkIndex: i,
           totalChunks: manChunksClear.length,
-          totalPlainLen: manifestBytes.length,
-          domain: 'manifest'
+          totalPlainLen: manifestBytes.length
         });
         manSealedParts.push({
           name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
@@ -2478,8 +2476,7 @@ async function doEncrypt() {
           payloadChunk: padToFixed(manIndexChunks[i]),
           chunkIndex: i,
           totalChunks: manIndexChunks.length,
-          totalPlainLen: manIndexBytes.length,
-          domain: 'index'
+          totalPlainLen: manIndexBytes.length
         });
         manIndexSealed.push({
           name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
@@ -2657,7 +2654,8 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       payloadChunk: fixedChunk,
       chunkIndex: partIndex,
       totalChunks: 0,
-      totalPlainLen: plainTotalLen
+      totalPlainLen: plainTotalLen,
+      domain: 'data'
     });    
 
     // Ajouter l’entrée part-XXXXXX.cbox dans le bundle (store-only) immédiatement
@@ -2760,7 +2758,8 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       payloadChunk: padToFixed(manChunksClear[i]),
       chunkIndex: i,
       totalChunks: manChunksClear.length,
-      totalPlainLen: manifestBytes.length
+      totalPlainLen: manifestBytes.length,
+      domain: 'manifest'
     });
     const name = `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
     const crc  = crc32(sealed);
@@ -2791,7 +2790,8 @@ for (let i = 0; i < manIndexChunks.length; i++) {
     payloadChunk: padToFixed(manIndexChunks[i]),
     chunkIndex: i,
     totalChunks: manIndexChunks.length,
-    totalPlainLen: manIndexBytes.length
+    totalPlainLen: manIndexBytes.length,
+    domain: 'index'
   });
   const name = `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
   const crc  = crc32(sealed);
