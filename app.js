@@ -588,8 +588,8 @@ async function hkdfSplit(master32, bundleSalt) {
  * Deterministic 96-bit IV per chunk via HKDF
  *  - Stable for (kIv32, bundleId, chunkIndex)
  ****************************************************** */
-async function deriveIv96(kIv32, bundleId, chunkIndex) {
-  const prefix = TE.encode('cbox/iv/');
+async function deriveIv96(kIv32, bundleId, chunkIndex, domain = 'data') {
+  const prefix = TE.encode(`cbox/iv/${domain}/`);
   const bid    = TE.encode(bundleId);
   const info   = new Uint8Array(prefix.length + bid.length + 4);
 
@@ -971,9 +971,9 @@ function validateArgon({ mMiB, t, p }) {
  *  - Encrypt a fixed-size chunk with AES-GCM (bundle-level keys)
  ****************************************************** */
 async function sealFixedChunkDet({
-  kEncKey, kIv32, bundleId, payloadChunk, chunkIndex, totalChunks, totalPlainLen
+  kEncKey, kIv32, bundleId, payloadChunk, chunkIndex, totalChunks, totalPlainLen, domain = 'data'
 }) {
-  const ivU8 = new Uint8Array(await deriveIv96(kIv32, bundleId, chunkIndex));
+  const ivU8 = new Uint8Array(await deriveIv96(kIv32, bundleId, chunkIndex, domain));
 
   const innerMeta = { v: 1, kind: 'fixed', fixedSize: FIXED_CHUNK_SIZE, chunkIndex, totalChunks, totalPlainLen };
   const innerMetaBytes = TE.encode(JSON.stringify(innerMeta));
@@ -2407,7 +2407,8 @@ async function doEncrypt() {
           payloadChunk: c,
           chunkIndex: i,
           totalChunks,
-          totalPlainLen
+          totalPlainLen,
+          domain: 'data'
         });
 
         sealedParts.push({
@@ -2445,7 +2446,8 @@ async function doEncrypt() {
           payloadChunk: padToFixed(manChunksClear[i]),
           chunkIndex: i,
           totalChunks: manChunksClear.length,
-          totalPlainLen: manifestBytes.length
+          totalPlainLen: manifestBytes.length,
+          domain: 'manifest'
         });
         manSealedParts.push({
           name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
@@ -2476,7 +2478,8 @@ async function doEncrypt() {
           payloadChunk: padToFixed(manIndexChunks[i]),
           chunkIndex: i,
           totalChunks: manIndexChunks.length,
-          totalPlainLen: manIndexBytes.length
+          totalPlainLen: manIndexBytes.length,
+          domain: 'index'
         });
         manIndexSealed.push({
           name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
