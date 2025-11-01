@@ -2500,7 +2500,7 @@ async function doEncrypt() {
       * Build bundle ZIP (store-only) and present download
       ****************************************************** */
       const filesOut = [ headerEntry, ...sealedParts, ...manSealedParts, ...manIndexSealed ];
-      const bundleZip = buildZip(filesOut);
+      const bundleZip = buildZip(filesOut, { store: true });
 
       // wipe sealed parts memory
       try { for (const f of filesOut) f?.bytes?.fill?.(0); } catch {}
