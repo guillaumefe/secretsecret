@@ -2654,7 +2654,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       payloadChunk: fixedChunk,
       chunkIndex: partIndex,
       totalChunks: 0,
-      totalPlainLen: plainTotalLen,
+      totalPlainLen: isLastChunk ? plainTotalLen : 0,
       domain: 'data'
     });    
 
