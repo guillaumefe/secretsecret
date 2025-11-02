@@ -2295,38 +2295,33 @@ function selectContentTab(which) {
   const outText  = document.querySelector('#encOutputsText');
   const outFiles = document.querySelector('#encOutputsFiles');
 
-  if (which === 'text') {
-    tBtn.setAttribute('aria-selected','true');
-    fBtn.setAttribute('aria-selected','false');
-    tPanel.hidden = false;
-    fPanel.hidden = true;
+  const selIsText = (which === 'text');
 
-    // Hide FILES outputs, show TEXT outputs (without clearing content)
-    if (outFiles) outFiles.classList.add('hidden');
-    if (outText)  { outText.classList.remove('hidden'); outText.classList.add('visible'); }
+  // Toggle tabs/panels
+  tBtn.setAttribute('aria-selected', selIsText ? 'true' : 'false');
+  fBtn.setAttribute('aria-selected', selIsText ? 'false' : 'true');
+  tPanel.hidden = !selIsText;
+  fPanel.hidden = selIsText;
 
-    // Make sure both scoped progress bars are hidden on switch
-    showEncProgress('files', false);
-    showEncProgress('text',  false);
-
+  // Only the active outputs wrapper is visible
+  if (selIsText) {
+    outFiles && outFiles.classList.add('hidden');
+    outText  && outText.classList.remove('hidden');
   } else {
-    fBtn.setAttribute('aria-selected','true');
-    tBtn.setAttribute('aria-selected','false');
-    fPanel.hidden = false;
-    tPanel.hidden = true;
-
-    // Hide TEXT outputs, show FILES outputs (without clearing content)
-    if (outText)  outText.classList.add('hidden');
-    if (outFiles) { outFiles.classList.remove('hidden'); outFiles.classList.add('visible'); }
-
-    showEncProgress('text',  false);
-    showEncProgress('files', false);
+    outText  && outText.classList.add('hidden');
+    outFiles && outFiles.classList.remove('hidden');
   }
 
-  // Keep existing results intact; just recompute button state
+  // Hide both progress bars on tab switch (will be shown by doEncrypt)
+  showEncProgress('text',  false);
+  showEncProgress('files', false);
+
+  // Re-check emptiness to avoid showing empty boxes
+  hideIfEmpty('#encOutputsText',  '#encResultsText');
+  hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
+
   updateEncryptButtonState();
 }
-
 
 
 // ===== Auto-tune with budget and cancel support =====
@@ -3052,7 +3047,7 @@ ${plb}:
   ${pla}`;
 
   out.textContent = text;      // textContent: no HTML injection
-  out.classList.add('hashbox');
+  out.classList.add('hashbox', 'card');
 }
 
 /**
