@@ -310,7 +310,7 @@ async function secureFail(ctx, overrideMsg) {
   // Hide results ONLY if they are actually empty (no stale UI)
   try { hideIfEmpty('#encOutputsText',  '#encResultsText'); } catch {}
   try { hideIfEmpty('#encOutputsFiles', '#encResultsFiles'); } catch {}
-  try { hideIfEmpty('#decOutputs',      '#decResults, #decText'); } catch {}
+  try { hideIfEmpty('#decDetails',      '#decResults, #decText'); } catch {}
 }
 
 function normalizeEncError(err) {
@@ -2218,7 +2218,7 @@ function resetDecryptUI(opts = {}) {
   showProgress('decBar', false);
   
   // Hide results container if empty
-  hideIfEmpty('#decOutputs', '#decResults, #decText');
+  hideIfEmpty('#decDetails', '#decResults, #decText');
 
   // Revoke object URLs and remove any blob links/buttons in decResults
   try {
