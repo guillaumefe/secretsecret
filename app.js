@@ -2171,59 +2171,82 @@ function resetDecryptUI(opts = {}) {
  * Switch between Encrypt and Decrypt tabs and reset both panels.
  */
 function selectTab(which) {
-  const encTab   = $('#tabEncrypt'), decTab = $('#tabDecrypt');
-  const encPanel = $('#panelEncrypt'), decPanel = $('#panelDecrypt');
+  const encTab   = $('#tabEncrypt');
+  const decTab   = $('#tabDecrypt');
+  const encPanel = $('#panelEncrypt');
+  const decPanel = $('#panelDecrypt');
 
   if (which === 'enc') {
-    encTab.setAttribute('aria-selected', 'true');  decTab.setAttribute('aria-selected', 'false');
-    encPanel.hidden = false; decPanel.hidden = true;
+    encTab.setAttribute('aria-selected', 'true');
+    decTab.setAttribute('aria-selected', 'false');
+    encPanel.hidden = false;
+    decPanel.hidden = true;
   } else {
-    decTab.setAttribute('aria-selected', 'true');  encTab.setAttribute('aria-selected', 'false');
-    decPanel.hidden = false; encPanel.hidden = true;
+    decTab.setAttribute('aria-selected', 'true');
+    encTab.setAttribute('aria-selected', 'false');
+    decPanel.hidden = false;
+    encPanel.hidden = true;
   }
 
-  try { document.querySelector('#encResults')?.classList.add('hidden'); } catch {}
-  try { document.querySelector('#decResults')?.classList.add('hidden'); } catch {}
-  try { $('#decText') && ($('#decText').hidden = true); } catch {}
+  // Do NOT clear results — only hide if truly empty
+  hideIfEmpty('#encOutputs', '#encResults');
+  hideIfEmpty('#decOutputs', '#decResults, #decText');
 
-  // Always ensure encryption password is re-hidden after any tab change.
+  // Keep decrypted text hidden only if it has no content
+  try {
+    const decText = $('#decText');
+    if (decText && !(decText.textContent || '').trim()) {
+      decText.hidden = true;
+    }
+  } catch {}
+
+  // Always re-mask encryption password
   try {
     const encPwd = $('#encPassword');
-    const encToggle = $('#encPwdToggle');
+    const toggle = $('#encPwdToggle');
     if (encPwd) {
       encPwd.type = 'password';
-      if (encToggle) {
-        setText(encToggle, 'Show');
-        encToggle.setAttribute('aria-pressed', 'false');
+      if (toggle) {
+        setText(toggle, 'Show');
+        toggle.setAttribute('aria-pressed', 'false');
       }
     }
-  } catch (e) { /* non-fatal UI tweak */ }
+  } catch {}
 
+  // Hide progress bars when switching panels
   showProgress('encBar', false);
   showProgress('decBar', false);
-  hideIfEmpty('#encOutputs', '#encResults');
-  hideIfEmpty('#decOutputs', '#decResults');
 }
 
 /**
  * Switch encryption content input mode (Text vs Files).
  */
 function selectContentTab(which) {
-  const tBtn=$('#encTabText'), fBtn=$('#encTabFiles');
-  const tPanel=$('#encPanelText'), fPanel=$('#encPanelFiles');
+  const tBtn   = $('#encTabText');
+  const fBtn   = $('#encTabFiles');
+  const tPanel = $('#encPanelText');
+  const fPanel = $('#encPanelFiles');
+
   if (which === 'text') {
-    tBtn.setAttribute('aria-selected','true');  fBtn.setAttribute('aria-selected','false');
-    tPanel.hidden = false; fPanel.hidden = true;
+    tBtn.setAttribute('aria-selected','true');
+    fBtn.setAttribute('aria-selected','false');
+    tPanel.hidden = false;
+    fPanel.hidden = true;
   } else {
-    fBtn.setAttribute('aria-selected','true');  tBtn.setAttribute('aria-selected','false');
-    fPanel.hidden = false; tPanel.hidden = true;
+    fBtn.setAttribute('aria-selected','true');
+    tBtn.setAttribute('aria-selected','false');
+    fPanel.hidden = false;
+    tPanel.hidden = true;
   }
-  clearNode('#encResults');
-  setText('#encHash', '');
-  setText('#encPlainHash', '');
+
+  // Keep existing results if any — do NOT clear here
   updateEncryptButtonState();
-  hideIfEmpty('#encOutputs', '#encResults');  // hide console if nothing inside
-  showProgress('encBar', false);              // always hide bar on tab switch
+
+  // Only hide the output container if it is actually empty
+  hideIfEmpty('#encOutputs', '#encResults');
+
+  // Always hide progress bar when switching input modes
+  showProgress('encBar', false);
 }
 
 
