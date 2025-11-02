@@ -134,41 +134,43 @@
             <ul id="encFileList" class="muted" aria-live="polite" aria-atomic="false" aria-relevant="additions removals"></ul>
           </div>
         </fieldset>
-
+        
         <!-- Sticky actions -->
         <div class="actionbar" role="region" aria-label="Encryption actions">
           <div class="buttons">
             <button id="btnEncrypt" class="btn primary" type="button" disabled aria-disabled="true">Encrypt</button>
             <button id="btnClearEncrypt" class="btn secondary" type="button">Clear</button>
           </div>
-        
-          <!-- TEXT mode outputs -->
-          <div id="encOutputsText" class="row hidden" role="region" aria-label="Encryption results (Text)">
-            <div class="progress mt-10" aria-label="Encryption progress (Text)">
-              <span id="encBarLabelText" class="visually-hidden">Encryption progress (Text)</span>
-              <div id="encBarText" class="bar"
-                   role="progressbar"
-                   aria-labelledby="encBarLabelText"
-                   aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
-            </div>
-        
-            <div id="encResultsText" role="status" aria-live="polite" aria-atomic="true"></div>
-            <div id="encHashText" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
+          <!-- Progress (Text) -->
+          <div id="encProgText" class="progress mt-10" aria-label="Encryption progress (Text)">
+            <span id="encBarLabelText" class="visually-hidden">Encryption progress (Text)</span>
+            <div id="encBarText" class="bar"
+                 role="progressbar"
+                 aria-labelledby="encBarLabelText"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
           </div>
-        
-          <!-- FILES mode outputs -->
-          <div id="encOutputsFiles" class="row hidden" role="region" aria-label="Encryption results (Files)">
-            <div class="progress mt-10" aria-label="Encryption progress (Files)">
-              <span id="encBarLabelFiles" class="visually-hidden">Encryption progress (Files)</span>
-              <div id="encBarFiles" class="bar"
-                   role="progressbar"
-                   aria-labelledby="encBarLabelFiles"
-                   aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
-            </div>
-        
-            <div id="encResultsFiles" role="status" aria-live="polite" aria-atomic="true"></div>
-            <div id="encHashFiles" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
+          <!-- Progress (Files) -->
+          <div id="encProgFiles" class="progress mt-10 hidden" aria-label="Encryption progress (Files)">
+            <span id="encBarLabelFiles" class="visually-hidden">Encryption progress (Files)</span>
+            <div id="encBarFiles" class="bar"
+                 role="progressbar"
+                 aria-labelledby="encBarLabelFiles"
+                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
           </div>
+          <!-- Results (Text) — same structure as Decrypt -->
+          <details id="encDetailsText" class="muted hidden">
+            <summary>Results</summary>
+            <div id="encResultsText" class="row hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+            <pre id="encPreviewText" class="card hidden" aria-label="Encrypted text preview"></pre>
+            <div id="encHashText" class="status"></div>
+          </details>
+          <!-- Results (Files) — same structure as Decrypt -->
+          <details id="encDetailsFiles" class="muted hidden">
+            <summary>Results</summary>
+            <div id="encResultsFiles" class="row hidden" role="status" aria-live="polite" aria-atomic="true"></div>
+            <pre id="encPreviewFiles" class="card hidden" aria-label="Encrypted files preview"></pre>
+            <div id="encHashFiles" class="status"></div>
+          </details>
         </div>
       </section>
 
