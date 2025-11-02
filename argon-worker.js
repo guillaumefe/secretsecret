@@ -15,7 +15,7 @@ let shuttingDown = false;
    If you deploy under a subfolder, these may be relative to this worker.
    You may also set them to full absolute URLs; the allowlist matches EXACT strings. */
 const ALLOWED_JS_PATH    = './argon2-bundled.min.js';     // or 'argon2-bundled.min.js?v=2025-10-08'
-const ALLOWED_WASM_PATH  = './argon2-3f1a7dca.wasm';      // hashed filename strongly recommended
+const ALLOWED_WASM_PATH  = './argon2.wasm';      // hashed filename strongly recommended
 
 /* ===== Bounds / ceilings ===== */
 const MAX_WASM_BYTES = 16 * 1024 * 1024; // 16 MiB
