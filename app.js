@@ -292,17 +292,25 @@ async function secureFail(ctx, overrideMsg) {
   await sleep(400); // fixed minimum latency for failure paths
   const generic = `${ctx} failed or file is corrupted.`;
   const msg = DEBUG && overrideMsg ? overrideMsg : generic;
+
   logInfo('[secureFail]', { ctx, msg });
   setLive(msg);
   showErrorBanner(msg);
 
-  // Always hide progress bars
-  showProgress('encBar', false);
-  showProgress('decBar', false);
+  // Hide all progress bars (scoped + decrypt)
+  try { showEncProgress('text',  false); } catch {}
+  try { showEncProgress('files', false); } catch {}
+  try { showProgress('decBar',   false); } catch {}
 
-  // Hide results ONLY if empty (no stale UI)
-  hideIfEmpty('#encOutputs', '#encResults');
-  hideIfEmpty('#decOutputs', '#decResults');
+  // Optionally reset ARIA-now to 0 so screen readers don’t announce stale values
+  try { setProgress(document.getElementById('encBarText'),  0); } catch {}
+  try { setProgress(document.getElementById('encBarFiles'), 0); } catch {}
+  try { setProgress('decBar', 0); } catch {}
+
+  // Hide results ONLY if they are actually empty (no stale UI)
+  try { hideIfEmpty('#encOutputsText',  '#encResultsText'); } catch {}
+  try { hideIfEmpty('#encOutputsFiles', '#encResultsFiles'); } catch {}
+  try { hideIfEmpty('#decOutputs',      '#decResults, #decText'); } catch {}
 }
 
 function normalizeEncError(err) {
@@ -312,35 +320,35 @@ function normalizeEncError(err) {
     const raw  = (err && (err.msg || err.message)) || '';
     const text = (raw || '').toString();
     
-    // — cas connus / fréquents —
+    // — frequent / known cases —
     if (code === 'input_large' || /Total input too large/i.test(text))
-      return 'Total input too large for this device.';
+      return 'Total input is too large for this device.';
 
     if (code === 'too_many_entries' || /too many files|central directory/i.test(text))
-      return 'Trop de fichiers dans le lot.';
+      return 'Too many files in the batch.';
 
     if (code === 'zip_crc' || /CRC mismatch/i.test(text))
-      return 'Erreur d’intégrité (CRC) dans le bundle. Réessayez avec un lot plus petit.';
+      return 'Integrity error (CRC) in the bundle. Try a smaller batch.';
 
     if (code === 'oom' || /out of memory|heap out of memory|Cannot allocate memory/i.test(text))
-      return 'Mémoire insuffisante. Fermez d’autres onglets ou scindez le lot.';
+      return 'Not enough memory. Close other tabs or split the batch.';
 
     if (/QuotaExceededError|No space left on device|ENOSPC/i.test(text))
-      return 'Plus d’espace disponible (quota navigateur / stockage).';
+      return 'No storage space available (browser quota).';
 
     if (code === 'aborted' || name === 'AbortError' || /user aborted|AbortError/i.test(text))
-      return 'Opération interrompue par l’utilisateur.';
+      return 'Operation aborted by user.';
 
     if (/writer.*closed|stream.*locked|already.*locked/i.test(text))
-      return 'Flux de sortie fermé/indisponible pendant le chiffrement.';
+      return 'Output stream closed or unavailable during encryption.';
 
     if (/Maximum call stack size exceeded/i.test(text))
-      return 'Pile d’appels saturée (trop de fichiers ou structure trop profonde).';
+      return 'Call stack exceeded (too many files or deeply nested structure).';
 
     if (/NetworkError|ERR_NETWORK|Failed to fetch/i.test(text))
-      return 'Erreur réseau pendant le chiffrement.';
+      return 'Network error during encryption.';
 
-    // Dernier recours
+    // Final fallback
     logError('[DEBUG]', err);
     return 'Encryption failed or file is corrupted.';
   } catch {
@@ -1914,9 +1922,26 @@ function promptUserConfirm(message) {
 
 // ===== UI state =====
 
-const encBar = '#encBar', decBar = '#decBar';
+const decBar = '#decBar';
 let tunedParams = null;
 let wordlist    = null;
+
+function getEncMode() {
+  // Returns 'text' when the Text panel is visible, else 'files'
+  return !$('#encPanelText').hidden ? 'text' : 'files';
+}
+
+function encIds(mode = getEncMode()) {
+  return (mode === 'text')
+    ? { outputs:'#encOutputsText', results:'#encResultsText', hash:'#encHashText', bar:'encBarText' }
+    : { outputs:'#encOutputsFiles', results:'#encResultsFiles', hash:'#encHashFiles', bar:'encBarFiles' };
+}
+
+// Show/hide a specific bar by id (reuses your showProgress API)
+function showEncProgress(mode, visible) {
+  const { bar } = encIds(mode);
+  showProgress(bar, visible);
+}
 
 
 
@@ -2048,12 +2073,17 @@ function resetEncryptUI(opts = {}) {
     preserveInputs   = false, // text/files inputs
   } = opts;
 
+  const mode = getEncMode();
+  const ids  = encIds(mode);
+
   // Clear Encrypt-specific outputs and state
-  try { clearNode('#encResults'); } catch {}
-  try { setText('#encHash', ''); } catch {}
-  try { setText('#encPlainHash', ''); } catch {}
+  try { clearNode(ids.results); } catch {}
+  try { setText(ids.hash, ''); } catch {}
   try { setText('#pwdStrength', ''); } catch {}
-  try { setProgress(encBar, 0); } catch {}
+  try {
+    const barEl = (typeof ids.bar === 'string') ? document.getElementById(ids.bar) : ids.bar;
+    setProgress(barEl, 0);
+  } catch {}
 
   // Clear inputs (text/files) if not preserved
   if (!preserveInputs) {
@@ -2071,32 +2101,39 @@ function resetEncryptUI(opts = {}) {
     const t = $('#encPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
   } catch {}
 
-  // Always hide progress bar on reset
-  showProgress('encBar', false);
-  
-  // Hide results container only if empty
-  hideIfEmpty('#encOutputs', '#encResults');
+  // Always hide progress bar on reset (scoped)
+  showEncProgress(mode, false);
 
+  // Hide results container only if empty (scoped)
+  hideIfEmpty(ids.outputs, ids.results);
 
-  // Revoke object URLs and remove any blob links/buttons in encResults
+  // Revoke object URLs and remove blob links/buttons in the *scoped* results
   try {
-    for (const url of [...__urlsToRevoke]) { try { URL.revokeObjectURL(url); } catch {} __urlsToRevoke.delete(url); }
-    const resEl = document.querySelector('#encResults');
+    for (const url of [...__urlsToRevoke]) {
+      try { URL.revokeObjectURL(url); } catch {}
+      __urlsToRevoke.delete(url);
+    }
+    const resEl = (typeof ids.results === 'string')
+      ? document.querySelector(ids.results)
+      : ids.results;
     if (resEl) {
       resEl.querySelectorAll('a[href^="blob:"]').forEach(a => { try { a.remove(); } catch {} });
       resEl.querySelectorAll('button').forEach(b => { try { b.remove(); } catch {} });
     }
-  } catch (e) { logWarn('[resetEncryptUI] revoke anchors warn', e); }
+  } catch (e) {
+    logWarn('[resetEncryptUI] revoke anchors warn', e);
+  }
 
   // Recompute Encrypt button state
   try {
-    const pwVal = ($('#encPassword').value || '').trim();   // renamed
+    const pwVal = ($('#encPassword').value || '').trim();
     const text  = ($('#encText').value || '').trim();
     const files = $('#encFiles').files;
     const ok = (pwVal.length > 0) && (text.length > 0 || (files && files.length > 0));
     const btn = $('#btnEncrypt');
     btn.disabled = !ok;
-    if (btn.disabled) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
+    if (btn.disabled) btn.setAttribute('aria-disabled', 'true');
+    else btn.removeAttribute('aria-disabled');
   } catch {}
 
   // Accessibility live message
@@ -2181,6 +2218,10 @@ function selectTab(which) {
     decTab.setAttribute('aria-selected', 'false');
     encPanel.hidden = false;
     decPanel.hidden = true;
+    hideIfEmpty('#encOutputsText',  '#encResultsText');
+    hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
+    showEncProgress('text',  false);
+    showEncProgress('files', false);
   } else {
     decTab.setAttribute('aria-selected', 'true');
     encTab.setAttribute('aria-selected', 'false');
@@ -2188,9 +2229,21 @@ function selectTab(which) {
     encPanel.hidden = true;
   }
 
-  // Do NOT clear results — only hide if truly empty
-  hideIfEmpty('#encOutputs', '#encResults');
-  hideIfEmpty('#decOutputs', '#decResults, #decText');
+  // Only hide if truly empty (scoped + decrypt details)
+  hideIfEmpty('#encOutputsText',  '#encResultsText');
+  hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
+  (function hideDecDetailsIfEmpty() {
+    const det   = document.querySelector('#decDetails');
+    const res   = document.querySelector('#decResults');
+    const text  = document.querySelector('#decText');
+    if (!det) return;
+    const emptyRes  = !res || !(res.childElementCount > 0);
+    const emptyText = !text || !((text.textContent || '').trim().length > 0);
+    det.open = !(emptyRes && emptyText); // open only if something to show
+    // keep #decResults hidden class in sync too
+    if (res) res.classList.toggle('hidden', emptyRes);
+    if (text) text.hidden = emptyText;
+  })();
 
   // Keep decrypted text hidden only if it has no content
   try {
@@ -2213,8 +2266,9 @@ function selectTab(which) {
     }
   } catch {}
 
-  // Hide progress bars when switching panels
-  showProgress('encBar', false);
+  // Hide progress bars when switching panels (scoped + decrypt)
+  showEncProgress('text',  false);
+  showEncProgress('files', false);
   showProgress('decBar', false);
 }
 
@@ -2232,21 +2286,27 @@ function selectContentTab(which) {
     fBtn.setAttribute('aria-selected','false');
     tPanel.hidden = false;
     fPanel.hidden = true;
+    // Hide FILES outputs/progress, keep its content untouched
+    hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
+    showEncProgress('files', false);
+    // Show TEXT outputs only if not empty
+    hideIfEmpty('#encOutputsText', '#encResultsText');
+    showEncProgress('text', false); // hidden until encryption starts
   } else {
     fBtn.setAttribute('aria-selected','true');
     tBtn.setAttribute('aria-selected','false');
     fPanel.hidden = false;
     tPanel.hidden = true;
+    // Hide TEXT outputs/progress, keep its content untouched
+    hideIfEmpty('#encOutputsText', '#encResultsText');
+    showEncProgress('text', false);
+    // Show FILES outputs only if not empty
+    hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
+    showEncProgress('files', false); // hidden until encryption starts
   }
 
   // Keep existing results if any — do NOT clear here
   updateEncryptButtonState();
-
-  // Only hide the output container if it is actually empty
-  hideIfEmpty('#encOutputs', '#encResults');
-
-  // Always hide progress bar when switching input modes
-  showProgress('encBar', false);
 }
 
 
@@ -2475,15 +2535,16 @@ async function doEncrypt() {
   try {
     logInfo('[enc] start');
 
-    showProgress('encBar', true);
-    setProgress(encBar, 5);
+    const mode = getEncMode();
+    const ids  = encIds(mode);
+    
+    showEncProgress(mode, true);
+    setProgress(document.getElementById(ids.bar), 5); 
 
-    // Clear only outputs (keep inputs + password)
-    clearNode('#encResults');
-    setText('#encHash','');
-    setText('#encPlainHash','');
+    clearNode(ids.results);
+    setText(ids.hash, '');
 
-    const out = document.querySelector('#encOutputs');
+    const out = document.querySelector(ids.outputs);
     if (out) out.classList.add('hidden'); 
 
     const pw = $('#encPassword').value || '';
@@ -2612,7 +2673,7 @@ async function doEncrypt() {
        ****************************************************** */
       const sealedParts = [];
       const perChunkHashes = [];
-      setProgress(encBar, 15);
+      setProgress(document.getElementById(ids.bar), 15); 
       
       // If you still need a whole-plaintext hash in the manifest, prefer the REAL one:
       // const wholeHashHex = wholeHashHexReal;
@@ -2642,7 +2703,7 @@ async function doEncrypt() {
           bytes: part
         });
 
-        setProgress(encBar, 15 + Math.floor(50 * (i + 1) / totalChunks));
+        setProgress(document.getElementById(ids.bar), 15 + Math.floor(50 * (i + 1) / totalChunks)); 
         if ((i & 1) === 0) await new Promise(r => setTimeout(r, 0));
       }
 
@@ -2761,19 +2822,20 @@ async function doEncrypt() {
       try { kIv32.fill(0); } catch {}
 
       const outBlob = new Blob([bundleZip], { type: 'application/octet-stream' });
-      addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
+      addDownload(ids.results, outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
 
       const bundleHash = await sha256Hex(bundleZip);
       renderSimpleHashes({
         bundleHashHex: bundleHash,
         plaintextHashHex: wholeHashHexReal,
         plaintextIsZip: false
-      });
+      }, ids);
 
-      setProgress(encBar, 100);
+      setProgress(document.getElementById(ids.bar), 100);
       setLive('Encryption complete.');
-      const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
-      showProgress('encBar', false);
+      const outEl = document.querySelector(ids.outputs);
+      if (outEl) { outEl.classList.remove('hidden'); outEl.classList.add('visible'); }
+      showEncProgress(mode, false);
       return;
     }
 
@@ -2848,42 +2910,57 @@ async function doEncrypt() {
         bundleHashHex: null,
         plaintextHashHex: plaintextHashHex,
         plaintextIsZip: plaintextIsZip
-      });
+      }, ids);
       setLive('Encryption complete (saved to disk).');
-      const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
-      setProgress(encBar, 100);
-      showProgress('encBar', false);
+      const outEl = document.querySelector(ids.outputs);
+      if (outEl) { outEl.classList.remove('hidden'); outEl.classList.add('visible'); }
+      setProgress(document.getElementById(ids.bar), 100);
+      showEncProgress(mode, false);
       return;
     } else {
       bundleBytes = res.bundleU8 || (typeof sink.toUint8Array === 'function' ? sink.toUint8Array() : null);
       if (!bundleBytes) throw new Error('No bundle bytes available');
 
       const outBlob = new Blob([bundleBytes], { type: 'application/octet-stream' });
-      addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
+      addDownload(ids.results, outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
 
       const bundleHash = await sha256Hex(bundleBytes);
       renderSimpleHashes({
         bundleHashHex: bundleHash,
         plaintextHashHex: plaintextHashHex,
         plaintextIsZip: plaintextIsZip
-      });
-
-      setProgress(encBar, 100);
+      }, ids);
+      
+      setProgress(document.getElementById(ids.bar), 100);
       setLive('Encryption complete.');
-      const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
-      showProgress('encBar', false);
+      const outEl = document.querySelector(ids.outputs);
+      if (outEl) { outEl.classList.remove('hidden'); outEl.classList.add('visible'); }
+      showEncProgress(mode, false);
       return;
     }
 
   } catch (err) {
-      await secureFail('Encryption', normalizeEncError(err));
-      setProgress(encBar, 0);
-    } finally {
-      try { showProgress('encBar', false); } catch {}
-      try { const p = document.querySelector('#encBar')?.parentElement; if (p) p.style.display = 'none'; } catch {}
-      if (payloadBytes) wipeBytes(payloadBytes);
-      if (bundleBytes)  wipeBytes(bundleBytes);
-    }
+    await secureFail('Encryption', normalizeEncError(err));
+    try {
+      const modeNow = getEncMode();
+      const barId   = encIds(modeNow).bar;
+      const barEl   = document.getElementById(barId);
+      if (barEl) setProgress(barEl, 0);
+    } catch {}
+  } finally {
+    try {
+      const modeNow = getEncMode();
+      showEncProgress(modeNow, false);
+    } catch {}
+    try {
+      const modeNow = getEncMode();
+      const barId   = encIds(modeNow).bar;
+      const p       = document.getElementById(barId)?.parentElement;
+      if (p) p.style.display = 'none';
+    } catch {}
+    if (payloadBytes) wipeBytes(payloadBytes);
+    if (bundleBytes)  wipeBytes(bundleBytes);
+  }
 }
 
 async function computeFileSha256Hex(file, limitBytes) {
@@ -2937,15 +3014,18 @@ function showProgress(barId, visible) {
 
 
 // Simple two-line hash display (English, no icons)
-function renderSimpleHashes({ bundleHashHex, plaintextHashHex, plaintextIsZip }) {
-  const out = document.querySelector('#encHash');
+// ids is optional; when provided, use its scoped selector for the hash box.
+function renderSimpleHashes({ bundleHashHex, plaintextHashHex, plaintextIsZip }, ids) {
+  // Prefer the scoped hash element from encIds(mode), else fall back to #encHash
+  const hashSel = ids?.hash || '#encHash';
+  const out = (typeof hashSel === 'string') ? document.querySelector(hashSel) : hashSel;
   if (!out) return;
 
   const enc = bundleHashHex ?? 'None';
   const plb = 'Plaintext SHA-256' + (plaintextIsZip ? ' (ZIP)' : '');
   const pla = plaintextHashHex ?? 'None';
 
-  // 2 espaces avant chaque valeur → indent identique
+  // 2 leading spaces before values for aligned look
   const text =
 `Encrypted SHA-256 (bundle):
   ${enc}
@@ -2953,8 +3033,8 @@ function renderSimpleHashes({ bundleHashHex, plaintextHashHex, plaintextIsZip })
 ${plb}:
   ${pla}`;
 
-  out.textContent = text;            // important: pas innerHTML
-  out.classList.add('hashbox');      // pour le style monospaced ci-dessous
+  out.textContent = text;      // textContent: no HTML injection
+  out.classList.add('hashbox');
 }
 
 /**
@@ -4223,28 +4303,46 @@ async function doDecrypt() {
  */
 function panicClear() {
   try {
+    // Reset both panels properly (also hides their progress bars)
     resetEncryptUI();
     resetDecryptUI();
     clearPasswords();
 
-    $('#encText').value = '';
-    $('#encFiles').value = '';
-    $('#decFile').value  = '';
-    setText('#decFileName', '');
-    clearNode('#decResults');
-    clearNode('#encResults');
-    setText('#decText', '');
-    setText('#encHash', '');
-    setText('#encPlainHash', '');
-    setText('#decIntegrity', '');
-    setProgress(encBar, 0);
-    setProgress(decBar, 0);
+    // Input fields
+    try { $('#encText').value = ''; } catch {}
+    try { $('#encFiles').value = ''; } catch {}
+    try { $('#decFile').value  = ''; } catch {}
+    try { setText('#decFileName', ''); } catch {}
+
+    // ENCRYPT outputs (scoped by input mode)
+    try { clearNode('#encResultsText'); } catch {}
+    try { clearNode('#encResultsFiles'); } catch {}
+    try { setText('#encHashText',  ''); } catch {}
+    try { setText('#encHashFiles', ''); } catch {}
+
+    // DECRYPT outputs
+    try { clearNode('#decResults'); } catch {}
+    try { setText('#decText', ''); } catch {}
+    try { setText('#decIntegrity', ''); } catch {}
+
+    // Hide and reset progress bars (scoped)
+    try { showEncProgress('text',  false); } catch {}
+    try { showEncProgress('files', false); } catch {}
+    try { showProgress('decBar', false); } catch {}
+    try { setProgress('#encBarText',  0); } catch {}
+    try { setProgress('#encBarFiles', 0); } catch {}
+    try { setProgress('#decBar',      0); } catch {}
+
     setLive('All local state cleared.');
 
-    for (const url of __urlsToRevoke) {
-      try { URL.revokeObjectURL(url); } catch {}
-      __urlsToRevoke.delete(url);
-    }
+    // Revoke all object URLs created earlier
+    try {
+      for (const url of __urlsToRevoke) {
+        try { URL.revokeObjectURL(url); } catch {}
+      }
+      __urlsToRevoke.clear();
+    } catch {}
+
   } catch (e) {
     logWarn('panicClear issue:', e);
   }
