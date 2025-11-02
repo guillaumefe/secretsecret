@@ -295,6 +295,29 @@ async function secureFail(ctx, overrideMsg) {
   logInfo('[secureFail]', { ctx, msg });
   setLive(msg);
   showErrorBanner(msg);
+
+  // Hide encryption progress bar safely
+  try {
+    const pe = document.querySelector('#encBar')?.parentElement;
+    if (pe) pe.style.display = 'none';
+  } catch {}
+
+  // Hide decryption progress bar safely
+  try {
+    const pd = document.querySelector('#decBar')?.parentElement;
+    if (pd) pd.style.display = 'none';
+  } catch {}
+
+  // Hide output sections (no stale/empty console visible)
+  try {
+    const eo = document.querySelector('#encOutputs');
+    if (eo) eo.classList.add('hidden');
+  } catch {}
+
+  try {
+    const doo = document.querySelector('#decOutputs');
+    if (doo) doo.classList.add('hidden');
+  } catch {}
 }
 
 function normalizeEncError(err) {
@@ -2456,6 +2479,15 @@ async function doEncrypt() {
     clearNode('#encResults');
     setText('#encHash','');
     setText('#encPlainHash','');
+
+    const out = document.querySelector('#encOutputs');
+    if (out) out.classList.add('hidden');
+    
+    // Hide progress container
+    try {
+      const p = document.querySelector('#encBar')?.parentElement;
+      if (p) p.style.display = 'none';
+    } catch {}
 
     const pw = $('#encPassword').value || '';
     if (!pw) throw new EnvelopeError('input', 'missing');
