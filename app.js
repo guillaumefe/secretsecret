@@ -2410,7 +2410,8 @@ async function doEncrypt() {
           payloadChunk: padToFixed(manChunksClear[i]),
           chunkIndex: i,
           totalChunks: manChunksClear.length,
-          totalPlainLen: manifestBytes.length
+          totalPlainLen: manifestBytes.length,
+          domain: 'manifest'
         });
         manSealedParts.push({
           name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
@@ -2441,7 +2442,8 @@ async function doEncrypt() {
           payloadChunk: padToFixed(manIndexChunks[i]),
           chunkIndex: i,
           totalChunks: manIndexChunks.length,
-          totalPlainLen: manIndexBytes.length
+          totalPlainLen: manIndexBytes.length,
+          domain: 'index'
         });
         manIndexSealed.push({
           name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
@@ -3016,49 +3018,105 @@ async function doDecrypt() {
     logInfo('[dec] input file', { name, size: fSize });
 
     /* ******************************************************
-     * Single fixed-chunk .cbox path (unchanged)
+     * Single fixed-chunk .cbox path (with Det-envelope detection)
      ****************************************************** */
-    if (name.endsWith(FILE_SINGLE_EXT)) {
-      logInfo('[dec] mode=single .cbox');
-      const env    = new Uint8Array(await f.arrayBuffer());
-      logInfo('[dec] single env bytes', { bytes: env.length });
+    async function detectDetEnvelope(bytes) {
+      if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
+    
+      const MAGIC_LEN = MAGIC.length;              // 'CBOX4' → 5
+      if (bytes.length < MAGIC_LEN + 4) {
+        throw new EnvelopeError('format', 'Invalid envelope');
+      }
+    
+      for (let i = 0; i < MAGIC_LEN; i++) {
+        if (bytes[i] !== MAGIC[i]) throw new EnvelopeError('magic', 'Unknown format');
+      }
+    
+      const metaLen = new DataView(bytes.buffer, bytes.byteOffset + MAGIC_LEN, 4).getUint32(0, false);
+      const metaStart = MAGIC_LEN + 4;
+      const metaEnd   = metaStart + metaLen;
+    
+      if (metaLen <= 0 || metaLen > 4096) { // borne prudente
+        throw new EnvelopeError('meta_big', 'Metadata too large');
+      }
+      if (metaEnd > bytes.length) {
+        throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
+      }
+    
+      let meta;
+      try {
+        const metaBytes = bytes.subarray(metaStart, metaEnd);
+        meta = JSON.parse(TD.decode(metaBytes));
+      } catch {
+        throw new EnvelopeError('meta_parse', 'Malformed metadata');
+      }
+    
+      const isDet = (meta?.kdf?.kdf === 'HKDF') && (meta?.salt == null);
+      return { kind: isDet ? 'det' : 'pw', meta };
+    }
 
+    if (name.endsWith(FILE_SINGLE_EXT)) {
+      if (/^(part-\d{6}|MANIFEST(?:_INDEX)?\.part-\d{6})\.cbox$/i.test(f.name)) {
+        throw new EnvelopeError(
+          'bundle_fragment',
+          'This is a bundle fragment. Please select the .cboxbundle file.'
+        );
+      }
+      logInfo('[dec] mode=single .cbox');
+      const env = new Uint8Array(await f.arrayBuffer());
+      logInfo('[dec] single env bytes', { bytes: env.length });
+    
+      let probe;
+      try {
+        probe = await detectDetEnvelope(env);
+      } catch (e) {
+        logWarn('[dec] envelope probe failed', e);
+      }
+    
+      if (probe?.kind === 'det') {
+        throw new EnvelopeError(
+          'det_envelope',
+          'This .cbox is a bundle fragment (HKDF, no per-envelope salt). Open the .cboxbundle instead.'
+        );
+      }
+    
+      // --- Flux “.cbox” per-envelope standard (Argon2id) ---
       const opened = await openFixedChunk({ password, bytes: env });
       const meta   = opened.innerMeta;
-
+    
       logInfo('[dec] single innerMeta', {
         kind: meta?.kind, idx: meta?.chunkIndex, total: meta?.totalChunks,
         totalPlainLen: meta?.totalPlainLen
       });
-
+    
       if (meta.kind !== 'fixed') throw new EnvelopeError('kind', 'Unexpected type');
-
-      const idx = meta.chunkIndex|0;
-      const total = meta.totalChunks|0;
+    
+      const idx   = meta.chunkIndex | 0;
+      const total = meta.totalChunks | 0;
       if (total > 0 && (idx < 0 || idx >= total)) {
         throw new EnvelopeError('idx_range', 'Chunk index out of range');
       }
-
+    
       if (!Number.isFinite(meta.totalPlainLen) ||
           meta.totalPlainLen < 0 ||
           meta.totalPlainLen > FIXED_CHUNK_SIZE) {
         throw new EnvelopeError('single_len', 'Invalid size for single chunk');
       }
-
-      const sliceEnd = meta.totalPlainLen|0;
+    
+      const sliceEnd = meta.totalPlainLen | 0;
       const payload  = opened.fixedChunk.subarray(0, sliceEnd);
       logInfo('[dec] single payload', { sliceEnd });
-
+    
       // Preview or download
       await tryRenderOrDownload(payload, '#decResults', '#decText');
       setText('#decIntegrity', `Single-chunk decrypted. Size: ${payload.length} bytes.`);
       try { opened.fixedChunk.fill(0); } catch {}
       try { env.fill(0); } catch {}
-
+    
       setProgress(decBar, 100);
       setLive('Decryption complete.');
       logInfo('[dec] single decryption success');
-
+    
       try {
         const decResults = document.getElementById('decResults');
         const decTextEl  = document.getElementById('decText');
@@ -3067,7 +3125,7 @@ async function doDecrypt() {
         const decProgress = document.querySelector('#decBar')?.parentElement;
         if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (single done)'); }
       } catch (e) { logWarn('[dec] results reveal warn (single)', e); }
-
+    
       const det = document.getElementById('decDetails');
       if (det) {
         det.open = true;
