@@ -264,17 +264,17 @@ function deviceProfile() {
  */
 function chooseCaps() {
   const { cores, memGiB, isMobile } = deviceProfile();
+  const desktopGuess = (!isMobile && !navigator.deviceMemory) ? 8 : memGiB; // suppose 8 GiB si inconnu
+
+  const mem = (isMobile ? memGiB : desktopGuess) || 4;
 
   // Overall max input size
-  const maxInput = (isMobile || memGiB <= 4)
-    ? 64 * 1024 * 1024       // Low-end device
-    : (memGiB <= 8)
-      ? 128 * 1024 * 1024    // Mid-range device
-      : 256 * 1024 * 1024;   // Desktop / high-end laptop
+  const maxInput = (isMobile || mem <= 4) ?  96 * 1024 * 1024
+                    : (mem <= 8)          ? 160 * 1024 * 1024
+                                           : 256 * 1024 * 1024;
 
-  // Argon2 auto-tuning limits
-  const minMemMiB = (isMobile || memGiB <= 4) ? 64 : 128;
-  const maxMemMiB = (isMobile || memGiB <= 4) ? 256 : 512;
+  const minMemMiB = (isMobile || mem <= 4) ? 64 : 128;
+  const maxMemMiB = (isMobile || mem <= 4) ? 256 : 512;
   const maxParallel = Math.min(HEALTHY_P_MAX, Math.max(1, Math.floor(cores / 2)));
 
   return { maxInput, minMemMiB, maxMemMiB, maxParallel };
@@ -920,6 +920,16 @@ function padToFixed(u8) {
   return out;
 }
 
+function choosePadBucket() {
+  const MAX_IN = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES; // ex: 64–256 MiB selon device
+  const MiB = 1024 * 1024;
+
+  // On borne le bucket entre 1 MiB et 8 MiB, et on force un multiple du chunk fixe.
+  const target = Math.min(8 * MiB, Math.max(1 * MiB, Math.floor(MAX_IN / 8))); 
+  const rounded = Math.max(FIXED_CHUNK_SIZE, Math.floor(target / FIXED_CHUNK_SIZE) * FIXED_CHUNK_SIZE);
+
+  return rounded; // p.ex. 4 MiB, 8 MiB… mais jamais plus que ce que supporte le device
+}
 
 
 // ===== Envelope format (version 4) =====
@@ -2464,8 +2474,8 @@ async function doEncrypt() {
       }
 
       // --- Privacy: optional size padding (bucket) ---
-      const PAD_TO = 8 * 1024 * 1024;      // 8 MiB bucket
       const enableSizePadding = false;      // toggle on hardened builds as needed
+      let PAD_TO = choosePadBucket();
       
       // Keep the real length for manifest/UX
       const realPlainLen = payloadBytes.length;
@@ -2487,39 +2497,63 @@ async function doEncrypt() {
           // Preflight device cap BEFORE allocating
           const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
           if (paddedLen > maxIn) {
-            const overBy = paddedLen - maxIn;
-            const msg =
-              'The padded message exceeds the device limit.\n\n' +
-              `• Real length: ${realPlainLen} bytes\n` +
-              `• Padded length: ${paddedLen} bytes (over by ${overBy} bytes)\n\n` +
-              'Do you want to disable size padding and proceed with the real length instead?';
-            const proceed = await promptUserConfirm(msg);
-      
-            if (!proceed) {
-              throw new EnvelopeError('input_large', 'Input too large for this device after padding');
+            // Automatically shrink the padding bucket to stay within device limits
+            const MiB = 1024 * 1024;
+            const headroom = Math.max(0, maxIn - realPlainLen);
+          
+            // Largest multiple of FIXED_CHUNK_SIZE that fits within the headroom
+            let newBucket = Math.floor(headroom / FIXED_CHUNK_SIZE) * FIXED_CHUNK_SIZE;
+            const MIN_BUCKET = 1 * MiB;
+          
+            if (newBucket < MIN_BUCKET) {
+              // There is not enough room to apply padding without exceeding limits
+              payloadBytes = originalBytes;
+              sizePadded = false;
+              logWarn("[enc] padding auto-disabled due to device cap; using realPlainLen only");
+              setLive("Size padding automatically disabled to fit device limit.");
+            } else {
+              // Ensure bucket is at least one full chunk
+              if (newBucket < FIXED_CHUNK_SIZE) newBucket = FIXED_CHUNK_SIZE;
+          
+              const paddedLen2 = Math.ceil(realPlainLen / newBucket) * newBucket;
+              const needPadBytes2 = Math.max(0, paddedLen2 - realPlainLen);
+          
+              if (needPadBytes2 === 0) {
+                payloadBytes = originalBytes;
+                sizePadded = false;
+                setLive("No size padding required.");
+              } else {
+                const pad = new Uint8Array(needPadBytes2);
+                crypto.getRandomValues(pad);
+          
+                const combined = new Uint8Array(paddedLen2);
+                combined.set(originalBytes, 0);
+                combined.set(pad, realPlainLen);
+          
+                try { pad.fill(0); } catch {}
+          
+                payloadBytes = combined;
+                sizePadded = true;
+          
+                try { originalBytes.fill(0); } catch {}
+          
+                logInfo("[enc] size padding adjusted", { bucket: newBucket, paddedLen: paddedLen2 });
+                setLive("Size padding automatically adjusted to device capacity.");
+              }
             }
-      
-            // Revert cleanly to original bytes (no new alloc, no subarray view)
-            payloadBytes = originalBytes;
-            sizePadded = false;
-            logWarn('[enc] padding disabled due to device cap; proceeding with realPlainLen');
-            setLive('Size padding disabled to fit device limit.');
           } else {
-            // Now we know we can safely allocate the padded buffer
+            // Original safe path when paddedLen is already within limits
             const pad = new Uint8Array(needPadBytes);
             crypto.getRandomValues(pad);
-      
+          
             const combined = new Uint8Array(paddedLen);
             combined.set(originalBytes, 0);
             combined.set(pad, realPlainLen);
-      
+          
             try { pad.fill(0); } catch {}
-      
-            // Swap in padded payload
+          
             payloadBytes = combined;
             sizePadded = true;
-      
-            // Wipe the previous (smaller) buffer if it contained sensitive data
             try { originalBytes.fill(0); } catch {}
           }
         }
