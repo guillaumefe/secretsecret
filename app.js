@@ -2195,9 +2195,15 @@ function resetDecryptUI(opts = {}) {
   // Clear Decrypt-specific outputs and state
   try { clearNode('#decResults'); } catch {}
   try { setText('#decText', ''); } catch {}
+  try {
+    const t = document.querySelector('#decText');
+    if (t) t.hidden = true;
+    const res = document.querySelector('#decResults');
+    if (res) res.classList.add('hidden');
+  } catch {}
   try { setText('#decIntegrity', ''); } catch {}
   try { setText('#decFileErr', ''); } catch {}
-  try { setProgress(decBar, 0); } catch {}
+  try { setProgress('#decBar', 0); } catch {} // ← fixed (use selector)
 
   // File input: clear if not preserved (+ filename label)
   if (!preserveFile) {
@@ -2205,7 +2211,7 @@ function resetDecryptUI(opts = {}) {
     try { setText('#decFileName',''); } catch {}
   }
 
-  // Password: clear if not preserved, always re-hide field and reset toggle
+  // Password: clear if not preserved; always re-hide field and reset toggle
   if (!preservePassword) {
     try { $('#decPassword').value = ''; } catch {}
   }
@@ -2216,19 +2222,25 @@ function resetDecryptUI(opts = {}) {
 
   // Always hide progress bar on reset
   showProgress('decBar', false);
-  
-  // Hide results container if empty
-  hideIfEmpty('#decDetails', '#decResults, #decText');
+
+  // Hide results container if empty (target an existing container)
+  // If you prefer to keep it simple, you can remove this line.
+  try { hideIfEmpty('#decDetails', '#decResults, #decText'); } catch {}
 
   // Revoke object URLs and remove any blob links/buttons in decResults
   try {
-    for (const url of [...__urlsToRevoke]) { try { URL.revokeObjectURL(url); } catch {} __urlsToRevoke.delete(url); }
+    for (const url of [...__urlsToRevoke]) {
+      try { URL.revokeObjectURL(url); } catch {}
+      __urlsToRevoke.delete(url);
+    }
     const resEl = document.querySelector('#decResults');
     if (resEl) {
       resEl.querySelectorAll('a[href^="blob:"]').forEach(a => { try { a.remove(); } catch {} });
       resEl.querySelectorAll('button').forEach(b => { try { b.remove(); } catch {} });
     }
-  } catch (e) { logWarn('[resetDecryptUI] revoke anchors warn', e); }
+  } catch (e) {
+    logWarn('[resetDecryptUI] revoke anchors warn', e);
+  }
 
   // Recompute Decrypt button state
   try {
@@ -2237,7 +2249,8 @@ function resetDecryptUI(opts = {}) {
     const ok = (pw.length > 0) && !!file;
     const btn = $('#btnDecrypt');
     btn.disabled = !ok;
-    if (btn.disabled) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
+    if (btn.disabled) btn.setAttribute('aria-disabled', 'true');
+    else btn.removeAttribute('aria-disabled');
   } catch {}
 
   // Accessibility live message
@@ -4435,7 +4448,7 @@ async function doDecrypt() {
  */
 function panicClear() {
   try {
-    // Reset both panels properly (also hides their progress bars)
+    // Reset both panels (also hides their progress bars)
     resetEncryptUI();
     resetDecryptUI();
     clearPasswords();
@@ -4451,10 +4464,17 @@ function panicClear() {
     try { clearNode('#encResultsFiles'); } catch {}
     try { setText('#encHashText',  ''); } catch {}
     try { setText('#encHashFiles', ''); } catch {}
+    // (optional) clear + hide previews
+    try { setText('#encPreviewText','');  document.querySelector('#encPreviewText')?.classList.add('hidden'); } catch {}
+    try { setText('#encPreviewFiles',''); document.querySelector('#encPreviewFiles')?.classList.add('hidden'); } catch {}
 
     // DECRYPT outputs
     try { clearNode('#decResults'); } catch {}
     try { setText('#decText', ''); } catch {}
+    try {
+      const t = document.querySelector('#decText'); if (t) t.hidden = true;
+      const res = document.querySelector('#decResults'); if (res) res.classList.add('hidden');
+    } catch {}
     try { setText('#decIntegrity', ''); } catch {}
 
     // Hide and reset progress bars (scoped)
@@ -4473,6 +4493,22 @@ function panicClear() {
         try { URL.revokeObjectURL(url); } catch {}
       }
       __urlsToRevoke.clear();
+    } catch {}
+
+    // Also ensure any residual blob anchors/buttons are removed
+    try {
+      ['#encResultsText', '#encResultsFiles', '#decResults'].forEach(sel => {
+        const el = document.querySelector(sel);
+        if (!el) return;
+        el.querySelectorAll('a[href^="blob:"]').forEach(a => { try { a.remove(); } catch {} });
+        el.querySelectorAll('button').forEach(b => { try { b.remove(); } catch {} });
+      });
+    } catch {}
+
+    // (UX) reset Encrypt password visibility toggle
+    try {
+      const pw = $('#encPassword'); if (pw) pw.type = 'password';
+      const t  = $('#encPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
     } catch {}
 
   } catch (e) {
