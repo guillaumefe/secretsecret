@@ -2628,7 +2628,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     bundleSaltB64: b64(bundleSalt)
   });
   const headerCrc = crc32(headerBytes);
-  await bundleWriter.addFile(`BUNDLE_HEADER${FILE_SINGLE_EXT}`, headerBytes.length, headerCrc, async function*(){ yield headerBytes; });
+  await bundleWriter.addFile(`BUNDLE_HEADER${FILE_SINGLE_EXT}`, headerBytes.length, headerCrc, async function*(){ yield headerBytes.slice(); });
   try { headerBytes.fill(0); } catch {}
 
   // 2) Construire le ZIP clair *en flux* et, en parallèle, le découper/chiffrer
@@ -2661,7 +2661,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     // Ajouter l’entrée part-XXXXXX.cbox dans le bundle (store-only) immédiatement
     const entryName = `part-${String(partIndex).padStart(6,'0')}${FILE_SINGLE_EXT}`;
     const crc = crc32(sealed);
-    await bundleWriter.addFile(entryName, sealed.length, crc, async function*(){ yield sealed; });
+    await bundleWriter.addFile(entryName, sealed.length, crc, async function*(){ yield sealed.slice(); });
 
     // scrub
     try { sealed.fill(0); } catch {}
