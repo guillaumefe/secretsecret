@@ -2229,6 +2229,8 @@ function selectContentTab(which) {
   setText('#encHash', '');
   setText('#encPlainHash', '');
   updateEncryptButtonState();
+  hideIfEmpty('#encOutputs', '#encResults');  // hide console if nothing inside
+  showProgress('encBar', false);              // always hide bar on tab switch
 }
 
 
@@ -2453,12 +2455,12 @@ async function doEncrypt() {
   let bundleBytes  = null; // memory fallback only
   let plaintextHashHex = null;
   let plaintextIsZip = false;
-
-  showProgress('encBar', true);
-  setProgress(encBar, 5);
   
   try {
     logInfo('[enc] start');
+
+    showProgress('encBar', true);
+    setProgress(encBar, 5);
 
     // Show progress bar during run
     showProgress('encBar', false);
@@ -2765,6 +2767,7 @@ async function doEncrypt() {
       setProgress(encBar, 100);
       setLive('Encryption complete.');
       const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
+      showProgress('encBar', false);
       return;
     }
 
@@ -2843,6 +2846,7 @@ async function doEncrypt() {
       setLive('Encryption complete (saved to disk).');
       const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
       setProgress(encBar, 100);
+      showProgress('encBar', false);
       return;
     } else {
       bundleBytes = res.bundleU8 || (typeof sink.toUint8Array === 'function' ? sink.toUint8Array() : null);
@@ -2861,6 +2865,7 @@ async function doEncrypt() {
       setProgress(encBar, 100);
       setLive('Encryption complete.');
       const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
+      showProgress('encBar', false);
       return;
     }
 
@@ -2868,7 +2873,8 @@ async function doEncrypt() {
       await secureFail('Encryption', normalizeEncError(err));
       setProgress(encBar, 0);
     } finally {
-      showProgress('encBar', false);
+      try { showProgress('encBar', false); } catch {}
+      try { const p = document.querySelector('#encBar')?.parentElement; if (p) p.style.display = 'none'; } catch {}
       if (payloadBytes) wipeBytes(payloadBytes);
       if (bundleBytes)  wipeBytes(bundleBytes);
     }
@@ -2912,56 +2918,17 @@ async function computeZipSha256HexForFiles(files, limitBytes) {
 }
 
 // === Helpers UI: progress + hide-if-empty + hashes ===
-function showProgress(barId, show) {
+function showProgress(barId, visible) {
   try {
-    const wrap = document.querySelector(`#${barId}`)?.parentElement;
-    if (wrap) wrap.style.display = show ? 'block' : 'none';
+    const bar     = document.getElementById(barId);
+    const wrapper = bar ? bar.parentElement : null;
+    if (!wrapper) return;
+    wrapper.style.display = visible ? 'block' : 'none';
+    wrapper.classList.toggle('hidden', !visible);
   } catch {}
 }
 
-function hideIfEmpty(containerSel, contentSelectors) {
-  try {
-    const container = document.querySelector(containerSel);
-    if (!container) return;
 
-    // Resolve selectors (string or array or comma list)
-    let selectors = [];
-    if (typeof contentSelectors === 'string') {
-      selectors = contentSelectors.split(',').map(s => s.trim());
-    } else if (Array.isArray(contentSelectors)) {
-      selectors = contentSelectors;
-    }
-
-    // Collect visible content nodes
-    const nodes = selectors
-      .flatMap(sel => Array.from(document.querySelectorAll(sel)))
-      .filter(Boolean);
-
-    // If no node found → consider empty
-    if (nodes.length === 0) {
-      container.classList.add('hidden');
-      return;
-    }
-
-    // Check emptiness: no children AND no text
-    const isNodeEmpty = (n) => {
-      const hasChildren = n.childElementCount > 0;
-      const hasText = (n.textContent||'').trim().length > 0;
-      return !(hasChildren || hasText);
-    };
-
-    const allEmpty = nodes.every(isNodeEmpty);
-
-    if (allEmpty) {
-      container.classList.add('hidden');
-    } else {
-      container.classList.remove('hidden'); // ✅ new: unhide when content appears
-    }
-
-  } catch (e) {
-    console.warn('[hideIfEmpty] failed:', e);
-  }
-}
 
 // Simple two-line hash display (English, no icons)
 function renderSimpleHashes({ bundleHashHex, plaintextHashHex, plaintextIsZip }) {
@@ -3408,12 +3375,12 @@ async function doDecrypt() {
   let decryptBtn = null;
   let prevDisabled = false;
 
-  showProgress('decBar', true);
-  setProgress(decBar, 10);
-
   try {
     logInfo('[dec] start');
 
+    showProgress('decBar', true);
+    setProgress(decBar, 10);
+    
     // Clear previous outputs (keep password and selected file for retry UX)
     logInfo('[dec] reset UI outputs');
     resetDecryptUI({ preservePassword: true, preserveFile: true });
