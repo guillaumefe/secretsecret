@@ -3,6 +3,7 @@
 // Build-time flag: set to false in hard-CSP builds
 // When false → strict worker only → any CSP/WASM failure is a hard failure
 const ALLOW_PERMISSIVE_FALLBACK = true;
+let __permissiveFallbackUsed = false;
 
 const ARGON2_JS_PATH   = './argon2-bundled.min.js';
 const ARGON2_WASM_PATH = './argon2.wasm';
@@ -289,9 +290,8 @@ function sleep(ms) {
 
 async function secureFail(ctx, overrideMsg) {
   await sleep(400); // fixed minimum latency for failure paths
-
-  // Generic message par défaut, mais on autorise un override ciblé
-  const msg = overrideMsg || `${ctx} failed or file is corrupted.`;
+  const generic = `${ctx} failed or file is corrupted.`;
+  const msg = DEBUG && overrideMsg ? overrideMsg : generic;
   logInfo('[secureFail]', { ctx, msg });
   setLive(msg);
   showErrorBanner(msg);
@@ -702,22 +702,28 @@ async function startArgonWorker(url) {
 /**
  * Attempt strict worker first; auto-fallback to permissive only when strictly necessary.
  */
- async function getArgonWorker() {
-   try {
-     return await startArgonWorker('./argon-worker.js'); // strict
-   } catch (err) {
-     // If it doesn't look like a CSP/WASM capability failure, permissive won't help.
-     if (!looksLikeWasmCspError(err)) throw err;
-     // Hard-disable permissive fallback if the build flag is off
-     if (!ALLOW_PERMISSIVE_FALLBACK) throw err;
+async function getArgonWorker() {
+  try {
+    return await startArgonWorker('./argon-worker.js');
+  } catch (err) {
+    if (!looksLikeWasmCspError(err)) throw err;
+    if (!ALLOW_PERMISSIVE_FALLBACK) throw err;
 
-     // Last-chance: try permissive worker (served with its own relaxed CSP).
-     // No flags or query params control this: it's purely environmental.
-     try {
-       console.warn('[argon2] Strict worker blocked by CSP/WASM; attempting permissive worker…');
-       return await startArgonWorker('./argon-worker-permissive.js');
-     } catch (err2) {
-      // If permissive also fails, surface the original context + secondary error.
+    try {
+      console.warn('[argon2] Strict worker blocked by CSP/WASM; attempting permissive worker…');
+      const w = await startArgonWorker('./argon-worker-permissive.js');
+
+      __permissiveFallbackUsed = true;
+
+      try {
+        showErrorBanner(
+          'Running in degraded mode (permissive worker). Cryptography remains safe, but CSP was relaxed.'
+        );
+        setLive('Degraded mode active: permissive worker in use.');
+      } catch {}
+
+      return w;
+    } catch (err2) {
       const combo = new Error(
         'permissive_fallback_failed: strict=' +
         String(err && (err.message || err)) +
@@ -1719,8 +1725,18 @@ async function openBundleHeaderWithPassword({ password, bytes, params }) {
   if (meta.enc_v !== 4 || meta.algo !== 'AES-GCM') throw new EnvelopeError('algo', 'Unsupported AEAD');
   if (!meta.salt) throw new EnvelopeError('salt', 'Missing KDF salt');
 
-  const salt = b64d(meta.salt);
-  const keyBytes = await deriveArgon2id(password, salt, params);
+  if (!meta.kdf || meta.kdf.kdf !== 'Argon2id') {
+    throw new EnvelopeError('kdf', 'Unsupported KDF');
+  }
+  const kdfParams = {
+    mMiB: Number(meta.kdf.mMiB),
+    t:    Number(meta.kdf.t),
+    p:    Number(meta.kdf.p),
+  };
+  validateArgon(kdfParams);
+  
+  const salt     = b64d(meta.salt);
+  const keyBytes = await deriveArgon2id(password, salt, kdfParams);
   const key      = await importAesKey(keyBytes);
 
   const cipher = bytes.subarray(metaEnd);
