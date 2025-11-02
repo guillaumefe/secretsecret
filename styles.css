@@ -466,4 +466,10 @@ Hashes display
   padding: 1rem 1.25rem;
 }
 
-
+#decIntegrity {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  padding: 0.75em;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
