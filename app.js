@@ -1429,7 +1429,7 @@ async function extractZipEntriesStrict(u8) {
   return entries;
 }
 
-// --- Sink minimaliste : accumulateur de segments ---
+// --- Minimal sink: segments accumulator ---
 class SegmentsSink {
   constructor() {
     this.parts = [];
@@ -1438,7 +1438,7 @@ class SegmentsSink {
   async write(u8) {
     const copy = (u8 instanceof Uint8Array) ? u8.slice() : new Uint8Array(u8);
     this.parts.push(copy);
-    this.size += copy.length;          // <-- important: taille du COPIÉ
+    this.size += copy.length;          // <-- important: COPIED size
   }
   toUint8Array() {
     const out = new Uint8Array(this.size);
@@ -1448,7 +1448,7 @@ class SegmentsSink {
   }
 }
 
-// --- ZIP store-only en flux (sans data-descriptor) ---
+// --- Store-only streaming ZIP (without data descriptor) ---
 class StoreZipWriter {
   constructor(sink) {
     this.sink = sink;
@@ -1456,12 +1456,12 @@ class StoreZipWriter {
     this.centrals = [];
   }
 
-  // helpers (si pas déjà présents)
+  // helpers (if not already present)
   _u16(v){ const b=new Uint8Array(2); new DataView(b.buffer).setUint16(0,v,true); return b; }
   _u32(v){ const b=new Uint8Array(4); new DataView(b.buffer).setUint32(0,v,true); return b; }
   _str(s){ return new TextEncoder().encode(s); }
   _concat(...parts){ const n=parts.reduce((a,p)=>a+p.length,0); const out=new Uint8Array(n); let o=0; for(const p of parts){ out.set(p,o); o+=p.length; } return out; }
-  _crc32 = (function(){ // table + incrementale (si vous avez déjà une fn crc32Update, utilisez-la)
+  _crc32 = (function(){ // table + incremental (if you already have a crc32Update fn, use it)
     const tbl=new Uint32Array(256).map((_,i)=>{let c=i; for(let k=0;k<8;k++) c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1); return c>>>0;});
     return (crc,u8)=>{ crc^=0xFFFFFFFF; for(let i=0;i<u8.length;i++) crc=tbl[(crc^u8[i])&0xFF]^(crc>>>8); return (crc^0xFFFFFFFF)>>>0; };
   })();
@@ -1501,15 +1501,15 @@ class StoreZipWriter {
       this.offset += u8.length;
     }
   
-    // Si on avait des tailles connues, "written" doit matcher "size"
+    // If we had known sizes, "written" must match "size"
     if (useKnownSizes && written !== size) {
       throw new EnvelopeError('zip_stream_size', `Size changed while writing "${name}" (expected ${size}, got ${written})`, { fileName: name });
     }
   
-    // --- 3) Data descriptor si nécessaire ---
+    // --- 3) Data descriptor if necessary ---
     if (!useKnownSizes) {
       const DD = [
-        u32le(0x08074b50),             // signature (recommandée)
+        u32le(0x08074b50),             // signature (recommended)
         u32le(runningCRC),
         u32le(written),
         u32le(written)
@@ -1518,7 +1518,7 @@ class StoreZipWriter {
       this.offset += DD.reduce((a,p)=>a+p.length,0);
     }
   
-    // --- 4) Enregistrer pour le Central Directory ---
+    // --- 4) Register for Central Directory ---
     const finalCRC  = useKnownSizes ? crc32 : runningCRC;
     const finalSize = useKnownSizes ? size  : written;
     const CDH = [
@@ -1551,8 +1551,8 @@ class StoreZipWriter {
     ];
     for (const part of EOCD) { await this.sink.write(part); }
 
-    // Si le sink est bufferisé (SegmentsSink), on renvoie l’U8 final.
-    // Sinon (FileStreamSink), on tente .close() et on renvoie null.
+    // If sink is buffered (SegmentsSink), return final U8.
+    // Else (FileStreamSink), try .close() and return null.
     if (typeof this.sink.toUint8Array === 'function') {
       return this.sink.toUint8Array();
     }
@@ -1563,12 +1563,12 @@ class StoreZipWriter {
   }  
 }
 
-// Adaptateur File System Access → même interface { write(u8) } que SegmentsSink
+// File System Access adapter → same interface { write(u8) } as SegmentsSink
 class FileStreamSink {
   constructor(fsWritable) { this.w = fsWritable; }
   async write(u8) {
     if (!(u8 instanceof Uint8Array)) u8 = new Uint8Array(u8);
-    await this.w.write(u8);            // l’API prend sa propre copie en interne
+    await this.w.write(u8);            // the API internally takes its own copy
   }
   async close() {
     try { await this.w.close(); } catch {}
@@ -1576,7 +1576,7 @@ class FileStreamSink {
 }
 
 
-// Choisit automatiquement le meilleur sink : FS (O(1)) sinon mémoire (SegmentsSink)
+// Automatically chooses the best sink: FS (O(1)) otherwise memory (SegmentsSink)
 async function getBundleSink(suggestedName = 'secret.cboxbundle') {
   if (window.showSaveFilePicker) {
     try {
@@ -1593,7 +1593,7 @@ async function getBundleSink(suggestedName = 'secret.cboxbundle') {
       return { sink, kind: 'mem', close: null };
     }
   }
-  // pas de FS API : fallback mémoire
+  // no FS API: memory fallback
   const sink = new SegmentsSink();
   return { sink, kind: 'mem', close: null };
 }
@@ -2547,7 +2547,7 @@ async function doEncrypt() {
     }
 }
 
-// petit helper d’UI pour afficher le hash avec un bouton copier
+// small UI helper to display the hash with a copy button
 function renderBundleHash(containerSel, hex) {
   const host = document.querySelector(containerSel);
   if (!host) return;
