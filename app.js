@@ -2733,7 +2733,13 @@ async function doEncrypt() {
       addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
 
       const bundleHash = await sha256Hex(bundleZip);
-      renderBundleHash('#encHash', bundleHash);
+      renderEncHashes({
+        bundleHashHex: bundleHash,
+        plaintextUnpaddedHex: wholeHashHexReal,      // text mode: we do have it
+        wholePlainHashHex: wholeHashHexReal,         // also stored in manifestInner
+        hasChunkHashes: Array.isArray(perChunkHashes) && perChunkHashes.length > 0,
+        chunkCount: perChunkHashes?.length ?? 0
+      });
 
       setProgress(encBar, 100);
       setLive('Encryption complete.');
@@ -2771,7 +2777,13 @@ async function doEncrypt() {
     // 3) UI result selon le sink
     if (kind === 'fs') {
       await close?.();
-      setText('#encHash','');
+      renderEncHashes({
+        bundleHashHex: null,
+        plaintextUnpaddedHex: null,
+        wholePlainHashHex: res?.manifest?.wholePlainHash || null,
+        hasChunkHashes: Array.isArray(res?.manifest?.chunkHashes) && res.manifest.chunkHashes.length > 0,
+        chunkCount: res?.manifest?.totalChunks ?? null
+      });
       setLive('Encryption complete (saved to disk).');
       const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
       setProgress(encBar, 100);
@@ -2784,7 +2796,13 @@ async function doEncrypt() {
       addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
 
       const bundleHash = await sha256Hex(bundleBytes);
-      renderBundleHash('#encHash', bundleHash);
+      renderEncHashes({
+        bundleHashHex: bundleHash,
+        plaintextUnpaddedHex: null,                  // not computed on streaming file path
+        wholePlainHashHex: res?.manifest?.wholePlainHash || null,
+        hasChunkHashes: Array.isArray(res?.manifest?.chunkHashes) && res.manifest.chunkHashes.length > 0,
+        chunkCount: res?.manifest?.totalChunks ?? null
+      });
 
       setProgress(encBar, 100);
       setLive('Encryption complete.');
@@ -2816,6 +2834,30 @@ function renderBundleHash(containerSel, hex) {
   const btn = document.createElement('button'); btn.className = 'btn secondary'; btn.type='button'; setText(btn,'Copy'); btn.onclick = async()=>{ try{ await navigator.clipboard.writeText(hex); setLive('Bundle SHA copied to clipboard.'); } catch { setLive('Copy failed.'); } };
   wrap.appendChild(code); wrap.appendChild(btn);
   host.appendChild(label); host.appendChild(wrap);
+}
+
+// --- Unified hash rendering for Encryption (always English, no icons) ---
+function renderEncHashes({ bundleHashHex, plaintextUnpaddedHex, wholePlainHashHex, hasChunkHashes, chunkCount }) {
+  const bundleHash     = bundleHashHex || 'None';
+  const plainHash      = plaintextUnpaddedHex || 'None';
+  const wholePlainHash = wholePlainHashHex || 'None';
+  const chunkStatus    = hasChunkHashes ? (typeof chunkCount === 'number' ? `Present (${chunkCount})` : 'Present') : 'None';
+
+  setText('#encHash', 
+`Bundle SHA-256 (encrypted):
+${bundleHash}
+
+Plaintext SHA-256 (unpadded):
+${plainHash}
+
+Whole Plaintext SHA-256:
+${wholePlainHash}
+
+Chunk-level Integrity Hashes:
+${chunkStatus}`);
+  
+  // Old secondary field not used anymore; keep it empty for legacy layout
+  setText('#encPlainHash', '');
 }
 
 /**
@@ -3951,8 +3993,7 @@ async function doDecrypt() {
       if (manifest.wholePlainHash) {
         const whole = await sha256Hex(offeredBytes);
         const ok = timingSafeEqual(whole, manifest.wholePlainHash);
-        //setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
-        setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
+        setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
       } else {
         setText('#decIntegrity', wantTrim ? 'Integrity: chunk-level verified (unpadded written).'
                                           : 'Integrity: chunk-level verified.');
@@ -4035,7 +4076,6 @@ async function doDecrypt() {
     } catch (e) { logWarn('[dec] final visibility warn', e); }
   }
 }
-
 
 
 // ===== Panic / Clear all =====
