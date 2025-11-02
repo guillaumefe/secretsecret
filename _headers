@@ -1,3 +1,119 @@
-/argon-worker-permissive.js
-  Content-Security-Policy: script-src 'self' 'wasm-unsafe-eval'
+# =====================================================================
+# GLOBAL SECURITY HEADERS — Apply to all responses
+# =====================================================================
+* 
+  # Prevent MIME type sniffing
+  X-Content-Type-Options: nosniff
 
+  # Enforce no referrer leakage
+  Referrer-Policy: no-referrer
+
+  # Block all framing (defense against clickjacking)
+  X-Frame-Options: DENY
+
+  # Enforce same-origin usage for resources
+  Cross-Origin-Resource-Policy: same-origin
+
+  # Harden browser capabilities
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), usb=(), bluetooth=(), xr-spatial-tracking=(), payment=(), clipboard-read=(), clipboard-write=(), browsing-topics=()
+
+  # Enable site isolation for better process boundaries
+  Origin-Agent-Cluster: ?1
+
+  # Strong caching for static files unless overridden
+  Cache-Control: public, max-age=31536000, immutable
+
+
+# =====================================================================
+# HTML ENTRY POINTS — Strict CSP and cross-origin isolation
+# =====================================================================
+/
+  Cache-Control: no-cache
+  Content-Type: text/html; charset=utf-8
+  Content-Security-Policy: default-src 'self'; script-src 'self'; script-src-attr 'none'; worker-src 'self'; style-src 'self'; style-src-attr 'none'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types worker-url
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+/index.html
+  Cache-Control: no-cache
+  Content-Type: text/html; charset=utf-8
+  Content-Security-Policy: default-src 'self'; script-src 'self'; script-src-attr 'none'; worker-src 'self'; style-src 'self'; style-src-attr 'none'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types worker-url
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+
+
+# =====================================================================
+# STRICT WORKER — No runtime WASM eval, maximum isolation
+# =====================================================================
+/argon-worker.js
+  Content-Type: text/javascript; charset=utf-8
+  Cache-Control: public, max-age=31536000, immutable
+  Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; img-src 'none'; style-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types worker-url
+  Cross-Origin-Embedder-Policy: require-corp
+
+
+# =====================================================================
+# PERMISSIVE WORKER — Localized WASM eval permission only
+# =====================================================================
+/argon-worker-permissive.js
+  Content-Type: text/javascript; charset=utf-8
+  Cache-Control: public, max-age=31536000, immutable
+  Content-Security-Policy: default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'none'; style-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; require-trusted-types-for 'script'; trusted-types worker-url
+  Cross-Origin-Embedder-Policy: require-corp
+
+
+# =====================================================================
+# WASM MODULE — Correct MIME and isolation compliance
+# =====================================================================
+/argon2.wasm
+  Content-Type: application/wasm
+  Cache-Control: public, max-age=31536000, immutable
+  Cross-Origin-Resource-Policy: same-origin
+
+
+# =====================================================================
+# APPLICATION CODE — Static and immutable
+# =====================================================================
+/app.js
+  Content-Type: text/javascript; charset=utf-8
+  Cache-Control: public, max-age=31536000, immutable
+
+/argon2-bundled.min.js
+  Content-Type: text/javascript; charset=utf-8
+  Cache-Control: public, max-age=31536000, immutable
+
+/styles.css
+  Content-Type: text/css; charset=utf-8
+  Cache-Control: public, max-age=31536000, immutable
+
+
+# =====================================================================
+# SERVICE WORKER FOR CROSS-ORIGIN ISOLATION (IF USED)
+# =====================================================================
+/register-coi-sw.js
+  Content-Type: text/javascript; charset=utf-8
+  Service-Worker-Allowed: /
+  Cache-Control: no-cache
+
+
+# =====================================================================
+# STATIC ASSETS — Immutable cache
+# =====================================================================
+/eff_large_wordlist.txt
+  Content-Type: text/plain; charset=utf-8
+  Cache-Control: public, max-age=31536000, immutable
+
+/favicon.ico
+  Cache-Control: public, max-age=31536000, immutable
+
+/favicon-32.png
+  Content-Type: image/png
+  Cache-Control: public, max-age=31536000, immutable
+
+/favicon-64.png
+  Content-Type: image/png
+  Cache-Control: public, max-age=31536000, immutable
+
+/favicon-128.png
+  Content-Type: image/png
+  Cache-Control: public, max-age=31536000, immutable
