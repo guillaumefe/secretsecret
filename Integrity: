@@ -4333,14 +4333,14 @@ async function doDecrypt() {
         //setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
         setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
       } else {
-        setText('#decIntegrity', wantTrim ? 'Integrity: chunk-level verified (unpadded written).'
-                                          : 'Integrity: chunk-level verified.');
+        setText('#decIntegrity', wantTrim ? 'Integrity: chunk-level verified (in memory)(OK).'
+                                          : 'Integrity: chunk-level verified - No padding required (in memory)(OK).');
       }
     } else {
       // Saved directly to disk
       setText('#decIntegrity', wantTrim
-        ? 'Integrity: chunk-level verified (unpadded written to disk).'
-        : 'Integrity: chunk-level verified (saved to disk).');
+        ? 'Integrity: chunk-level verified (written to disk)(OK).'
+        : 'Integrity: chunk-level verified - No padding required (written to disk)(OK).');
       const decResults = document.getElementById('decResults');
       if (decResults) { decResults.classList.remove('hidden'); decResults.classList.add('visible'); }
     }
