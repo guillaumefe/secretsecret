@@ -2465,7 +2465,7 @@ async function doEncrypt() {
 
       // --- Privacy: optional size padding (bucket) ---
       const PAD_TO = 8 * 1024 * 1024;      // 8 MiB bucket
-      const enableSizePadding = true;      // toggle on hardened builds as needed
+      const enableSizePadding = false;      // toggle on hardened builds as needed
       
       // Keep the real length for manifest/UX
       const realPlainLen = payloadBytes.length;
