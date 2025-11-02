@@ -4564,19 +4564,6 @@ function revokeAllObjectURLsNow() {
   } catch {}
 }
 
-// --- Revoke any pending object URLs on pagehide/unload ---
-function revokeAllObjectURLsNow() {
-  try {
-    let count = 0;
-    for (const url of __urlsToRevoke) {
-      try { URL.revokeObjectURL(url); } catch {}
-      count++;
-    }
-    __urlsToRevoke.clear();
-    logInfo && logInfo('[revokeAllObjectURLsNow] revoked all', { count });
-  } catch {}
-}
-
 
 
 // ===== Drag & Drop (mobile & desktop accessibility) =====
