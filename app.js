@@ -2115,8 +2115,8 @@ function resetEncryptUI(opts = {}) {
     preserveInputs   = false, // text/files inputs
   } = opts;
 
-  const mode = getEncMode();
-  const ids  = encIds(mode);
+  const mode = getEncMode();      // 'text' | 'files'
+  const ids  = encIds(mode);      // { outputs, results, hash, bar }
 
   // Clear Encrypt-specific outputs and state
   try { clearNode(ids.results); } catch {}
@@ -2140,16 +2140,38 @@ function resetEncryptUI(opts = {}) {
   }
   try {
     const pw = $('#encPassword'); if (pw) pw.type = 'password';
-    const t = $('#encPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
+    const t  = $('#encPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
   } catch {}
 
   // Always hide progress bar on reset (scoped)
   showEncProgress(mode, false);
 
+  // Hide Encrypt result containers and previews explicitly
+  try {
+    const detText   = document.querySelector('#encDetailsText');
+    const detFiles  = document.querySelector('#encDetailsFiles');
+    const resText   = document.querySelector('#encResultsText');
+    const resFiles  = document.querySelector('#encResultsFiles');
+    const prevText  = document.querySelector('#encPreviewText');
+    const prevFiles = document.querySelector('#encPreviewFiles');
+
+    // Hide details sections
+    if (detText)  detText.classList.add('hidden');
+    if (detFiles) detFiles.classList.add('hidden');
+
+    // Hide result rows
+    if (resText)  resText.classList.add('hidden');
+    if (resFiles) resFiles.classList.add('hidden');
+
+    // Clear + hide previews
+    if (prevText)  { setText(prevText, '');  prevText.classList.add('hidden'); }
+    if (prevFiles) { setText(prevFiles, ''); prevFiles.classList.add('hidden'); }
+  } catch {}
+
   // Hide results container only if empty (scoped)
   hideIfEmpty(ids.outputs, ids.results);
 
-  // Revoke object URLs and remove blob links/buttons in the *scoped* results
+  // Revoke object URLs and remove blob links/buttons in the scoped results
   try {
     for (const url of [...__urlsToRevoke]) {
       try { URL.revokeObjectURL(url); } catch {}
@@ -4459,20 +4481,33 @@ function panicClear() {
     try { $('#decFile').value  = ''; } catch {}
     try { setText('#decFileName', ''); } catch {}
 
-    // ENCRYPT outputs (scoped by input mode)
+    // ENCRYPT outputs (explicitly clear + hide everything)
     try { clearNode('#encResultsText'); } catch {}
     try { clearNode('#encResultsFiles'); } catch {}
     try { setText('#encHashText',  ''); } catch {}
     try { setText('#encHashFiles', ''); } catch {}
-    // (optional) clear + hide previews
-    try { setText('#encPreviewText','');  document.querySelector('#encPreviewText')?.classList.add('hidden'); } catch {}
-    try { setText('#encPreviewFiles',''); document.querySelector('#encPreviewFiles')?.classList.add('hidden'); } catch {}
+    try {
+      const detText   = document.querySelector('#encDetailsText');
+      const detFiles  = document.querySelector('#encDetailsFiles');
+      const resText   = document.querySelector('#encResultsText');
+      const resFiles  = document.querySelector('#encResultsFiles');
+      const prevText  = document.querySelector('#encPreviewText');
+      const prevFiles = document.querySelector('#encPreviewFiles');
+
+      if (detText)  detText.classList.add('hidden');
+      if (detFiles) detFiles.classList.add('hidden');
+      if (resText)  resText.classList.add('hidden');
+      if (resFiles) resFiles.classList.add('hidden');
+
+      if (prevText)  { setText(prevText, '');  prevText.classList.add('hidden'); }
+      if (prevFiles) { setText(prevFiles, ''); prevFiles.classList.add('hidden'); }
+    } catch {}
 
     // DECRYPT outputs
     try { clearNode('#decResults'); } catch {}
     try { setText('#decText', ''); } catch {}
     try {
-      const t = document.querySelector('#decText'); if (t) t.hidden = true;
+      const t   = document.querySelector('#decText');    if (t)   t.hidden = true;
       const res = document.querySelector('#decResults'); if (res) res.classList.add('hidden');
     } catch {}
     try { setText('#decIntegrity', ''); } catch {}
@@ -4495,7 +4530,7 @@ function panicClear() {
       __urlsToRevoke.clear();
     } catch {}
 
-    // Also ensure any residual blob anchors/buttons are removed
+    // Ensure any residual blob anchors/buttons are removed
     try {
       ['#encResultsText', '#encResultsFiles', '#decResults'].forEach(sel => {
         const el = document.querySelector(sel);
@@ -4505,7 +4540,7 @@ function panicClear() {
       });
     } catch {}
 
-    // (UX) reset Encrypt password visibility toggle
+    // Reset Encrypt password visibility toggle (UX)
     try {
       const pw = $('#encPassword'); if (pw) pw.type = 'password';
       const t  = $('#encPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
@@ -4514,6 +4549,19 @@ function panicClear() {
   } catch (e) {
     logWarn('panicClear issue:', e);
   }
+}
+
+// --- Revoke any pending object URLs on pagehide/unload ---
+function revokeAllObjectURLsNow() {
+  try {
+    let count = 0;
+    for (const url of __urlsToRevoke) {
+      try { URL.revokeObjectURL(url); } catch {}
+      count++;
+    }
+    __urlsToRevoke.clear();
+    logInfo && logInfo('[revokeAllObjectURLsNow] revoked all', { count });
+  } catch {}
 }
 
 // --- Revoke any pending object URLs on pagehide/unload ---
