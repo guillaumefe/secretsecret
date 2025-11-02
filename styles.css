@@ -455,7 +455,7 @@ details > summary::-webkit-details-marker{ display:none }
 }
 
 /* =========================================================
-Hash display
+Hashes display
 ========================================================= */
 
 #encHash,
@@ -468,4 +468,13 @@ Hash display
   border-radius: 4px;
   font-size: 0.9rem;
 }
+
+.hashbox {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  white-space: pre;    /* préserve les sauts de ligne et l'indentation */
+  line-height: 1.4;
+  margin: 0;           /* évite les décalages dus aux <p> */
+  padding: 1rem 1.25rem;
+}
+
 
