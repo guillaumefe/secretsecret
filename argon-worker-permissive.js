@@ -290,7 +290,6 @@ self.onmessage = async (e) => {
       // ephemeral model: shutdown
       try { self.close(); } catch {}
       shuttingDown = true; self.onmessage = null;
-      shuttingDown = true;
       try {
         Object.defineProperty(self, 'onmessage', { value: null, writable: false, configurable: false });
       } catch { self.onmessage = null; }
