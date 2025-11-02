@@ -4324,6 +4324,12 @@ async function doDecrypt() {
         addDownload('#decResults', new Blob([offeredBytes], { type: offeredMime }), offeredName, 'Download');
         const decResults = document.getElementById('decResults');
         if (decResults) { decResults.classList.remove('hidden'); decResults.classList.add('visible'); }
+        const decTextEl = document.getElementById('decText');
+        if (decTextEl) {
+          decTextEl.hidden = true;
+          decTextEl.classList.remove('visible');
+          setText('#decText', '');
+        }
       }
     
       // Whole-file hash verification (only possible in memory fallback)
@@ -4343,6 +4349,12 @@ async function doDecrypt() {
         : 'Integrity: chunk-level verified - No padding required (written to disk)(OK).');
       const decResults = document.getElementById('decResults');
       if (decResults) { decResults.classList.remove('hidden'); decResults.classList.add('visible'); }
+      const decTextEl = document.getElementById('decText');
+      if (decTextEl) {
+        decTextEl.hidden = true;
+        decTextEl.classList.remove('visible');
+        setText('#decText', '');
+      }
     }
 
     setProgress(decBar, 100);
