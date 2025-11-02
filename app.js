@@ -2121,6 +2121,7 @@ function resetEncryptUI(opts = {}) {
   // Clear Encrypt-specific outputs and state
   try { clearNode(ids.results); } catch {}
   try { setText(ids.hash, ''); } catch {}
+  document.querySelector(`${ids.outputs} summary`)?.hidden = true;
   document.querySelector(ids.outputs)?.classList.add('hidden');
   document.querySelector(ids.hash)?.classList.add('hidden');
   try { setText('#pwdStrength', ''); } catch {}
@@ -3183,6 +3184,7 @@ ${plb}:
   out.classList.add('hashbox', 'card');
   out.classList.remove('hidden');
   out.closest('details')?.classList.remove('hidden');
+  document.querySelector(`${ids.outputs} summary`)?.hidden = false;
 }
 
 /**
