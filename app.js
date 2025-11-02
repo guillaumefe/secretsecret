@@ -2443,6 +2443,8 @@ function fileChunkProducer(file) {
 async function doEncrypt() {
   let payloadBytes = null;
   let bundleBytes  = null; // memory fallback only
+  let plaintextHashHex = null;
+  let plaintextIsZip = false;
   try {
     logInfo('[enc] start');
 
@@ -2733,12 +2735,10 @@ async function doEncrypt() {
       addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
 
       const bundleHash = await sha256Hex(bundleZip);
-      renderEncHashes({
+      renderSimpleHashes({
         bundleHashHex: bundleHash,
-        plaintextUnpaddedHex: wholeHashHexReal,      // text mode: we do have it
-        wholePlainHashHex: wholeHashHexReal,         // also stored in manifestInner
-        hasChunkHashes: Array.isArray(perChunkHashes) && perChunkHashes.length > 0,
-        chunkCount: perChunkHashes?.length ?? 0
+        plaintextHashHex: wholeHashHexReal,
+        plaintextIsZip: false
       });
 
       setProgress(encBar, 100);
@@ -2763,6 +2763,43 @@ async function doEncrypt() {
       }
     }
 
+    // -- Before choosing sink, calculate the "plaintext" hash
+    {
+      const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
+      if (files.length === 1) {
+        // Hash du fichier clair (si ça rentre dans la limite)
+        const f0 = files[0];
+        if (Number(f0.size || 0) <= maxIn) {
+          const u8 = new Uint8Array(await f0.arrayBuffer());
+          plaintextHashHex = await sha256Hex(u8);
+          try { u8.fill(0); } catch {}
+        } else {
+          plaintextHashHex = null; // trop gros → None
+        }
+        plaintextIsZip = false;
+      } else {
+        // Hash du ZIP clair (STORE) reconstruit en mémoire (si total annoncé ≤ limite)
+        let total = 0;
+        for (const f of files) { total += Number(f.size || 0); }
+        if (total <= maxIn) {
+          const sinkTmp = new SegmentsSink();
+          const writerTmp = new StoreZipWriter(sinkTmp);
+          let idx = 0;
+          for (const f of files) {
+            const internalName = `000${String(idx).padStart(3,'0')}.bin`.replace(/^0+/, (m)=> m);
+            await writerTmp.addFile(internalName, null, null, fileChunkProducer(f));
+            idx++;
+          }
+          const zipPlain = await writerTmp.finish();
+          plaintextHashHex = await sha256Hex(zipPlain);
+          try { zipPlain.fill(0); } catch {}
+        } else {
+          plaintextHashHex = null; // trop gros → None
+        }
+        plaintextIsZip = true;
+      }
+    }
+
     // 1) Choose output sink: O(1) via File System Access si dispo, sinon mémoire
     const { sink, close, kind } = await getBundleSink('secret' + FILE_BUNDLE_EXT);
 
@@ -2777,12 +2814,10 @@ async function doEncrypt() {
     // 3) UI result selon le sink
     if (kind === 'fs') {
       await close?.();
-      renderEncHashes({
+      renderSimpleHashes({
         bundleHashHex: null,
-        plaintextUnpaddedHex: null,
-        wholePlainHashHex: res?.manifest?.wholePlainHash || null,
-        hasChunkHashes: Array.isArray(res?.manifest?.chunkHashes) && res.manifest.chunkHashes.length > 0,
-        chunkCount: res?.manifest?.totalChunks ?? null
+        plaintextHashHex: plaintextHashHex,
+        plaintextIsZip: plaintextIsZip
       });
       setLive('Encryption complete (saved to disk).');
       const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
@@ -2796,12 +2831,10 @@ async function doEncrypt() {
       addDownload('#encResults', outBlob, `secret${FILE_BUNDLE_EXT}`, 'Download bundle');
 
       const bundleHash = await sha256Hex(bundleBytes);
-      renderEncHashes({
+      renderSimpleHashes({
         bundleHashHex: bundleHash,
-        plaintextUnpaddedHex: null,                  // not computed on streaming file path
-        wholePlainHashHex: res?.manifest?.wholePlainHash || null,
-        hasChunkHashes: Array.isArray(res?.manifest?.chunkHashes) && res.manifest.chunkHashes.length > 0,
-        chunkCount: res?.manifest?.totalChunks ?? null
+        plaintextHashHex: plaintextHashHex,
+        plaintextIsZip: plaintextIsZip
       });
 
       setProgress(encBar, 100);
@@ -2820,44 +2853,56 @@ async function doEncrypt() {
     }
 }
 
-// small UI helper to display the hash with a copy button
-function renderBundleHash(containerSel, hex) {
-  const host = document.querySelector(containerSel);
-  if (!host) return;
-  clearNode(host);
-  const label = document.createElement('div');
-  label.className = 'muted';
-  setText(label, 'Bundle SHA-256:');
-  const wrap = document.createElement('div');
-  wrap.style.display = 'flex'; wrap.style.alignItems = 'center'; wrap.style.gap = '8px'; wrap.style.marginTop = '6px';
-  const code = document.createElement('code'); code.style.fontFamily = 'monospace, monospace'; code.style.padding = '6px 8px'; code.style.borderRadius = '8px'; code.style.background = 'rgba(255,255,255,0.02)'; code.textContent = hex;
-  const btn = document.createElement('button'); btn.className = 'btn secondary'; btn.type='button'; setText(btn,'Copy'); btn.onclick = async()=>{ try{ await navigator.clipboard.writeText(hex); setLive('Bundle SHA copied to clipboard.'); } catch { setLive('Copy failed.'); } };
-  wrap.appendChild(code); wrap.appendChild(btn);
-  host.appendChild(label); host.appendChild(wrap);
+async function computeFileSha256Hex(file, limitBytes) {
+  const size = Number(file?.size || 0);
+  if (!Number.isFinite(size) || size < 0) return null;
+  if (limitBytes && size > limitBytes) return null; // too large to hold in memory safely
+  const u8 = new Uint8Array(await file.arrayBuffer());
+  const hex = await sha256Hex(u8);
+  try { u8.fill(0); } catch {}
+  return hex;
 }
 
-// --- Unified hash rendering for Encryption (always English, no icons) ---
-function renderEncHashes({ bundleHashHex, plaintextUnpaddedHex, wholePlainHashHex, hasChunkHashes, chunkCount }) {
-  const bundleHash     = bundleHashHex || 'None';
-  const plainHash      = plaintextUnpaddedHex || 'None';
-  const wholePlainHash = wholePlainHashHex || 'None';
-  const chunkStatus    = hasChunkHashes ? (typeof chunkCount === 'number' ? `Present (${chunkCount})` : 'Present') : 'None';
+// Build a STORE-only ZIP in memory (opaque internal names, like the streaming path)
+// and return sha256 hex of that clear ZIP
+async function computeZipSha256HexForFiles(files, limitBytes) {
+  // sanity / announced total
+  let total = 0;
+  for (const f of files) {
+    total += Number(f.size || 0);
+    if (limitBytes && total > limitBytes) return null;
+  }
 
+  const sink = new SegmentsSink();
+  const writer = new StoreZipWriter(sink);
+
+  let fileIdx = 0;
+  for (const f of files) {
+    // match the opaque internal naming used in encryptMultiFilesStreaming()
+    const internalName = `000${String(fileIdx).padStart(3,'0')}.bin`.replace(/^0+/, (m)=> m);
+    await writer.addFile(internalName, null, null, fileChunkProducer(f));
+    fileIdx++;
+  }
+  const zipU8 = await writer.finish();
+  if (!zipU8) return null;
+  const hex = await sha256Hex(zipU8);
+  try { zipU8.fill(0); } catch {}
+  return hex;
+}
+
+// Simple two-line hash display (English, no icons)
+function renderSimpleHashes({ bundleHashHex, plaintextHashHex, plaintextIsZip = false }) {
+  const enc = bundleHashHex || 'None';
+  const plc = plaintextHashHex || 'None';
+  const label = `Plaintext SHA-256${plaintextIsZip ? ' (ZIP)' : ''}`;
   setText('#encHash', 
-`Bundle SHA-256 (encrypted):
-${bundleHash}
-
-Plaintext SHA-256 (unpadded):
-${plainHash}
-
-Whole Plaintext SHA-256:
-${wholePlainHash}
-
-Chunk-level Integrity Hashes:
-${chunkStatus}`);
+  `Encrypted SHA-256 (bundle):
+  ${enc}
   
-  // Old secondary field not used anymore; keep it empty for legacy layout
-  setText('#encPlainHash', '');
+  ${label}:
+  ${plc}`);
+    // legacy secondary field stays empty
+    setText('#encPlainHash', '');
 }
 
 /**
