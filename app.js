@@ -1776,6 +1776,43 @@ const DANGEROUS_EXT = /\.(exe|msi|bat|cmd|com|scr|ps1|psm1|vbs|js|jse|wsf|sh|apk
 // BiDi / control characters often abused to hide extension
 const BIDI_CTRL = /[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 
+// Minimal filename sanitizer for ZIP rebuilds
+function sanitizeZipFilename(name, used = new Set()) {
+  if (!name || typeof name !== 'string') name = 'file';
+
+  // Normalize + strip control/BiDi chars
+  let s = name.normalize('NFKC').replace(BIDI_CTRL, '');
+
+  // Unify separators and drop absolute/parent refs
+  s = s.replace(/[\\]+/g, '/');       // backslashes → '/'
+  s = s.replace(/\/{2,}/g, '/');      // collapse '//' 
+  s = s.replace(/^\/+/, '');          // drop leading '/'
+  s = s.split('/').filter(seg => seg && seg !== '.' && seg !== '..').join('/');
+
+  // Force basename-only to avoid Zip Slip risks
+  s = s.split('/').pop() || 'file';
+
+  // Trim whitespace/dots at ends (ambiguous on some filesystems)
+  s = s.replace(/^[\s.]+|[\s.]+$/g, '');
+
+  // Very conservative fallback if empty after cleaning
+  if (!s) s = 'file';
+
+  // Optional: cap length a bit
+  if (s.length > 180) s = s.slice(0, 180);
+
+  // Ensure uniqueness within the archive
+  let out = s, n = 2;
+  const dot = out.lastIndexOf('.');
+  const base = dot > 0 ? out.slice(0, dot) : out;
+  const ext  = dot > 0 ? out.slice(dot) : '';
+  while (used.has(out)) {
+    out = `${base} (${n++})${ext}`;
+  }
+  used.add(out);
+  return out;
+}
+
 /**
  * Returns { ok: boolean, why: string } describing suspicious filename heuristics.
  */
@@ -3677,12 +3714,14 @@ async function doDecrypt() {
     
           const rebuildSink = new SegmentsSink();
           const writer = new StoreZipWriter(rebuildSink);
+          const usedNames = new Set();
     
           for (const e of clearEntries) {
             // Internal opaque pattern like "000000.bin" → extract numeric index
             const m = e.name.match(/0*?(\d+)\.bin$/i);
             const idx = m ? Number(m[1]) : null;
-            const outEntryName = (idx !== null && fileMap.has(idx)) ? String(fileMap.get(idx).name) : e.name;
+            const desired = (idx !== null && fileMap.has(idx)) ? String(fileMap.get(idx).name) : e.name;
+            const outEntryName = sanitizeZipFilename(desired, usedNames);
             const crc = crc32(e.bytes);
             await writer.addFile(outEntryName, e.bytes.length, crc, async function* () { yield e.bytes.slice(); });
           }
