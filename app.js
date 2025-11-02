@@ -2735,9 +2735,6 @@ async function doEncrypt() {
       const bundleHash = await sha256Hex(bundleZip);
       renderBundleHash('#encHash', bundleHash);
 
-      // Display unpadded plaintext hash for user confidence
-      setText('#encPlainHash', `SHA-256 (unpadded): ${wholeHashHexReal}`);
-
       setProgress(encBar, 100);
       setLive('Encryption complete.');
       const out = $('#encOutputs'); if (out) { out.classList.remove('hidden'); out.classList.add('visible'); }
