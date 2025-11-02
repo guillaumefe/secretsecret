@@ -2891,18 +2891,24 @@ async function computeZipSha256HexForFiles(files, limitBytes) {
 }
 
 // Simple two-line hash display (English, no icons)
-function renderSimpleHashes({ bundleHashHex, plaintextHashHex, plaintextIsZip = false }) {
-  const enc = bundleHashHex || 'None';
-  const plc = plaintextHashHex || 'None';
-  const label = `Plaintext SHA-256${plaintextIsZip ? ' (ZIP)' : ''}`;
-  setText('#encHash', 
-  `Encrypted SHA-256 (bundle):
+function renderSimpleHashes({ bundleHashHex, plaintextHashHex, plaintextIsZip }) {
+  const out = document.querySelector('#encHash');
+  if (!out) return;
+
+  const enc = bundleHashHex ?? 'None';
+  const plb = 'Plaintext SHA-256' + (plaintextIsZip ? ' (ZIP)' : '');
+  const pla = plaintextHashHex ?? 'None';
+
+  // 2 espaces avant chaque valeur → indent identique
+  const text =
+`Encrypted SHA-256 (bundle):
   ${enc}
-  
-  ${label}:
-  ${plc}`);
-    // legacy secondary field stays empty
-    setText('#encPlainHash', '');
+
+${plb}:
+  ${pla}`;
+
+  out.textContent = text;            // important: pas innerHTML
+  out.classList.add('hashbox');      // pour le style monospaced ci-dessous
 }
 
 /**
