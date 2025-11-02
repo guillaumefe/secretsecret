@@ -453,3 +453,19 @@ details > summary::-webkit-details-marker{ display:none }
   [role="tabpanel"]:focus-visible,
   summary:focus-visible{ outline: 2px solid Highlight; }
 }
+
+/* =========================================================
+Hash display
+========================================================= */
+
+#encHash,
+#decIntegrity {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #111;
+  color: #0f0;
+  padding: 0.75em;
+  border-radius: 4px;
+  font-size: 0.9rem;
+}
+
