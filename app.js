@@ -2297,28 +2297,28 @@ function selectContentTab(which) {
 
   const selIsText = (which === 'text');
 
-  // Toggle tabs/panels
+  // Tabs/panels
   tBtn.setAttribute('aria-selected', selIsText ? 'true' : 'false');
   fBtn.setAttribute('aria-selected', selIsText ? 'false' : 'true');
   tPanel.hidden = !selIsText;
-  fPanel.hidden = selIsText;
+  fPanel.hidden =  selIsText;
 
-  // Only the active outputs wrapper is visible
+  // Only one outputs wrapper visible
   if (selIsText) {
-    outFiles && outFiles.classList.add('hidden');
-    outText  && outText.classList.remove('hidden');
+    outFiles?.classList.add('hidden');
+    outFiles?.classList.remove('visible');
+    outText?.classList.remove('hidden');
+    outText?.classList.add('visible');
   } else {
-    outText  && outText.classList.add('hidden');
-    outFiles && outFiles.classList.remove('hidden');
+    outText?.classList.add('hidden');
+    outText?.classList.remove('visible');
+    outFiles?.classList.remove('hidden');
+    outFiles?.classList.add('visible');
   }
 
-  // Hide both progress bars on tab switch (will be shown by doEncrypt)
+  // Hide both progress bars on switch; doEncrypt() will show the right one
   showEncProgress('text',  false);
   showEncProgress('files', false);
-
-  // Re-check emptiness to avoid showing empty boxes
-  hideIfEmpty('#encOutputsText',  '#encResultsText');
-  hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
 
   updateEncryptButtonState();
 }
@@ -2551,14 +2551,15 @@ async function doEncrypt() {
     const mode = getEncMode();
     const ids  = encIds(mode);
 
-    // Hide the inactive outputs explicitly
+    // Ensure only the active outputs wrapper is visible
     const other = encIds(mode === 'text' ? 'files' : 'text');
-    document.querySelector(other.outputs)?.classList.add('hidden');
+    const otherWrap = document.querySelector(other.outputs);
+    otherWrap?.classList.add('hidden');
+    otherWrap?.classList.remove('visible');
     
-    // Show the active one (so progress is visible)
-    const out = document.querySelector(ids.outputs);
-    out?.classList.remove('hidden');
-    out?.classList.add('visible');
+    const outWrap = document.querySelector(ids.outputs);
+    outWrap?.classList.remove('hidden');
+    outWrap?.classList.add('visible');
     
     showEncProgress(mode, true);
     setProgress(document.getElementById(ids.bar), 5); 
