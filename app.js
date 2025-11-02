@@ -3422,12 +3422,12 @@ async function doDecrypt() {
   try {
     logInfo('[dec] start');
 
+    // Clear previous outputs first (this currently hides the bar)
+    resetDecryptUI({ preservePassword: true, preserveFile: true });
+
+    // Now show the bar and set initial progress
     showProgress('decBar', true);
     setProgress(decBar, 10);
-    
-    // Clear previous outputs (keep password and selected file for retry UX)
-    logInfo('[dec] reset UI outputs');
-    resetDecryptUI({ preservePassword: true, preserveFile: true });
 
     // Show decryption progress container only while active
     try {
