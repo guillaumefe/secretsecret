@@ -2772,14 +2772,20 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       }
     });
 
-    // stream using data-descriptor mode
+    // Use opaque internal entry names to avoid exposing original file metadata in the clear ZIP.
+    // Store a mapping (index -> original metadata) in sourceFilesMeta which will be put in the encrypted manifest.
+    let fileIdx = 0;
     for (const f of files) {
-      sourceFilesMeta.push({ name: f.name });
-    }
-
-    // write local entries + data, pushing into feedPlain()
-    for (const f of files) {
-      await zipPlainWriter.addFile(f.name, null, null, fileChunkProducer(f));
+      sourceFilesMeta.push({
+        idx: fileIdx,
+        name: f.name,
+        size: Number(f.size || 0),
+        type: f.type || 'application/octet-stream'
+      });
+      const internalName = `000${String(fileIdx).padStart(3,'0')}.bin`.replace(/^0+/, (m)=> m); // e.g. "000000.bin" if you prefer pad 6
+      // write clear ZIP with opaque internal name (original metadata stays in the encrypted manifest)
+      await zipPlainWriter.addFile(internalName, null, null, fileChunkProducer(f));
+      fileIdx++;
     }
 
     // write CD + EOCD of clear ZIP (into pipe also)
@@ -3641,25 +3647,60 @@ async function doDecrypt() {
      ****************************************************** */
     if (plainSink instanceof SegmentsSink) {
       const u8 = plainSink.toUint8Array();
-      const mime =
+    
+      // Attempt to rebuild a ZIP with original filenames using the encrypted manifest mapping.
+      // If this is not a multi-file package or rebuild fails, fall back to the current behavior.
+      let offeredBytes = u8;
+      let offeredMime =
         (manifest?.source?.kind === 'files' && manifest.source.files?.length > 1)
           ? 'application/zip'
           : (manifest?.source?.kind === 'text'
               ? 'text/plain;charset=utf-8'
               : (manifest?.source?.files?.[0]?.type || 'application/octet-stream'));
-
+      let offeredName = outName;
+    
+      if (manifest?.source?.kind === 'files' && Array.isArray(manifest.source.files) && manifest.source.files.length > 1) {
+        try {
+          const clearEntries = await extractZipEntriesStrict(u8); // [{ name, bytes }, ...]
+          const fileMap = new Map(
+            (manifest.source.files || [])
+              .filter(m => Number.isFinite(m.idx))
+              .map(m => [Number(m.idx), m])
+          );
+    
+          const rebuildSink = new SegmentsSink();
+          const writer = new StoreZipWriter(rebuildSink);
+    
+          for (const e of clearEntries) {
+            // Internal opaque pattern like "000000.bin" → extract numeric index
+            const m = e.name.match(/0*?(\d+)\.bin$/i);
+            const idx = m ? Number(m[1]) : null;
+            const outEntryName = (idx !== null && fileMap.has(idx)) ? String(fileMap.get(idx).name) : e.name;
+            const crc = crc32(e.bytes);
+            await writer.addFile(outEntryName, e.bytes.length, crc, async function* () { yield e.bytes.slice(); });
+          }
+    
+          const rebuiltZip = await writer.finish();
+          offeredBytes = rebuiltZip;
+          offeredMime  = 'application/zip';
+          offeredName  = 'files.zip';
+        } catch (e) {
+          // Fall back silently to anonymous ZIP if rebuild is not possible.
+        }
+      }
+    
       if (manifest?.source?.kind === 'text') {
-        // Affiche le texte dans #decText (jusqu’à MAX_PREVIEW) ET ajoute un bouton Download .txt
-        await tryRenderOrDownload(u8, '#decResults', '#decText');
+        // Show text preview (up to MAX_PREVIEW) and provide a .txt download
+        await tryRenderOrDownload(offeredBytes, '#decResults', '#decText');
       } else {
-        addDownload('#decResults', new Blob([u8], { type: mime }), outName, 'Download');
+        addDownload('#decResults', new Blob([offeredBytes], { type: offeredMime }), offeredName, 'Download');
         const decResults = document.getElementById('decResults');
         if (decResults) decResults.classList.remove('hidden');
       }
-
+    
       // Whole-file hash verification (only possible in memory fallback)
       if (manifest.wholePlainHash) {
-        const whole = await sha256Hex(u8);
+        const whole = await sha256Hex(offeredBytes);
         const ok = timingSafeEqual(whole, manifest.wholePlainHash);
         logInfo('[dec] whole hash check', { ok });
         setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
