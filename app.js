@@ -1939,8 +1939,19 @@ function encIds(mode = getEncMode()) {
 
 // Show/hide a specific bar by id (reuses your showProgress API)
 function showEncProgress(mode, visible) {
-  const { bar } = encIds(mode);
+  const { bar, outputs } = encIds(mode);
+
+  // Keep your existing wrapper/show logic
   showProgress(bar, visible);
+
+  // IMPORTANT: when progress is visible, unhide this mode's output container
+  if (visible) {
+    const out = document.querySelector(outputs);
+    if (out) {
+      out.classList.remove('hidden');
+      out.classList.add('visible');
+    }
+  }
 }
 
 
@@ -2281,31 +2292,38 @@ function selectContentTab(which) {
   const tPanel = $('#encPanelText');
   const fPanel = $('#encPanelFiles');
 
+  const outText  = document.querySelector('#encOutputsText');
+  const outFiles = document.querySelector('#encOutputsFiles');
+
   if (which === 'text') {
     tBtn.setAttribute('aria-selected','true');
     fBtn.setAttribute('aria-selected','false');
     tPanel.hidden = false;
     fPanel.hidden = true;
-    // Hide FILES outputs/progress, keep its content untouched
-    hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
+
+    // Hide FILES outputs, show TEXT outputs (without clearing content)
+    if (outFiles) outFiles.classList.add('hidden');
+    if (outText)  { outText.classList.remove('hidden'); outText.classList.add('visible'); }
+
+    // Make sure both scoped progress bars are hidden on switch
     showEncProgress('files', false);
-    // Show TEXT outputs only if not empty
-    hideIfEmpty('#encOutputsText', '#encResultsText');
-    showEncProgress('text', false); // hidden until encryption starts
+    showEncProgress('text',  false);
+
   } else {
     fBtn.setAttribute('aria-selected','true');
     tBtn.setAttribute('aria-selected','false');
     fPanel.hidden = false;
     tPanel.hidden = true;
-    // Hide TEXT outputs/progress, keep its content untouched
-    hideIfEmpty('#encOutputsText', '#encResultsText');
-    showEncProgress('text', false);
-    // Show FILES outputs only if not empty
-    hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
-    showEncProgress('files', false); // hidden until encryption starts
+
+    // Hide TEXT outputs, show FILES outputs (without clearing content)
+    if (outText)  outText.classList.add('hidden');
+    if (outFiles) { outFiles.classList.remove('hidden'); outFiles.classList.add('visible'); }
+
+    showEncProgress('text',  false);
+    showEncProgress('files', false);
   }
 
-  // Keep existing results if any — do NOT clear here
+  // Keep existing results intact; just recompute button state
   updateEncryptButtonState();
 }
 
@@ -3695,8 +3713,11 @@ async function doDecrypt() {
       try {
         const decResults = document.getElementById('decResults');
         const decTextEl  = document.getElementById('decText');
-        if (decResults) decResults.classList.remove('hidden');
-        if (decTextEl && (decTextEl.textContent || '').trim() !== '') decTextEl.hidden = false;
+        if (decResults) { decResults.classList.remove('hidden'); decResults.classList.add('visible'); }
+        if (decTextEl && (decTextEl.textContent || '').trim() !== '') {
+          decTextEl.hidden = false;
+          decTextEl.classList.add('visible');
+        }
         const decProgress = document.querySelector('#decBar')?.parentElement;
         if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (single done)'); }
       } catch (e) { logWarn('[dec] results reveal warn (single)', e); }
@@ -4201,10 +4222,17 @@ async function doDecrypt() {
       if (manifest?.source?.kind === 'text') {
         // Show text preview (up to MAX_PREVIEW) and provide a .txt download
         await tryRenderOrDownload(offeredBytes, '#decResults', '#decText');
+        const decResults = document.getElementById('decResults');
+        if (decResults) { decResults.classList.remove('hidden'); decResults.classList.add('visible'); }
+        const decTextEl = document.getElementById('decText');
+        if (decTextEl && (decTextEl.textContent || '').trim() !== '') {
+          decTextEl.hidden = false;
+          decTextEl.classList.add('visible');
+        }
       } else {
         addDownload('#decResults', new Blob([offeredBytes], { type: offeredMime }), offeredName, 'Download');
         const decResults = document.getElementById('decResults');
-        if (decResults) decResults.classList.remove('hidden');
+        if (decResults) { decResults.classList.remove('hidden'); decResults.classList.add('visible'); }
       }
     
       // Whole-file hash verification (only possible in memory fallback)
@@ -4222,7 +4250,7 @@ async function doDecrypt() {
         ? 'Integrity: chunk-level verified (unpadded written to disk).'
         : 'Integrity: chunk-level verified (saved to disk).');
       const decResults = document.getElementById('decResults');
-      if (decResults) decResults.classList.remove('hidden');
+      if (decResults) { decResults.classList.remove('hidden'); decResults.classList.add('visible'); }
     }
 
     setProgress(decBar, 100);
