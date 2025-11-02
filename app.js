@@ -2564,12 +2564,12 @@ function renderBundleHash(containerSel, hex) {
 }
 
 /**
- * Construit le ZIP clair en flux (store-only), l’alimente dans le chiffrage par chunks,
- * et écrit le bundle (.cboxbundle) en flux (store-only) au fil de l’eau.
- * Renvoie {bundleU8, manifest, manifestIndex}.
+ * Builds the clear ZIP as a stream (store-only), feeds it into chunk-based encryption,
+ * and writes the bundle (.cboxbundle) as a stream (store-only) on the fly.
+ * Returns {bundleU8, manifest, manifestIndex}.
  */
 async function encryptMultiFilesStreaming({ files, password, tunedParams, outSink }) {
-  // 0) Writer de BUNDLE (sortie) : on utilise celui fourni (FS ou mémoire)
+  // 0) BUNDLE writer (output): use the one provided (FS or memory)
   const bundleSink   = outSink || new SegmentsSink();
   const bundleWriter = new StoreZipWriter(bundleSink);
 
@@ -2597,9 +2597,9 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
   await bundleWriter.addFile(`BUNDLE_HEADER${FILE_SINGLE_EXT}`, headerBytes.length, headerCrc, async function*(){ yield headerBytes.slice(); });
   try { headerBytes.fill(0); } catch {}
 
-  // 2) Construire le ZIP clair *en flux* et, en parallèle, le découper/chiffrer
-  //    On va produire des parts chiffrées part-000000.cbox directement dans le bundle.
-  //    Pour ça, on a besoin d’un “chunker clair” qui accumule FIXED_CHUNK_SIZE.
+  // 2) Build clear ZIP *as a stream* and simultaneously chunk/encrypt it
+  //    We produce encrypted parts part-000000.cbox directly in the bundle.
+  //    We need a “clear chunker” that accumulates FIXED_CHUNK_SIZE.
   let plainTotalLen = 0;
   let partIndex = 0;
   const perChunkHashes = [];
@@ -2624,7 +2624,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       domain: 'data'
     });    
 
-    // Ajouter l’entrée part-XXXXXX.cbox dans le bundle (store-only) immédiatement
+    // Add part-XXXXXX.cbox entry into bundle (store-only) immediately
     const entryName = `part-${String(partIndex).padStart(6,'0')}${FILE_SINGLE_EXT}`;
     const crc = crc32(sealed);
     await bundleWriter.addFile(entryName, sealed.length, crc, async function*(){ yield sealed.slice(); });
@@ -2634,7 +2634,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     partIndex++;
   }
 
-  // 2a) Mécanique de chunking clair → FIXED_CHUNK_SIZE
+  // 2a) Clear chunking mechanic → FIXED_CHUNK_SIZE
   async function feedPlain(u8, done=false) {
     if (u8.length === 0 && !done) return;
     // concat pending + u8
@@ -2645,14 +2645,14 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       merged.set(pending, 0); merged.set(u8, pending.length);
       pending = merged;
     }
-    // extraire les blocs fixes
+    // extract fixed blocks
     while (pending.length >= FIXED_CHUNK_SIZE) {
       const block = pending.subarray(0, FIXED_CHUNK_SIZE);
-      const pad = padToFixed(block); // block est déjà de taille fixe, padToFixed garde identique
+      const pad = padToFixed(block);
       await flushSealChunk(pad, false);
       pending = pending.subarray(FIXED_CHUNK_SIZE);
     }
-    // si fin de flux : sceller le dernier (même si 0)
+    // if end of stream: seal the last one (even if 0)
     /* ******************************************************
     * feedPlain: flush last chunk only if needed
     ****************************************************** */
@@ -2666,13 +2666,13 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     }
   }
 
-  // 2b) Construire la source claire → selon 1 fichier vs plusieurs
+  // 2b) Build the clear source → depending on 1 file vs multiple
   const sourceFilesMeta = [];
 
   if (files.length === 1) {
-    // === FAST-PATH 1 FICHIER : pas de ZIP clair, on chiffre directement le contenu du fichier ===
+    // === FAST-PATH 1 FILE: no clear ZIP, directly encrypt file data ===
     const f = files[0];
-    sourceFilesMeta.push({ name: f.name, type: f.type }); // on conserve le type pour le MIME en sortie
+    sourceFilesMeta.push({ name: f.name, type: f.type }); // keep type for MIME on output
 
     const r = f.stream().getReader();
     try {
@@ -2680,16 +2680,16 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
         const { value, done } = await r.read();
         if (done) break;
         const u8 = value instanceof Uint8Array ? value : new Uint8Array(value);
-        plainTotalLen += u8.length;                // ✅ important : mettre à jour la taille claire
+        plainTotalLen += u8.length;               // ✅ important: update clear size
         await feedPlain(u8, false);
       }
     } finally {
       try { r.releaseLock?.(); } catch {}
     }
-    await feedPlain(new Uint8Array(0), true);      // flush final
+    await feedPlain(new Uint8Array(0), true);    // final flush
 
   } else {
-    // === CAS MULTI-FICHIERS : ZIP clair en flux comme avant ===
+    // === MULTI-FILES CASE: clear ZIP streaming as before ===
     const zipPlainWriter = new StoreZipWriter({
       write: async (u8) => {
         plainTotalLen += u8.length;
@@ -2697,29 +2697,27 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       }
     });
 
-    // stream en mode data-descriptor
+    // stream using data-descriptor mode
     for (const f of files) {
       sourceFilesMeta.push({ name: f.name });
     }
 
-    // écriture des entrées locales + data, le tout pousse dans feedPlain()
+    // write local entries + data, pushing into feedPlain()
     for (const f of files) {
-      // size/crc = null → le writer passera en data-descriptor
       await zipPlainWriter.addFile(f.name, null, null, fileChunkProducer(f));
     }
 
-    // écrire CD + EOCD du ZIP clair (dans le pipe aussi)
+    // write CD + EOCD of clear ZIP (into pipe also)
     const zipPlainFinalBytes = await zipPlainWriter.finish();
-    // finish() peut renvoyer null si le sink “stream” directement.
     if (zipPlainFinalBytes && zipPlainFinalBytes.length) {
-      plainTotalLen += zipPlainFinalBytes.length;  // ✅ cohérent avec le chemin multi-fichiers
+      plainTotalLen += zipPlainFinalBytes.length; // ✅ consistent with multi-files path
       await feedPlain(zipPlainFinalBytes, false);
     }
-    // signaler fin au chunker
+    // signal end to chunker
     await feedPlain(new Uint8Array(0), true);
   }
 
-  // 3) MANIFEST + INDEX (petits → RAM ok)
+  // 3) MANIFEST + INDEX (small → RAM OK)
   /* ******************************************************
   * MANIFEST sealing (streaming path) with bundle-level keys
   ****************************************************** */
@@ -2757,8 +2755,8 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
   }
 
   /* ******************************************************
- * MANIFEST_INDEX sealing (streaming path) with bundle-level keys
- ****************************************************** */
+  * MANIFEST_INDEX sealing (streaming path) with bundle-level keys
+  ****************************************************** */
   const manChunkHashes = [];
   for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
   const manifestIndexInner = {
