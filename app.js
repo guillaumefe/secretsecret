@@ -296,28 +296,13 @@ async function secureFail(ctx, overrideMsg) {
   setLive(msg);
   showErrorBanner(msg);
 
-  // Hide encryption progress bar safely
-  try {
-    const pe = document.querySelector('#encBar')?.parentElement;
-    if (pe) pe.style.display = 'none';
-  } catch {}
+  // Always hide progress bars
+  showProgress('encBar', false);
+  showProgress('decBar', false);
 
-  // Hide decryption progress bar safely
-  try {
-    const pd = document.querySelector('#decBar')?.parentElement;
-    if (pd) pd.style.display = 'none';
-  } catch {}
-
-  // Hide output sections (no stale/empty console visible)
-  try {
-    const eo = document.querySelector('#encOutputs');
-    if (eo) eo.classList.add('hidden');
-  } catch {}
-
-  try {
-    const doo = document.querySelector('#decOutputs');
-    if (doo) doo.classList.add('hidden');
-  } catch {}
+  // Hide results ONLY if empty (no stale UI)
+  hideIfEmpty('#encOutputs', '#encResults');
+  hideIfEmpty('#decOutputs', '#decResults');
 }
 
 function normalizeEncError(err) {
@@ -2063,21 +2048,21 @@ function resetEncryptUI(opts = {}) {
     preserveInputs   = false, // text/files inputs
   } = opts;
 
-  // 1) Clear Encrypt-specific outputs and state
+  // Clear Encrypt-specific outputs and state
   try { clearNode('#encResults'); } catch {}
   try { setText('#encHash', ''); } catch {}
   try { setText('#encPlainHash', ''); } catch {}
   try { setText('#pwdStrength', ''); } catch {}
   try { setProgress(encBar, 0); } catch {}
 
-  // 2) Clear inputs (text/files) if not preserved
+  // Clear inputs (text/files) if not preserved
   if (!preserveInputs) {
     try { $('#encText').value = ''; } catch {}
     try { $('#encFiles').value = ''; } catch {}
     try { setText('#encFileList', ''); } catch {}
   }
 
-  // 3) Password: clear if not preserved, always re-hide field and reset toggle
+  // Password: clear if not preserved, always re-hide field and reset toggle
   if (!preservePassword) {
     try { $('#encPassword').value = ''; } catch {}
   }
@@ -2086,15 +2071,14 @@ function resetEncryptUI(opts = {}) {
     const t = $('#encPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
   } catch {}
 
-  // 4) Hide Encrypt UI sections (outputs, progress)
-  try {
-    const out = $('#encOutputs');
-    if (out) { out.classList.add('hidden'); out.classList.remove('visible'); }
-    const encProgress = document.querySelector('#encBar')?.parentElement;
-    if (encProgress) encProgress.style.display = 'none';
-  } catch {}
+  // Always hide progress bar on reset
+  showProgress('encBar', false);
+  
+  // Hide results container only if empty
+  hideIfEmpty('#encOutputs', '#encResults');
 
-  // 5) Revoke object URLs and remove any blob links/buttons in encResults
+
+  // Revoke object URLs and remove any blob links/buttons in encResults
   try {
     for (const url of [...__urlsToRevoke]) { try { URL.revokeObjectURL(url); } catch {} __urlsToRevoke.delete(url); }
     const resEl = document.querySelector('#encResults');
@@ -2104,18 +2088,18 @@ function resetEncryptUI(opts = {}) {
     }
   } catch (e) { logWarn('[resetEncryptUI] revoke anchors warn', e); }
 
-  // 6) Recompute Encrypt button state
+  // Recompute Encrypt button state
   try {
-    const pw = ($('#encPassword').value || '').trim();
-    const text = ($('#encText').value || '').trim();
+    const pwVal = ($('#encPassword').value || '').trim();   // renamed
+    const text  = ($('#encText').value || '').trim();
     const files = $('#encFiles').files;
-    const ok = (pw.length > 0) && (text.length > 0 || (files && files.length > 0));
+    const ok = (pwVal.length > 0) && (text.length > 0 || (files && files.length > 0));
     const btn = $('#btnEncrypt');
     btn.disabled = !ok;
     if (btn.disabled) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
   } catch {}
 
-  // 7) Accessibility live message
+  // Accessibility live message
   try { setLive('Encryption UI cleared.'); } catch {}
 }
 
@@ -2129,20 +2113,20 @@ function resetDecryptUI(opts = {}) {
     preserveFile     = false, // selected .cbox/.cboxbundle
   } = opts;
 
-  // 1) Clear Decrypt-specific outputs and state
+  // Clear Decrypt-specific outputs and state
   try { clearNode('#decResults'); } catch {}
   try { setText('#decText', ''); } catch {}
   try { setText('#decIntegrity', ''); } catch {}
   try { setText('#decFileErr', ''); } catch {}
   try { setProgress(decBar, 0); } catch {}
 
-  // 2) File input: clear if not preserved (+ filename label)
+  // File input: clear if not preserved (+ filename label)
   if (!preserveFile) {
     try { $('#decFile').value = ''; } catch {}
     try { setText('#decFileName',''); } catch {}
   }
 
-  // 3) Password: clear if not preserved, always re-hide field and reset toggle
+  // Password: clear if not preserved, always re-hide field and reset toggle
   if (!preservePassword) {
     try { $('#decPassword').value = ''; } catch {}
   }
@@ -2151,17 +2135,13 @@ function resetDecryptUI(opts = {}) {
     const t = $('#decPwdToggle'); if (t) { setText(t, 'Show'); t.setAttribute('aria-pressed','false'); }
   } catch {}
 
-  // 4) Hide Decrypt UI sections (results text, progress)
-  try {
-    const decResults = document.getElementById('decResults');
-    const decTextEl  = document.getElementById('decText');
-    if (decResults) decResults.classList.add('hidden');
-    if (decTextEl) decTextEl.hidden = true;
-    const decProgress = document.querySelector('#decBar')?.parentElement;
-    if (decProgress) decProgress.style.display = 'none';
-  } catch {}
+  // Always hide progress bar on reset
+  showProgress('decBar', false);
+  
+  // Hide results container if empty
+  hideIfEmpty('#decOutputs', '#decResults, #decText');
 
-  // 5) Revoke object URLs and remove any blob links/buttons in decResults
+  // Revoke object URLs and remove any blob links/buttons in decResults
   try {
     for (const url of [...__urlsToRevoke]) { try { URL.revokeObjectURL(url); } catch {} __urlsToRevoke.delete(url); }
     const resEl = document.querySelector('#decResults');
@@ -2171,7 +2151,7 @@ function resetDecryptUI(opts = {}) {
     }
   } catch (e) { logWarn('[resetDecryptUI] revoke anchors warn', e); }
 
-  // 6) Recompute Decrypt button state
+  // Recompute Decrypt button state
   try {
     const pw = ($('#decPassword').value || '').trim();
     const file = ($('#decFile').files || [])[0];
@@ -2181,7 +2161,7 @@ function resetDecryptUI(opts = {}) {
     if (btn.disabled) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
   } catch {}
 
-  // 7) Accessibility live message
+  // Accessibility live message
   try { setLive('Decryption UI cleared.'); } catch {}
 }
 
@@ -2225,6 +2205,11 @@ function selectTab(which) {
   if (decResults && decResults.childElementCount > 0) {
     decResults.classList.remove('hidden');
   }
+
+  showProgress('encBar', false);
+  showProgress('decBar', false);
+  hideIfEmpty('#encOutputs', '#encResults');
+  hideIfEmpty('#decOutputs', '#decResults');
 }
 
 /**
@@ -2468,11 +2453,15 @@ async function doEncrypt() {
   let bundleBytes  = null; // memory fallback only
   let plaintextHashHex = null;
   let plaintextIsZip = false;
+
+  showProgress('encBar', true);
+  setProgress(encBar, 5);
+  
   try {
     logInfo('[enc] start');
 
     // Show progress bar during run
-    try { const p = document.querySelector('#encBar')?.parentElement; if (p) p.style.display = 'block'; } catch {}
+    showProgress('encBar', false);
     setProgress(encBar, 5);
 
     // Clear only outputs (keep inputs + password)
@@ -2879,7 +2868,7 @@ async function doEncrypt() {
       await secureFail('Encryption', normalizeEncError(err));
       setProgress(encBar, 0);
     } finally {
-      try { const p = document.querySelector('#encBar')?.parentElement; if (p) p.style.display = 'none'; } catch {}
+      showProgress('encBar', false);
       if (payloadBytes) wipeBytes(payloadBytes);
       if (bundleBytes)  wipeBytes(bundleBytes);
     }
@@ -2920,6 +2909,58 @@ async function computeZipSha256HexForFiles(files, limitBytes) {
   const hex = await sha256Hex(zipU8);
   try { zipU8.fill(0); } catch {}
   return hex;
+}
+
+// === Helpers UI: progress + hide-if-empty + hashes ===
+function showProgress(barId, show) {
+  try {
+    const wrap = document.querySelector(`#${barId}`)?.parentElement;
+    if (wrap) wrap.style.display = show ? 'block' : 'none';
+  } catch {}
+}
+
+function hideIfEmpty(containerSel, contentSelectors) {
+  try {
+    const container = document.querySelector(containerSel);
+    if (!container) return;
+
+    // Resolve selectors (string or array or comma list)
+    let selectors = [];
+    if (typeof contentSelectors === 'string') {
+      selectors = contentSelectors.split(',').map(s => s.trim());
+    } else if (Array.isArray(contentSelectors)) {
+      selectors = contentSelectors;
+    }
+
+    // Collect visible content nodes
+    const nodes = selectors
+      .flatMap(sel => Array.from(document.querySelectorAll(sel)))
+      .filter(Boolean);
+
+    // If no node found → consider empty
+    if (nodes.length === 0) {
+      container.classList.add('hidden');
+      return;
+    }
+
+    // Check emptiness: no children AND no text
+    const isNodeEmpty = (n) => {
+      const hasChildren = n.childElementCount > 0;
+      const hasText = (n.textContent||'').trim().length > 0;
+      return !(hasChildren || hasText);
+    };
+
+    const allEmpty = nodes.every(isNodeEmpty);
+
+    if (allEmpty) {
+      container.classList.add('hidden');
+    } else {
+      container.classList.remove('hidden'); // ✅ new: unhide when content appears
+    }
+
+  } catch (e) {
+    console.warn('[hideIfEmpty] failed:', e);
+  }
 }
 
 // Simple two-line hash display (English, no icons)
@@ -3366,6 +3407,9 @@ async function doDecrypt() {
   let entries = null;
   let decryptBtn = null;
   let prevDisabled = false;
+
+  showProgress('decBar', true);
+  setProgress(decBar, 10);
 
   try {
     logInfo('[dec] start');
