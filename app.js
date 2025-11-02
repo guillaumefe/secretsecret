@@ -2121,8 +2121,8 @@ function resetEncryptUI(opts = {}) {
   // Clear Encrypt-specific outputs and state
   try { clearNode(ids.results); } catch {}
   try { setText(ids.hash, ''); } catch {}
-  document.querySelector(ids.outputs)?.classList.add('hidden'); 
-  document.querySelector(ids.results)?.classList.add('hidden');
+  document.querySelector(ids.outputs)?.classList.add('hidden');
+  document.querySelector(ids.hash)?.classList.add('hidden');
   try { setText('#pwdStrength', ''); } catch {}
   try {
     const barEl = (typeof ids.bar === 'string') ? document.getElementById(ids.bar) : ids.bar;
