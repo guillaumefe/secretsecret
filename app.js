@@ -2182,8 +2182,11 @@ function selectTab(which) {
     decPanel.hidden = false; encPanel.hidden = true;
   }
 
-  // IMPORTANT: do not reset the encrypt/decrypt UIs here — preserve outputs & bundle & hashes.
-  // However, always ensure encryption password is re-hidden after any tab change.
+  try { document.querySelector('#encResults')?.classList.add('hidden'); } catch {}
+  try { document.querySelector('#decResults')?.classList.add('hidden'); } catch {}
+  try { $('#decText') && ($('#decText').hidden = true); } catch {}
+
+  // Always ensure encryption password is re-hidden after any tab change.
   try {
     const encPwd = $('#encPassword');
     const encToggle = $('#encPwdToggle');
@@ -2195,16 +2198,6 @@ function selectTab(which) {
       }
     }
   } catch (e) { /* non-fatal UI tweak */ }
-
-  // Also ensure decrypt preview isn't accidentally visible until a result exists.
-  const decText = $('#decText'), decResults = $('#decResults');
-  if (decText && decText.textContent.trim() === '') {
-    try { decText.hidden = true; } catch {}
-  }
-  // If there is content in decResults (a result was produced), keep it visible across tab switches.
-  if (decResults && decResults.childElementCount > 0) {
-    decResults.classList.remove('hidden');
-  }
 
   showProgress('encBar', false);
   showProgress('decBar', false);
@@ -2462,23 +2455,13 @@ async function doEncrypt() {
     showProgress('encBar', true);
     setProgress(encBar, 5);
 
-    // Show progress bar during run
-    showProgress('encBar', false);
-    setProgress(encBar, 5);
-
     // Clear only outputs (keep inputs + password)
     clearNode('#encResults');
     setText('#encHash','');
     setText('#encPlainHash','');
 
     const out = document.querySelector('#encOutputs');
-    if (out) out.classList.add('hidden');
-    
-    // Hide progress container
-    try {
-      const p = document.querySelector('#encBar')?.parentElement;
-      if (p) p.style.display = 'none';
-    } catch {}
+    if (out) out.classList.add('hidden'); 
 
     const pw = $('#encPassword').value || '';
     if (!pw) throw new EnvelopeError('input', 'missing');
@@ -3235,6 +3218,44 @@ function updateEncryptButtonState() {
   else btn.setAttribute('aria-disabled', 'true');
 }
 
+function hideIfEmpty(containerSel, contentSelectors) {
+  try {
+    const container = document.querySelector(containerSel);
+    if (!container) return;
+
+    // Resolve selectors (string or array or comma list)
+    let selectors = [];
+    if (typeof contentSelectors === 'string') {
+      selectors = contentSelectors.split(',').map(s => s.trim());
+    } else if (Array.isArray(contentSelectors)) {
+      selectors = contentSelectors;
+    }
+
+    // Collect visible content nodes
+    const nodes = selectors
+      .flatMap(sel => Array.from(document.querySelectorAll(sel)))
+      .filter(Boolean);
+
+    // If no node found → consider empty
+    if (nodes.length === 0) {
+      container.classList.add('hidden');
+      return;
+    }
+
+    // Check emptiness: no children AND no text
+    const isNodeEmpty = (n) => {
+      const hasChildren = n.childElementCount > 0;
+      const hasText = (n.textContent || '').trim().length > 0;
+      return !(hasChildren || hasText);
+    };
+
+    const allEmpty = nodes.every(isNodeEmpty);
+
+    container.classList.toggle('hidden', allEmpty);
+  } catch (e) {
+    console.warn('[hideIfEmpty] failed:', e);
+  }
+}
 
 function updateDecryptButtonState() {
   const btn = $('#btnDecrypt');
