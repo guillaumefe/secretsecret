@@ -4696,6 +4696,8 @@ document.addEventListener('DOMContentLoaded', () => {
   // Panel clears
   $('#btnClearEncrypt').addEventListener('click', () => {
        resetEncryptUI();
+       const resultsContainer = $('#resultsContainer');
+       if (resultsContainer) resultsContainer.hidden = true;
        setLive('UI cleared.');
      });
     
@@ -4741,7 +4743,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Panic / Clear all
   const panicBtn = $('#btnPanic');
-  if (panicBtn) panicBtn.addEventListener('click', panicClear);
+  if (panicBtn) panicBtn.addEventListener('click', () => {
+    panicClear();
+    const resultsContainer = $('#resultsContainer');
+    if (resultsContainer) resultsContainer.hidden = true;
+  });
 
   // Dropzones (tap/click selection + drag-and-drop)
   wireDrop('encDrop','encFiles','encFileList');
