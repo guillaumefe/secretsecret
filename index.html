@@ -141,21 +141,35 @@
             <button id="btnEncrypt" class="btn primary" type="button" disabled aria-disabled="true">Encrypt</button>
             <button id="btnClearEncrypt" class="btn secondary" type="button">Clear</button>
           </div>
-
-          <!-- Progressbar nommée + annoncée -->
-          <div class="progress mt-10" aria-label="Encryption progress">
-            <span id="encBarLabel" class="visually-hidden">Encryption progress</span>
-            <div id="encBar" class="bar"
-                 role="progressbar"
-                 aria-labelledby="encBarLabel"
-                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+        
+          <!-- TEXT mode outputs -->
+          <div id="encOutputsText" class="row hidden" role="region" aria-label="Encryption results (Text)">
+            <div class="progress mt-10" aria-label="Encryption progress (Text)">
+              <span id="encBarLabelText" class="visually-hidden">Encryption progress (Text)</span>
+              <div id="encBarText" class="bar"
+                   role="progressbar"
+                   aria-labelledby="encBarLabelText"
+                   aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+            </div>
+        
+            <div id="encResultsText" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="encHashText" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="encPlainHashText" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
           </div>
-
-          <!-- Results container -->
-          <div id="encOutputs" class="row hidden" role="region" aria-label="Encryption results">
-            <div id="encResults" role="status" aria-live="polite" aria-atomic="true"></div>
-            <div id="encHash" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
-            <div id="encPlainHash" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
+        
+          <!-- FILES mode outputs -->
+          <div id="encOutputsFiles" class="row hidden" role="region" aria-label="Encryption results (Files)">
+            <div class="progress mt-10" aria-label="Encryption progress (Files)">
+              <span id="encBarLabelFiles" class="visually-hidden">Encryption progress (Files)</span>
+              <div id="encBarFiles" class="bar"
+                   role="progressbar"
+                   aria-labelledby="encBarLabelFiles"
+                   aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"></div>
+            </div>
+        
+            <div id="encResultsFiles" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="encHashFiles" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
+            <div id="encPlainHashFiles" class="status muted" role="status" aria-live="polite" aria-atomic="true"></div>
           </div>
         </div>
       </section>
