@@ -3083,6 +3083,18 @@ async function doDecrypt() {
         );
       }
       logInfo('[dec] mode=single .cbox');
+
+      // --- SIZE GUARD (single .cbox) ---
+      // dynamic bound based on the device, with a "reasonable" ceiling for a single chunk
+      const capsMax = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_BUNDLE_BYTES; // MAX_BUNDLE_BYTES = MAX_INPUT_BYTES
+      const MAX_CBOX_BYTES_DYNAMIC = Math.min(
+        FIXED_CHUNK_SIZE + (1 * 1024 * 1024), // 4 MiB + 1 MiB margin for headers/overhead
+        capsMax
+      );
+      if (f.size > MAX_CBOX_BYTES_DYNAMIC) {
+        throw new EnvelopeError('input_large', 'Envelope too large for this device');
+      }
+
       const env = new Uint8Array(await f.arrayBuffer());
       logInfo('[dec] single env bytes', { bytes: env.length });
     
@@ -3164,6 +3176,13 @@ async function doDecrypt() {
     if (!name.endsWith(FILE_BUNDLE_EXT)) {
       logWarn('[dec] unsupported file extension', { name });
       throw new EnvelopeError('input', 'unsupported');
+    }
+
+    // --- SIZE GUARD (bundle .cboxbundle) ---
+    // relies on the device capability detected by init(); fallback to the global hard limit
+    const MAX_BUNDLE_BYTES_DYNAMIC = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_BUNDLE_BYTES;
+    if (f.size > MAX_BUNDLE_BYTES_DYNAMIC) {
+      throw new EnvelopeError('input_large', 'Bundle too large for this device');
     }
 
     zipU8 = new Uint8Array(await f.arrayBuffer());
