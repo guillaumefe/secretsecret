@@ -3951,7 +3951,8 @@ async function doDecrypt() {
       if (manifest.wholePlainHash) {
         const whole = await sha256Hex(offeredBytes);
         const ok = timingSafeEqual(whole, manifest.wholePlainHash);
-        setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
+        //setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
+        setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
       } else {
         setText('#decIntegrity', wantTrim ? 'Integrity: chunk-level verified (unpadded written).'
                                           : 'Integrity: chunk-level verified.');
