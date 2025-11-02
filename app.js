@@ -46,27 +46,18 @@ const MAX_PREVIEW = 1 * 1024 * 1024;
 
   // Shared validator for allowed ScriptURLs
   const allowScriptURL = (url) => {
-    // Resolve relative paths correctly, including subfolder deployments
     const u = new URL(url, location.href);
-
-    // 1) Enforce same-origin URLs only
-    if (u.origin !== location.origin) {
-      throw new TypeError('TrustedTypes: only same-origin ScriptURL allowed');
-    }
-
-    // 2) Whitelist only the expected JS assets
+    if (u.origin !== location.origin) throw new TypeError('TrustedTypes: only same-origin ScriptURL allowed');
+    if (u.search || u.hash) throw new TypeError('TrustedTypes: query/hash not allowed for ScriptURL');
     const p = u.pathname;
-    const allowed =
-      p.endsWith('/app.js') ||
-      p.endsWith('/argon-worker.js') ||
-      p.endsWith('/argon-worker-permissive.js') ||
-      p.endsWith('/argon2-bundled.min.js');
-
-    if (!allowed) {
-      throw new TypeError('TrustedTypes: ScriptURL path not whitelisted: ' + p);
-    }
-
-    return u.toString(); // Safe normalized ScriptURL string
+    const allowed = new Set([
+      '/app.js',
+      '/argon-worker.js',
+      '/argon-worker-permissive.js',
+      '/argon2-bundled.min.js'
+    ]);
+    if (!allowed.has(p)) throw new TypeError('TrustedTypes: ScriptURL path not whitelisted: ' + p);
+    return u.toString();
   };
 
   // Create the "default" policy if not already defined
@@ -181,9 +172,19 @@ function u32le(n) {
  * Silent in production by default.
  */
 const DEBUG = location.hostname === 'localhost';
+function redacted(o) {
+  if (DEBUG) return o;
+  if (o && typeof o === 'object') {
+    const c = { ...o };
+    if ('fileName' in c) c.fileName = '[redacted]';
+    if ('meta' in c) c.meta = '[redacted]';
+    return c;
+  }
+  return o;
+}
 function logError(...args) { if (DEBUG) { try { console.error(...args); } catch {} } }
-function logWarn (...args) { if (DEBUG) { try { console.warn (...args); } catch {} } }
-function logInfo (...args) { if (DEBUG) { try { console.info (...args); } catch {} } }
+function logWarn (...args) { if (DEBUG) { try { console.warn (...args.map(redacted)); } catch {} } }
+function logInfo (...args) { if (DEBUG) { try { console.info (...args.map(redacted)); } catch {} } }
 function showErrorBanner(text) {
   const el = document.getElementById('errBanner');
   if (!el) return;
@@ -636,14 +637,11 @@ async function startArgonWorker(url) {
         : {
             createScriptURL: (u) => {
               const abs = new URL(u, location.href);
-              // Allow only same-origin + specific worker script files
-              const okOrigin = abs.origin === location.origin;
-              const okPath =
-                abs.pathname.endsWith('/argon-worker.js') ||
-                abs.pathname.endsWith('/argon-worker-permissive.js');
-              if (!okOrigin || !okPath) {
-                throw new EnvelopeError('worker_url_blocked', 'Rejected Worker ScriptURL', { fileName: abs.pathname });
-              }
+              if (abs.origin !== location.origin) throw new EnvelopeError('worker_url_blocked','Cross-origin worker blocked',{fileName:abs.pathname});
+              if (abs.search || abs.hash) throw new EnvelopeError('worker_url_blocked','Worker URL cannot have query/hash',{fileName:abs.pathname});
+              const okPath = abs.pathname.endsWith('/argon-worker.js') ||
+                             abs.pathname.endsWith('/argon-worker-permissive.js');
+              if (!okPath) throw new EnvelopeError('worker_url_blocked','Worker path not whitelisted',{fileName:abs.pathname});
               return abs.toString();
             }
           };
@@ -2373,8 +2371,7 @@ function chunkFixedGeneric(u8) {
 }
 
 async function computeCrcAndSizeFromFile(file) {
-  let crc = 0xFFFFFFFF ^ 0xFFFFFFFF; // just pour type
-  crc = 0xFFFFFFFF; // standard init
+  let crc = 0xFFFFFFFF; // standard init
   let size = 0;
   const reader = file.stream().getReader();
   while (true) {
@@ -2450,14 +2447,77 @@ async function doEncrypt() {
         throw new EnvelopeError('input_large', 'Input too large for this device');
       }
 
+      // --- Privacy: optional size padding (bucket) ---
+      const PAD_TO = 8 * 1024 * 1024;      // 8 MiB bucket
+      const enableSizePadding = true;      // toggle on hardened builds as needed
+      
+      // Keep the real length for manifest/UX
+      const realPlainLen = payloadBytes.length;
+      
+      // (Optional) whole-plaintext hash over the *real* content only
+      const wholeHashHexReal = await sha256Hex(payloadBytes);
+
+      const originalBytes = payloadBytes;  // keep reference so we can revert cleanly
+      let sizePadded = false;              // explicit init
+      
+      if (enableSizePadding) {
+        const paddedLen    = Math.ceil(realPlainLen / PAD_TO) * PAD_TO;
+        const needPadBytes = Math.max(0, paddedLen - realPlainLen);
+      
+        // Quick exit: no padding needed
+        if (needPadBytes === 0) {
+          sizePadded = false; // explicit: nothing added
+        } else {
+          // Preflight device cap BEFORE allocating
+          const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
+          if (paddedLen > maxIn) {
+            const overBy = paddedLen - maxIn;
+            const msg =
+              'The padded message exceeds the device limit.\n\n' +
+              `• Real length: ${realPlainLen} bytes\n` +
+              `• Padded length: ${paddedLen} bytes (over by ${overBy} bytes)\n\n` +
+              'Do you want to disable size padding and proceed with the real length instead?';
+            const proceed = await promptUserConfirm(msg);
+      
+            if (!proceed) {
+              throw new EnvelopeError('input_large', 'Input too large for this device after padding');
+            }
+      
+            // Revert cleanly to original bytes (no new alloc, no subarray view)
+            payloadBytes = originalBytes;
+            sizePadded = false;
+            logWarn('[enc] padding disabled due to device cap; proceeding with realPlainLen');
+            setLive('Size padding disabled to fit device limit.');
+          } else {
+            // Now we know we can safely allocate the padded buffer
+            const pad = new Uint8Array(needPadBytes);
+            crypto.getRandomValues(pad);
+      
+            const combined = new Uint8Array(paddedLen);
+            combined.set(originalBytes, 0);
+            combined.set(pad, realPlainLen);
+      
+            try { pad.fill(0); } catch {}
+      
+            // Swap in padded payload
+            payloadBytes = combined;
+            sizePadded = true;
+      
+            // Wipe the previous (smaller) buffer if it contained sensitive data
+            try { originalBytes.fill(0); } catch {}
+          }
+        }
+      }
+      
+      // From here, totalPlainLen reflects the *padded* length
       const totalPlainLen = payloadBytes.length;
       const chunks = chunkFixed(payloadBytes);
       const totalChunks = chunks.length;
-
+      
       // Anti-replay binding and bundle-level KDF
       const bundleIdBytes = crypto.getRandomValues(new Uint8Array(16));
       const bundleId = b64(bundleIdBytes);
-
+      
       /* ******************************************************
        * One-time bundle KDF (Argon2id once → HKDF split)
        ****************************************************** */
@@ -2465,21 +2525,23 @@ async function doEncrypt() {
       const master32   = await deriveArgon2id(password, bundleSalt, tunedParams);
       const { kEnc32, kIv32 } = await hkdfSplit(master32, bundleSalt);
       const K_ENC = await importAesKey(kEnc32);
-
+      
       /* ******************************************************
        * Chunk sealing (deterministic IVs via HKDF, no per-chunk Argon2)
        ****************************************************** */
       const sealedParts = [];
       const perChunkHashes = [];
       setProgress(encBar, 15);
-
-      // Compute whole-plaintext hash once
-      const wholeHashHex = await sha256Hex(payloadBytes);
-
+      
+      // If you still need a whole-plaintext hash in the manifest, prefer the REAL one:
+      // const wholeHashHex = wholeHashHexReal;
+      
       for (let i = 0; i < totalChunks; i++) {
         const c = chunks[i];
         const isLast   = (i === totalChunks - 1);
-        const sliceEnd = isLast ? (totalPlainLen - (FIXED_CHUNK_SIZE * (totalChunks - 1))) : FIXED_CHUNK_SIZE;
+        const sliceEnd = isLast
+          ? (totalPlainLen - (FIXED_CHUNK_SIZE * (totalChunks - 1)))
+          : FIXED_CHUNK_SIZE;
         const slice    = c.subarray(0, sliceEnd);
 
         perChunkHashes.push(await sha256Hex(slice));
@@ -2506,18 +2568,42 @@ async function doEncrypt() {
       /* ******************************************************
        * MANIFEST (includes bundleSaltB64) sealed with bundle keys
        ****************************************************** */
+      if (!Number.isSafeInteger(totalPlainLen) || !Number.isSafeInteger(realPlainLen)) {
+        throw new EnvelopeError('bad_len', 'Length not a safe integer');
+      }
+      
       const manifestInner = {
         v: 1, kind: 'manifest',
+      
+        // Binding
         bundleId,
         bundleSaltB64: b64(bundleSalt),
+      
+        // Chunking
         chunkSize: FIXED_CHUNK_SIZE,
-        totalPlainLen,
+        totalPlainLen,                 // effective (maybe padded)
         totalChunks,
         chunkHashes: perChunkHashes,
-        wholePlainHash: wholeHashHex,
+      
+        // Integrity of REAL content (unpadded)
+        wholePlainHash: wholeHashHexReal,   // sha256(real content)
+        hashAlg: 'sha256',
+      
+        // Padding metadata
+        realPlainLen,
+        sizePadded: (typeof sizePadded === 'boolean') ? sizePadded : true,
+        padBytes: Math.max(0, totalPlainLen - realPlainLen),
+        padBucket: 8 * 1024 * 1024,         // if stable
+      
+        // Crypto descriptor (doc)
+        aead: 'AES-256-GCM',
+        kdf: { outer: 'Argon2id', split: 'HKDF' },
+      
+        // Provenance
         source: { kind: 'text', files: null },
         createdAt: new Date().toISOString()
       };
+      
       const manifestBytes  = TE.encode(JSON.stringify(manifestInner));
       const manChunksClear = chunkFixedGeneric(manifestBytes);
       const manSealedParts = [];
@@ -2598,6 +2684,9 @@ async function doEncrypt() {
 
       const bundleHash = await sha256Hex(bundleZip);
       renderBundleHash('#encHash', bundleHash);
+
+      // Display unpadded plaintext hash for user confidence
+      setText('#encPlainHash', `SHA-256 (unpadded): ${wholeHashHexReal}`);
 
       setProgress(encBar, 100);
       setLive('Encryption complete.');
@@ -2799,7 +2888,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
         const { value, done } = await r.read();
         if (done) break;
         const u8 = value instanceof Uint8Array ? value : new Uint8Array(value);
-        plainTotalLen += u8.length;               // ✅ important: update clear size
+        plainTotalLen += u8.length;               // important: update clear size
         await feedPlain(u8, false);
       }
     } finally {
@@ -2835,7 +2924,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     // write CD + EOCD of clear ZIP (into pipe also)
     const zipPlainFinalBytes = await zipPlainWriter.finish();
     if (zipPlainFinalBytes && zipPlainFinalBytes.length) {
-      plainTotalLen += zipPlainFinalBytes.length; // ✅ consistent with multi-files path
+      plainTotalLen += zipPlainFinalBytes.length;
       await feedPlain(zipPlainFinalBytes, false);
     }
     // signal end to chunker
@@ -2844,18 +2933,40 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
 
   // 3) MANIFEST + INDEX (small → RAM OK)
   /* ******************************************************
-  * MANIFEST sealing (streaming path) with bundle-level keys
-  ****************************************************** */
+   * MANIFEST sealing (streaming path) with bundle-level keys
+   ****************************************************** */
+  if (!Number.isSafeInteger(plainTotalLen) || !Number.isSafeInteger(partIndex)) {
+    throw new EnvelopeError('bad_len', 'Length not a safe integer');
+  }
+  
   const manifestInner = {
     v: 1,
     kind: 'manifest',
+  
+    // Binding
     bundleId,
     bundleSaltB64: b64(bundleSalt),
+  
+    // Chunking
     chunkSize: FIXED_CHUNK_SIZE,
     totalPlainLen: plainTotalLen,
     totalChunks: partIndex,
     chunkHashes: perChunkHashes,
+  
+    // Whole-file hash not computed in streaming
     wholePlainHash: null,
+    hashAlg: 'sha256',
+  
+    // Padding disabled on this path
+    realPlainLen: plainTotalLen,
+    sizePadded: false,
+    padBytes: 0,
+  
+    // Crypto descriptor (doc)
+    aead: 'AES-256-GCM',
+    kdf: { outer: 'Argon2id', split: 'HKDF' },
+  
+    // Provenance
     source: { kind: 'files', files: sourceFilesMeta },
     createdAt: new Date().toISOString()
   };
@@ -3537,6 +3648,23 @@ async function doDecrypt() {
       throw new EnvelopeError('bad_manifest', 'Manifest salt does not match header');
     }
 
+    // ===== Padding-aware manifest checks =====
+    const hasReal = Object.prototype.hasOwnProperty.call(manifest, 'realPlainLen');
+    const realLen = Number(manifest.realPlainLen);
+    const totalLen = Number(manifest.totalPlainLen);
+    
+    if (hasReal) {
+      if (!Number.isFinite(realLen) || realLen < 0) {
+        throw new EnvelopeError('bad_manifest_len', 'Invalid realPlainLen');
+      }
+      if (realLen > totalLen) {
+        throw new EnvelopeError('bad_manifest_len', 'realPlainLen exceeds totalPlainLen');
+      }
+      if (manifest.sizePadded === false && realLen !== totalLen) {
+        throw new EnvelopeError('bad_manifest_len', 'Unexpected size mismatch for unpadded bundle');
+      }
+    }
+
     /* ******************************************************
      * Validate indices (data parts)
      ****************************************************** */
@@ -3601,6 +3729,16 @@ async function doDecrypt() {
     }
     
     const plainSink = await getPlainSink(outName);
+    
+    // ===== Prepare trimming (remove size padding on decrypt) =====
+    const wantTrim =
+      hasReal &&
+      Number.isFinite(realLen) &&
+      realLen >= 0 &&
+      realLen <= totalLen;
+    
+    let remainingToWrite = wantTrim ? realLen : totalLen;
+    logInfo('[dec] trim setup', { wantTrim, realLen, totalLen });
 
     /* ******************************************************
      * Decrypt, verify and stream each data chunk
@@ -3668,8 +3806,22 @@ async function doDecrypt() {
         }
       }
       
-      await plainSink.write(slice);
-      written += slice.length;
+      // Write only unpadded plaintext
+      let toWrite = slice.length;
+      if (wantTrim) {
+        toWrite = Math.min(toWrite, Math.max(0, remainingToWrite));
+      }
+      
+      if (toWrite > 0) {
+        await plainSink.write(slice.subarray(0, toWrite));
+        written += toWrite;
+        if (wantTrim) remainingToWrite -= toWrite;
+      }
+      
+      if (wantTrim && remainingToWrite <= 0) {
+        try { opened.fixedChunk.fill(0); } catch {}
+        break;
+      }
 
       try { opened.fixedChunk.fill(0); } catch {}
 
@@ -3691,10 +3843,14 @@ async function doDecrypt() {
      ****************************************************** */
     if (plainSink instanceof SegmentsSink) {
       const u8 = plainSink.toUint8Array();
-    
+      // Defensive trim for memory fallback
+      let offeredBytes = u8;
+      if (hasReal && realLen <= offeredBytes.length) {
+        offeredBytes = offeredBytes.subarray(0, realLen);
+      }
+      
       // Attempt to rebuild a ZIP with original filenames using the encrypted manifest mapping.
       // If this is not a multi-file package or rebuild fails, fall back to the current behavior.
-      let offeredBytes = u8;
       let offeredMime =
         (manifest?.source?.kind === 'files' && manifest.source.files?.length > 1)
           ? 'application/zip'
@@ -3748,14 +3904,16 @@ async function doDecrypt() {
       if (manifest.wholePlainHash) {
         const whole = await sha256Hex(offeredBytes);
         const ok = timingSafeEqual(whole, manifest.wholePlainHash);
-        logInfo('[dec] whole hash check', { ok });
-        setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
+        setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
       } else {
-        setText('#decIntegrity', 'Integrity: chunk-level verified.');
+        setText('#decIntegrity', wantTrim ? 'Integrity: chunk-level verified (unpadded written).'
+                                          : 'Integrity: chunk-level verified.');
       }
     } else {
       // Saved directly to disk
-      setText('#decIntegrity', 'Integrity: chunk-level verified (saved to disk).');
+      setText('#decIntegrity', wantTrim
+        ? 'Integrity: chunk-level verified (unpadded written to disk).'
+        : 'Integrity: chunk-level verified (saved to disk).');
       const decResults = document.getElementById('decResults');
       if (decResults) decResults.classList.remove('hidden');
     }
