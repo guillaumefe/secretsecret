@@ -1759,6 +1759,81 @@ function looksLikeUtf8Text(u8) {
   return ascii >= ctrl * 4;
 }
 
+// ---------------------------
+// Filename & content checks
+// ---------------------------
+
+// Dangerous executable extensions (case-insensitive)
+const DANGEROUS_EXT = /\.(exe|msi|bat|cmd|com|scr|ps1|psm1|vbs|js|jse|wsf|sh|apk|app|pkg|dmg|elf|msc)$/i;
+
+// BiDi / control characters often abused to hide extension
+const BIDI_CTRL = /[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+
+/**
+ * Returns { ok: boolean, why: string } describing suspicious filename heuristics.
+ */
+function hasSuspiciousName(name) {
+  if (!name || typeof name !== 'string') return { ok: false, why: 'No filename suggested' };
+  const s = name.normalize('NFKC');
+
+  if (BIDI_CTRL.test(s)) return { ok: false, why: 'Filename contains special Unicode control characters' };
+  if (/[ \.]{2,}$/.test(s)) return { ok: false, why: 'Filename ends with ambiguous whitespace/dots' };
+  if (DANGEROUS_EXT.test(s)) return { ok: false, why: 'Filename suggests an executable or installer' };
+
+  const parts = s.split('.');
+  if (parts.length >= 3) {
+    const last = parts[parts.length - 1];
+    const prev = parts[parts.length - 2];
+    if (DANGEROUS_EXT.test('.' + last) && /^(pdf|docx?|xlsx?|pptx?|jpg|jpeg|png|txt|rtf|csv|zip)$/i.test(prev)) {
+      return { ok: false, why: 'Filename contains a double extension that can be misleading' };
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Heuristic binary signature checks for common executable formats:
+ * - PE (MZ), ELF, Mach-O, shebang scripts.
+ * Returns true if the sample looks like an executable or script.
+ */
+function looksExecutableBytes(u8) {
+  if (!(u8 && u8.length >= 4)) return false;
+
+  // PE "MZ"
+  if (u8[0] === 0x4D && u8[1] === 0x5A) return true;
+
+  // ELF 0x7F 'E' 'L' 'F'
+  if (u8[0] === 0x7F && u8[1] === 0x45 && u8[2] === 0x4C && u8[3] === 0x46) return true;
+
+  // Mach-O / Universal magic numbers (various values)
+  const readU32 = (off) => {
+    if (off + 3 >= u8.length) return null;
+    return (u8[off] << 24) | (u8[off + 1] << 16) | (u8[off + 2] << 8) | (u8[off + 3]);
+  };
+  const magic = readU32(0);
+  const MACHO_MAGICS = new Set([0xFEEDFACE, 0xCAFEBABE, 0xFEEDFACF, 0xCEFAEDFE, 0xBEBAFECA, 0xCFFAEDFE]);
+  if (MACHO_MAGICS.has(magic)) return true;
+
+  // Shebang for scripts "#!"
+  if (u8[0] === 0x23 && u8[1] === 0x21) return true;
+
+  return false;
+}
+
+/**
+ * Minimal prompt wrapper that returns a Promise<boolean>:
+ * true = user chose to continue; false = abort.
+ */
+function promptUserConfirm(message) {
+  return new Promise((resolve) => {
+    try {
+      const ok = window.confirm(message + '\n\nPress OK to continue, Cancel to stop.');
+      resolve(Boolean(ok));
+    } catch {
+      resolve(false);
+    }
+  });
+}
 
 
 // ===== UI state =====
@@ -3437,19 +3512,50 @@ async function doDecrypt() {
       return new SegmentsSink(); // memory fallback
     }
 
-    // Suggested output filename
-    const outName =
-    (manifest?.source?.kind === 'files' && Array.isArray(manifest.source.files) && manifest.source.files.length > 1)
-        ? 'files.zip'
-        : (manifest?.source?.kind === 'text'
-            ? 'decrypted.txt'
-            : (manifest?.source?.files?.[0]?.name || 'decrypted.bin'));
-
+    // Suggested output filename (original intent)
+    let outName =
+      (manifest?.source?.kind === 'files' && Array.isArray(manifest.source.files) && manifest.source.files.length > 1)
+          ? 'files.zip'
+          : (manifest?.source?.kind === 'text'
+              ? 'decrypted.txt'
+              : (manifest?.source?.files?.[0]?.name || 'decrypted.bin'));
+    
+    // Filename heuristic: warn user if suggested name looks suspicious and allow abort.
+    // If user continues, replace the suggested name with a safe default (zip/txt/bin).
+    const nameCheck = hasSuspiciousName(outName);
+    if (!nameCheck.ok) {
+      const msg = `Warning: suggested filename looks suspicious: ${nameCheck.why}\n\n` +
+                  `If you continue, a safe filename will be used for saving.`;
+      const cont = await promptUserConfirm(msg);
+      if (!cont) {
+        throw new EnvelopeError('user_abort', 'User cancelled due to suspicious filename');
+      }
+      // Force safe default
+      if (manifest?.source?.kind === 'files' && manifest.source.files.length > 1) outName = 'files.zip';
+      else if (manifest?.source?.kind === 'text') outName = 'decrypted.txt';
+      else outName = 'decrypted.bin';
+    }
+    
+    // Additional manifest-level check: warn if declared source files include executable-like names.
+    if (Array.isArray(manifest?.source?.files) && manifest.source.files.length > 0) {
+      for (const sf of manifest.source.files) {
+        const fname = String(sf?.name || '');
+        if (DANGEROUS_EXT.test(fname)) {
+          const msg = `Warning: package contains file named "${fname}", which appears to be an executable.\n\n` +
+                      `Press OK to continue and save decrypted output, or Cancel to abort.`;
+          const cont = await promptUserConfirm(msg);
+          if (!cont) throw new EnvelopeError('user_abort', 'User cancelled due to executable file in manifest');
+          break;
+        }
+      }
+    }
+    
     const plainSink = await getPlainSink(outName);
 
     /* ******************************************************
      * Decrypt, verify and stream each data chunk
      ****************************************************** */
+    let warnedAboutExecutable = false;
     let written = 0;
     for (let i = 0; i < manifest.totalChunks; i++) {
       const entry = byName.get(`part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
@@ -3497,7 +3603,21 @@ async function doDecrypt() {
         logWarn('[dec] data hash mismatch', { i });
         throw new EnvelopeError('hash_mismatch', `Chunk ${i}: unexpected hash`);
       }
-
+      
+      // User warning: content appears executable/script; OK to continue, Cancel to stop.
+      if (!warnedAboutExecutable) {
+        const sample = slice.subarray(0, Math.min(slice.length, 4096));
+        if (looksExecutableBytes(sample)) {
+          const cont = await promptUserConfirm(
+            'The decrypted content appears to be an executable or script. Opening or running such files can be dangerous.'
+          );
+          if (!cont) throw new EnvelopeError('user_abort', 'User cancelled after executable warning');
+          if (!outName || !outName.endsWith('.zip')) outName = 'decrypted.bin';
+          showErrorBanner('Caution: executable-like content detected. Proceeding as binary.');
+          warnedAboutExecutable = true;
+        }
+      }
+      
       await plainSink.write(slice);
       written += slice.length;
 
