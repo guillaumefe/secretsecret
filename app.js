@@ -30,8 +30,6 @@ const ARGON_MAX_T        = 10;
 // Max amount of text we render directly in the UI (1 MiB)
 const MAX_PREVIEW = 1 * 1024 * 1024;
 
-let encBusy = false;
-
 // ===== Trusted Types setup (default + worker-url) ===============================
 // CSP expectations:
 //   require-trusted-types-for 'script';
@@ -398,23 +396,6 @@ function setText(selOrEl, text) {
 
 
 
-// ===== Errors =====
-
-/**
- * Custom error type for envelope/ZIP/KDF related errors.
- */
-+class EnvelopeError extends Error {
-    constructor(code, message, opts) {
-      // support native Error cause (Chrome/Firefox)
-      super(message, opts && opts.cause ? { cause: opts.cause } : undefined);
-      this.name = 'EnvelopeError';
-      this.code = code;
-      if (opts?.fileName) this.fileName = opts.fileName;
-    }
-  }
-
-
-
 // ===== Accessibility helpers =====
 
 /**
@@ -665,18 +646,6 @@ async function startArgonWorker(url) {
           // Erreur de construction du Worker (CSP/TT/URL)
           throw new EnvelopeError('worker_init', 'Failed to construct Argon2 worker', { cause: e, fileName: url });
       }
-
-      w.onerror = (ev) => {
-        if (settled) return;
-        settled = true;
-        reject(new EnvelopeError('worker_runtime', 'Worker runtime error', { cause: ev.error || ev, fileName: url }));
-      };
-      
-      w.onmessageerror = (ev) => {
-        if (settled) return;
-        settled = true;
-        reject(new EnvelopeError('worker_runtime', 'Worker message error', { cause: ev.error || ev, fileName: url }));
-      };
       
     } catch (syncErr) {
       // CSP/TT/URL can block synchronously
@@ -704,26 +673,22 @@ async function startArgonWorker(url) {
     };
 
     w.addEventListener('message', onMsg);
-
-    w.onerror = (e) => {
+    
+    w.addEventListener('error', (e) => {
       if (!settled) {
-        settled = true;
-        clearTimeout(to);
+        settled = true; clearTimeout(to);
         try { w.terminate(); } catch {}
-        const err = (e && e.error) || new Error(e && e.message ? e.message : 'worker_error');
-        reject(err);
+        reject((e && e.error) || new Error(e?.message || 'worker_error'));
       }
-    };
-
-    // Optional: capture message deserialization errors
-    w.onmessageerror = (e) => {
+    });
+    
+    w.addEventListener('messageerror', (e) => {
       if (!settled) {
-        settled = true;
-        clearTimeout(to);
+        settled = true; clearTimeout(to);
         try { w.terminate(); } catch {}
         reject(new Error('worker_message_error'));
       }
-    };
+    });
 
     w.postMessage({ cmd: 'init', payload: { jsURL: ARGON2_JS_PATH, wasmURL: ARGON2_WASM_PATH } });
   });
@@ -1017,7 +982,7 @@ async function sealFixedChunkDet({
  *      - kIv32 (HKDF IV key) to rebuild IV deterministically
  *  - Verifies bundleId and inner meta
  ****************************************************** */
-async function openFixedChunkDet({ kEncKey, kIv32, bytes, expectedBundleId, chunkIndex }) {
+async function openFixedChunkDet({ kEncKey, kIv32, bytes, expectedBundleId, chunkIndex, domain = 'data' }) {
   /* ******************************************************
    * Strict header: MAGIC + meta length field guard
    ****************************************************** */
@@ -1064,7 +1029,7 @@ async function openFixedChunkDet({ kEncKey, kIv32, bytes, expectedBundleId, chun
   /* ******************************************************
    * Deterministic IV for this chunk
    ****************************************************** */
-  const ivU8 = await deriveIv96(kIv32, meta.bundleId || '', chunkIndex >>> 0);
+  const ivU8 = await deriveIv96(kIv32, meta.bundleId || '', chunkIndex >>> 0, domain);
 
   /* ******************************************************
    * Decrypt and parse inner prelude
@@ -2577,7 +2542,6 @@ async function doEncrypt() {
       try { const p = document.querySelector('#encBar')?.parentElement; if (p) p.style.display = 'none'; } catch {}
       if (payloadBytes) wipeBytes(payloadBytes);
       if (bundleBytes)  wipeBytes(bundleBytes);
-      encBusy = false;
     }
 }
 
@@ -2653,7 +2617,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       bundleId,
       payloadChunk: fixedChunk,
       chunkIndex: partIndex,
-      totalChunks: 0,
+      totalChunks: isLastChunk ? (partIndex + 1) : 0,
       totalPlainLen: isLastChunk ? plainTotalLen : 0,
       domain: 'data'
     });    
@@ -2955,7 +2919,6 @@ async function tryRenderOrDownload(bytes, containerSel, textSel) {
 
 
 
-
 // ===== Decrypt flow (manifest + strict checks) =====
 
 /* ******************************************************
@@ -3070,8 +3033,11 @@ async function doDecrypt() {
 
       if (meta.kind !== 'fixed') throw new EnvelopeError('kind', 'Unexpected type');
 
-      const idx = meta.chunkIndex|0, total = meta.totalChunks|0, fixed = opened.fixedChunk;
-      if (idx !== 0 || total !== 1) throw new EnvelopeError('idx_single', 'Inconsistent index/total');
+      const idx = meta.chunkIndex|0;
+      const total = meta.totalChunks|0;
+      if (total > 0 && (idx < 0 || idx >= total)) {
+        throw new EnvelopeError('idx_range', 'Chunk index out of range');
+      }
 
       if (!Number.isFinite(meta.totalPlainLen) ||
           meta.totalPlainLen < 0 ||
@@ -3080,7 +3046,7 @@ async function doDecrypt() {
       }
 
       const sliceEnd = meta.totalPlainLen|0;
-      const payload  = fixed.subarray(0, sliceEnd);
+      const payload  = opened.fixedChunk.subarray(0, sliceEnd);
       logInfo('[dec] single payload', { sliceEnd });
 
       // Preview or download
@@ -3196,7 +3162,8 @@ async function doDecrypt() {
         kIv32,
         bytes: idxEntries[i].bytes,
         expectedBundleId,
-        chunkIndex: i
+        chunkIndex: i,
+        domain: 'index'
       });
 
       const inner = opened.innerMeta;
@@ -3272,7 +3239,8 @@ async function doDecrypt() {
         kIv32,
         bytes: entry.bytes,
         expectedBundleId,
-        chunkIndex: i
+        chunkIndex: i,
+        domain: 'manifest'
       });
 
       const inner = opened.innerMeta;
@@ -3396,7 +3364,8 @@ async function doDecrypt() {
         kIv32,
         bytes: entry.bytes,
         expectedBundleId,
-        chunkIndex: i
+        chunkIndex: i,
+        domain: 'data'
       });
 
       const inner  = opened.innerMeta;
@@ -3769,11 +3738,11 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
   
-    encBusy = true;            // <— active le flag ici
+    encBusy = true;
     try {
-      await doEncrypt();       // <— doEncrypt() ne touche plus à encBusy
+      await doEncrypt();
     } finally {
-      encBusy = false;         // <— reset ici
+      encBusy = false;
       btn.disabled = false;
     }
   });
