@@ -84,11 +84,16 @@ const MAX_PREVIEW = 1 * 1024 * 1024;
 
   // Create a dedicated "worker-url" policy (allowed by CSP)
   try {
-    trustedTypes.createPolicy('worker-url', {
+    const p = trustedTypes.createPolicy('worker-url', {
       createScriptURL: allowScriptURL,
     });
+    // Cache for later use so other code can reuse this policy safely
+    try { window.__workerUrlPolicy = p; } catch {}
   } catch (e) {
     try { console.warn('[TT] worker-url policy not installed (may already exist):', e); } catch {}
+    // If the policy already exists, attempt to read it from a cached handle
+    // (another script may have created and cached it earlier)
+    // No throw here to avoid breaking worker startup later.
   }
 })();
 
@@ -625,21 +630,23 @@ async function startArgonWorker(url) {
     let w;
     try {
       // Trusted Types policy for Worker script URLs
-      const workerPolicy = (window.trustedTypes && trustedTypes.createPolicy('worker-url', {
-        createScriptURL: (u) => {
-          const abs = new URL(u, location.href);
-          // Allow only same-origin + specific worker script files
-          const okOrigin = abs.origin === location.origin;
-          const okPath =
-            abs.pathname.endsWith('/argon-worker.js') ||
-            abs.pathname.endsWith('/argon-worker-permissive.js');
-          if (!okOrigin || !okPath) {
-            throw new EnvelopeError('worker_url_blocked', 'Rejected Worker ScriptURL', { fileName: abs.pathname });
-          }
-          return abs.toString();
-        }
-      })) || { createScriptURL: (u) => u }; // Fallback when Trusted Types is unavailable
- 
+      // Reuse the previously created policy when available; otherwise apply the same whitelist logic.
+      const workerPolicy = (window.trustedTypes && window.__workerUrlPolicy)
+        ? window.__workerUrlPolicy
+        : {
+            createScriptURL: (u) => {
+              const abs = new URL(u, location.href);
+              // Allow only same-origin + specific worker script files
+              const okOrigin = abs.origin === location.origin;
+              const okPath =
+                abs.pathname.endsWith('/argon-worker.js') ||
+                abs.pathname.endsWith('/argon-worker-permissive.js');
+              if (!okOrigin || !okPath) {
+                throw new EnvelopeError('worker_url_blocked', 'Rejected Worker ScriptURL', { fileName: abs.pathname });
+              }
+              return abs.toString();
+            }
+          };
       try {
           w = new Worker(workerPolicy.createScriptURL(url));
       } catch (e) {
@@ -1767,7 +1774,7 @@ function looksLikeUtf8Text(u8) {
 const DANGEROUS_EXT = /\.(exe|msi|bat|cmd|com|scr|ps1|psm1|vbs|js|jse|wsf|sh|apk|app|pkg|dmg|elf|msc)$/i;
 
 // BiDi / control characters often abused to hide extension
-const BIDI_CTRL = /[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+const BIDI_CTRL = /[\u0000-\u001F\u007F\u200E\u200F\u202A-\u202E\u2066-\u2069]/;
 
 /**
  * Returns { ok: boolean, why: string } describing suspicious filename heuristics.
