@@ -2550,15 +2550,21 @@ async function doEncrypt() {
 
     const mode = getEncMode();
     const ids  = encIds(mode);
+
+    // Hide the inactive outputs explicitly
+    const other = encIds(mode === 'text' ? 'files' : 'text');
+    document.querySelector(other.outputs)?.classList.add('hidden');
+    
+    // Show the active one (so progress is visible)
+    const out = document.querySelector(ids.outputs);
+    out?.classList.remove('hidden');
+    out?.classList.add('visible');
     
     showEncProgress(mode, true);
     setProgress(document.getElementById(ids.bar), 5); 
 
     clearNode(ids.results);
     setText(ids.hash, '');
-
-    const out = document.querySelector(ids.outputs);
-    if (out) out.classList.add('hidden'); 
 
     const pw = $('#encPassword').value || '';
     if (!pw) throw new EnvelopeError('input', 'missing');
