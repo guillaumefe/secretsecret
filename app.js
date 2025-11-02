@@ -2666,35 +2666,58 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     }
   }
 
-  // 2b) Construire le ZIP clair “en flux” et l’envoyer vers feedPlain
-  //     (deux passes par fichier pour CRC+taille, puis data)
+  // 2b) Construire la source claire → selon 1 fichier vs plusieurs
   const sourceFilesMeta = [];
-  const zipPlainWriter = new StoreZipWriter({
-    write: async (u8) => {
-      plainTotalLen += u8.length;
-      await feedPlain(u8, false);
+
+  if (files.length === 1) {
+    // === FAST-PATH 1 FICHIER : pas de ZIP clair, on chiffre directement le contenu du fichier ===
+    const f = files[0];
+    sourceFilesMeta.push({ name: f.name, type: f.type }); // on conserve le type pour le MIME en sortie
+
+    const r = f.stream().getReader();
+    try {
+      while (true) {
+        const { value, done } = await r.read();
+        if (done) break;
+        const u8 = value instanceof Uint8Array ? value : new Uint8Array(value);
+        plainTotalLen += u8.length;                // ✅ important : mettre à jour la taille claire
+        await feedPlain(u8, false);
+      }
+    } finally {
+      try { r.releaseLock?.(); } catch {}
     }
-  });
+    await feedPlain(new Uint8Array(0), true);      // flush final
 
-  // stream en mode data-descriptor
-  for (const f of files) {
-    sourceFilesMeta.push({ name: f.name });
-  }
+  } else {
+    // === CAS MULTI-FICHIERS : ZIP clair en flux comme avant ===
+    const zipPlainWriter = new StoreZipWriter({
+      write: async (u8) => {
+        plainTotalLen += u8.length;
+        await feedPlain(u8, false);
+      }
+    });
 
-  // écriture des entrées locales + data, le tout pousse dans feedPlain()
-  for (const f of files) {
-    // size/crc = null → le writer passera en data-descriptor
-    await zipPlainWriter.addFile(f.name, null, null, fileChunkProducer(f));
-  }
+    // stream en mode data-descriptor
+    for (const f of files) {
+      sourceFilesMeta.push({ name: f.name });
+    }
 
-  // écrire CD + EOCD du ZIP clair (dans le pipe aussi)
-  const zipPlainFinalBytes = await zipPlainWriter.finish();
-  // finish() peut renvoyer null si le sink “stream” directement.
-  if (zipPlainFinalBytes && zipPlainFinalBytes.length) {
-    await feedPlain(zipPlainFinalBytes, false);
+    // écriture des entrées locales + data, le tout pousse dans feedPlain()
+    for (const f of files) {
+      // size/crc = null → le writer passera en data-descriptor
+      await zipPlainWriter.addFile(f.name, null, null, fileChunkProducer(f));
+    }
+
+    // écrire CD + EOCD du ZIP clair (dans le pipe aussi)
+    const zipPlainFinalBytes = await zipPlainWriter.finish();
+    // finish() peut renvoyer null si le sink “stream” directement.
+    if (zipPlainFinalBytes && zipPlainFinalBytes.length) {
+      plainTotalLen += zipPlainFinalBytes.length;  // ✅ cohérent avec le chemin multi-fichiers
+      await feedPlain(zipPlainFinalBytes, false);
+    }
+    // signaler fin au chunker
+    await feedPlain(new Uint8Array(0), true);
   }
-  // signaler fin au chunker
-  await feedPlain(new Uint8Array(0), true);
 
   // 3) MANIFEST + INDEX (petits → RAM ok)
   /* ******************************************************
@@ -2736,42 +2759,41 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
   /* ******************************************************
  * MANIFEST_INDEX sealing (streaming path) with bundle-level keys
  ****************************************************** */
-const manChunkHashes = [];
-for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
-const manifestIndexInner = {
-  v: 1, kind: 'manifest_index',
-  totalChunks: manChunksClear.length,
-  totalLen: manifestBytes.length,
-  chunkSize: FIXED_CHUNK_SIZE,
-  chunkHashes: manChunkHashes
-};
-const manIndexBytes  = TE.encode(JSON.stringify(manifestIndexInner));
-const manIndexChunks = chunkFixedGeneric(manIndexBytes);
+  const manChunkHashes = [];
+  for (const c of manChunksClear) manChunkHashes.push(await sha256Hex(c));
+  const manifestIndexInner = {
+    v: 1, kind: 'manifest_index',
+    totalChunks: manChunksClear.length,
+    totalLen: manifestBytes.length,
+    chunkSize: FIXED_CHUNK_SIZE,
+    chunkHashes: manChunkHashes
+  };
+  const manIndexBytes  = TE.encode(JSON.stringify(manifestIndexInner));
+  const manIndexChunks = chunkFixedGeneric(manIndexBytes);
 
-for (let i = 0; i < manIndexChunks.length; i++) {
-  const sealed = await sealFixedChunkDet({
-    kEncKey: K_ENC,
-    kIv32,
-    bundleId,
-    payloadChunk: padToFixed(manIndexChunks[i]),
-    chunkIndex: i,
-    totalChunks: manIndexChunks.length,
-    totalPlainLen: manIndexBytes.length,
-    domain: 'index'
-  });
-  const name = `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
-  const crc  = crc32(sealed);
-  await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed.slice(); });
-  try { sealed.fill(0); } catch {}
-}
+  for (let i = 0; i < manIndexChunks.length; i++) {
+    const sealed = await sealFixedChunkDet({
+      kEncKey: K_ENC,
+      kIv32,
+      bundleId,
+      payloadChunk: padToFixed(manIndexChunks[i]),
+      chunkIndex: i,
+      totalChunks: manIndexChunks.length,
+      totalPlainLen: manIndexBytes.length,
+      domain: 'index'
+    });
+    const name = `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
+    const crc  = crc32(sealed);
+    await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed.slice(); });
+    try { sealed.fill(0); } catch {}
+  }
 
-/* ******************************************************
- * Finalize bundle ZIP
- ****************************************************** */
-const bundleU8 = await bundleWriter.finish();
-try { pending.fill(0); } catch {}
-return { bundleU8, manifest: manifestInner, manifestIndex: manifestIndexInner };
-
+  /* ******************************************************
+   * Finalize bundle ZIP
+   ****************************************************** */
+  const bundleU8 = await bundleWriter.finish();
+  try { pending.fill(0); } catch {}
+  return { bundleU8, manifest: manifestInner, manifestIndex: manifestIndexInner };
 }
 
 function updateEncryptButtonState() {
