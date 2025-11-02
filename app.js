@@ -2763,7 +2763,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     });
     const name = `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
     const crc  = crc32(sealed);
-    await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed; });
+    await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed.slice(); });
     try { sealed.fill(0); } catch {}
   }
 
@@ -2795,7 +2795,7 @@ for (let i = 0; i < manIndexChunks.length; i++) {
   });
   const name = `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
   const crc  = crc32(sealed);
-  await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed; });
+  await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed.slice(); });
   try { sealed.fill(0); } catch {}
 }
 
