@@ -1932,9 +1932,23 @@ function getEncMode() {
 }
 
 function encIds(mode = getEncMode()) {
-  return (mode === 'text')
-    ? { outputs:'#encOutputsText', results:'#encResultsText', hash:'#encHashText', bar:'encBarText' }
-    : { outputs:'#encOutputsFiles', results:'#encResultsFiles', hash:'#encHashFiles', bar:'encBarFiles' };
+  // Map to the <details> wrappers and the new progress wrappers
+  if (mode === 'text') {
+    return {
+      outputs: '#encDetailsText',   // <details>
+      results: '#encResultsText',
+      hash:    '#encHashText',
+      bar:     'encBarText',        // inner bar id (no '#')
+      prog:    '#encProgText'       // progress wrapper div
+    };
+  }
+  return {
+    outputs: '#encDetailsFiles',    // <details>
+    results: '#encResultsFiles',
+    hash:    '#encHashFiles',
+    bar:     'encBarFiles',
+    prog:    '#encProgFiles'
+  };
 }
 
 // Show/hide a specific bar by id (reuses your showProgress API)
@@ -2229,10 +2243,48 @@ function selectTab(which) {
     decTab.setAttribute('aria-selected', 'false');
     encPanel.hidden = false;
     decPanel.hidden = true;
-    hideIfEmpty('#encOutputsText',  '#encResultsText');
-    hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
+
+    // Show the correct encryption RESULTS wrapper based on current content tab
+    const isText = !document.getElementById('encPanelText').hidden;
+
+    const encDetailsText  = document.querySelector('#encDetailsText');
+    const encDetailsFiles = document.querySelector('#encDetailsFiles');
+
+    // Normalize both, then show only the relevant one if it has something inside
+    const textEmpty  = !(document.querySelector('#encResultsText')?.childElementCount > 0) &&
+                       !((document.querySelector('#encPreviewText')?.textContent || '').trim().length > 0) &&
+                       !((document.querySelector('#encHashText')?.textContent || '').trim().length > 0);
+
+    const filesEmpty = !(document.querySelector('#encResultsFiles')?.childElementCount > 0) &&
+                       !((document.querySelector('#encPreviewFiles')?.textContent || '').trim().length > 0) &&
+                       !((document.querySelector('#encHashFiles')?.textContent || '').trim().length > 0);
+
+    // Hide both by default
+    encDetailsText?.classList.add('hidden');
+    encDetailsText?.classList.remove('visible');
+    encDetailsText?.removeAttribute('open');
+
+    encDetailsFiles?.classList.add('hidden');
+    encDetailsFiles?.classList.remove('visible');
+    encDetailsFiles?.removeAttribute('open');
+
+    // Only show/open the one that matches current sub-tab AND is not empty
+    if (isText && !textEmpty) {
+      encDetailsText?.classList.remove('hidden');
+      encDetailsText?.classList.add('visible');
+      encDetailsText?.setAttribute('open','');
+    } else if (!isText && !filesEmpty) {
+      encDetailsFiles?.classList.remove('hidden');
+      encDetailsFiles?.classList.add('visible');
+      encDetailsFiles?.setAttribute('open','');
+    }
+
+    // Hide both encrypt progress wrappers; doEncrypt() will show the right one
+    document.querySelector('#encProgText')?.classList.add('hidden');
+    document.querySelector('#encProgFiles')?.classList.add('hidden');
     showEncProgress('text',  false);
     showEncProgress('files', false);
+
   } else {
     decTab.setAttribute('aria-selected', 'true');
     encTab.setAttribute('aria-selected', 'false');
@@ -2240,31 +2292,20 @@ function selectTab(which) {
     encPanel.hidden = true;
   }
 
-  // Only hide if truly empty (scoped + decrypt details)
-  hideIfEmpty('#encOutputsText',  '#encResultsText');
-  hideIfEmpty('#encOutputsFiles', '#encResultsFiles');
-  (function hideDecDetailsIfEmpty() {
-    const det   = document.querySelector('#decDetails');
-    const res   = document.querySelector('#decResults');
-    const text  = document.querySelector('#decText');
+  // Decrypt details: open only if there is content
+  (function syncDecDetails() {
+    const det  = document.querySelector('#decDetails');
     if (!det) return;
-    const emptyRes  = !res || !(res.childElementCount > 0);
-    const emptyText = !text || !((text.textContent || '').trim().length > 0);
-    det.open = !(emptyRes && emptyText); // open only if something to show
-    // keep #decResults hidden class in sync too
-    if (res) res.classList.toggle('hidden', emptyRes);
-    if (text) text.hidden = emptyText;
+    const res  = document.querySelector('#decResults');
+    const text = document.querySelector('#decText');
+    const hasRes  = !!(res && res.childElementCount > 0);
+    const hasText = !!(text && (text.textContent || '').trim().length > 0);
+    det.open = (hasRes || hasText);
+    if (res)  res.classList.toggle('hidden', !hasRes);
+    if (text) text.hidden = !hasText;
   })();
 
-  // Keep decrypted text hidden only if it has no content
-  try {
-    const decText = $('#decText');
-    if (decText && !(decText.textContent || '').trim()) {
-      decText.hidden = true;
-    }
-  } catch {}
-
-  // Always re-mask encryption password
+  // Re-mask encryption password
   try {
     const encPwd = $('#encPassword');
     const toggle = $('#encPwdToggle');
@@ -2277,10 +2318,10 @@ function selectTab(which) {
     }
   } catch {}
 
-  // Hide progress bars when switching panels (scoped + decrypt)
+  // Always hide progress bars when switching panels
   showEncProgress('text',  false);
   showEncProgress('files', false);
-  showProgress('decBar', false);
+  showProgress('decBar',   false);
 }
 
 /**
@@ -2292,37 +2333,55 @@ function selectContentTab(which) {
   const tPanel = $('#encPanelText');
   const fPanel = $('#encPanelFiles');
 
-  const outText  = document.querySelector('#encOutputsText');
-  const outFiles = document.querySelector('#encOutputsFiles');
+  // NOTE: outputs are now <details>, not #encOutputs*
+  const outText  = document.querySelector('#encDetailsText');
+  const outFiles = document.querySelector('#encDetailsFiles');
 
   const selIsText = (which === 'text');
 
-  // Tabs/panels
+  // Tabs / panels (ARIA)
   tBtn.setAttribute('aria-selected', selIsText ? 'true' : 'false');
   fBtn.setAttribute('aria-selected', selIsText ? 'false' : 'true');
   tPanel.hidden = !selIsText;
   fPanel.hidden =  selIsText;
 
-  // Only one outputs wrapper visible
-  if (selIsText) {
-    outFiles?.classList.add('hidden');
-    outFiles?.classList.remove('visible');
+  // Normalize both details
+  outText?.classList.remove('visible');
+  outFiles?.classList.remove('visible');
+  outText?.classList.add('hidden');
+  outFiles?.classList.add('hidden');
+  outText?.removeAttribute('open');
+  outFiles?.removeAttribute('open');
+
+  // Show/open only the active details if it already has content
+  const textHasContent =
+      (document.querySelector('#encResultsText')?.childElementCount > 0) ||
+      ((document.querySelector('#encPreviewText')?.textContent || '').trim().length > 0) ||
+      ((document.querySelector('#encHashText')?.textContent || '').trim().length > 0);
+
+  const filesHasContent =
+      (document.querySelector('#encResultsFiles')?.childElementCount > 0) ||
+      ((document.querySelector('#encPreviewFiles')?.textContent || '').trim().length > 0) ||
+      ((document.querySelector('#encHashFiles')?.textContent || '').trim().length > 0);
+
+  if (selIsText && textHasContent) {
     outText?.classList.remove('hidden');
     outText?.classList.add('visible');
-  } else {
-    outText?.classList.add('hidden');
-    outText?.classList.remove('visible');
+    outText?.setAttribute('open','');
+  } else if (!selIsText && filesHasContent) {
     outFiles?.classList.remove('hidden');
     outFiles?.classList.add('visible');
+    outFiles?.setAttribute('open','');
   }
 
-  // Hide both progress bars on switch; doEncrypt() will show the right one
+  // Hide both encrypt progress wrappers; doEncrypt() will show the correct one
+  document.querySelector('#encProgText')?.classList.add('hidden');
+  document.querySelector('#encProgFiles')?.classList.add('hidden');
   showEncProgress('text',  false);
   showEncProgress('files', false);
 
   updateEncryptButtonState();
 }
-
 
 // ===== Auto-tune with budget and cancel support =====
 
@@ -2541,37 +2600,53 @@ function fileChunkProducer(file) {
  ****************************************************** */
 async function doEncrypt() {
   let payloadBytes = null;
-  let bundleBytes  = null; // memory fallback only
+  let bundleBytes  = null;
   let plaintextHashHex = null;
   let plaintextIsZip = false;
-  
+
   try {
     logInfo('[enc] start');
 
-    const mode = getEncMode();
+    const mode = getEncMode();      // 'text' or 'files' (based on visible panel)
     const ids  = encIds(mode);
-
-    // Ensure only the active outputs wrapper is visible
     const other = encIds(mode === 'text' ? 'files' : 'text');
-    const otherWrap = document.querySelector(other.outputs);
-    otherWrap?.classList.add('hidden');
-    otherWrap?.classList.remove('visible');
-    
-    const outWrap = document.querySelector(ids.outputs);
-    outWrap?.classList.remove('hidden');
-    outWrap?.classList.add('visible');
-    
-    showEncProgress(mode, true);
-    setProgress(document.getElementById(ids.bar), 5); 
 
+    // Ensure only the active <details> is visible/open
+    const otherDetails = document.querySelector(other.outputs);
+    if (otherDetails) {
+      otherDetails.classList.add('hidden');
+      otherDetails.classList.remove('visible');
+      otherDetails.removeAttribute('open');
+    }
+
+    const details = document.querySelector(ids.outputs);
+    if (details) {
+      details.classList.remove('hidden');
+      details.classList.add('visible');
+      details.setAttribute('open', '');
+    }
+
+    // Show only the active progress wrapper; hide the other
+    document.querySelector(other.prog)?.classList.add('hidden');
+    const activeProg = document.querySelector(ids.prog);
+    if (activeProg) {
+      activeProg.classList.remove('hidden');
+      activeProg.style.display = 'block';
+    }
+
+    // Show the active progress bar
+    showEncProgress(mode, true);
+    setProgress(document.getElementById(ids.bar), 5);
+
+    // Clear this mode’s outputs before starting
     clearNode(ids.results);
-    setText(ids.hash, '');
+    setText(ids.hash, ''); // this is where the hashbox will be rendered later
 
     const pw = $('#encPassword').value || '';
     if (!pw) throw new EnvelopeError('input', 'missing');
     const password = pw.normalize('NFKC');
 
-    // Input source: text or files?
+    // Determine input source from panel visibility
     const textMode = !$('#encPanelText').hidden;
     if (textMode) {
       /* ******************************************************
@@ -2585,14 +2660,14 @@ async function doEncrypt() {
         throw new EnvelopeError('input_large', 'Input too large for this device');
       }
 
-      // --- Privacy: optional size padding (bucket) ---
+      // Optional size padding (bucket)
       const enableSizePadding = false;      // toggle on hardened builds as needed
       let PAD_TO = choosePadBucket();
       
       // Keep the real length for manifest/UX
       const realPlainLen = payloadBytes.length;
       
-      // (Optional) whole-plaintext hash over the *real* content only
+      // Optional whole-plaintext hash over the real (unpadded) content
       const wholeHashHexReal = await sha256Hex(payloadBytes);
 
       const originalBytes = payloadBytes;  // keep reference so we can revert cleanly
@@ -2604,12 +2679,12 @@ async function doEncrypt() {
       
         // Quick exit: no padding needed
         if (needPadBytes === 0) {
-          sizePadded = false; // explicit: nothing added
+          sizePadded = false;
         } else {
-          // Preflight device cap BEFORE allocating
+          // Check device cap BEFORE allocating
           const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
           if (paddedLen > maxIn) {
-            // Automatically shrink the padding bucket to stay within device limits
+            // Automatically shrink the padding bucket to stay within limits
             const MiB = 1024 * 1024;
             const headroom = Math.max(0, maxIn - realPlainLen);
           
@@ -2618,7 +2693,7 @@ async function doEncrypt() {
             const MIN_BUCKET = 1 * MiB;
           
             if (newBucket < MIN_BUCKET) {
-              // There is not enough room to apply padding without exceeding limits
+              // Not enough room to apply padding
               payloadBytes = originalBytes;
               sizePadded = false;
               logWarn("[enc] padding auto-disabled due to device cap; using realPlainLen only");
@@ -2654,7 +2729,7 @@ async function doEncrypt() {
               }
             }
           } else {
-            // Original safe path when paddedLen is already within limits
+            // Path when paddedLen is already within limits
             const pad = new Uint8Array(needPadBytes);
             crypto.getRandomValues(pad);
           
@@ -2671,7 +2746,7 @@ async function doEncrypt() {
         }
       }
       
-      // From here, totalPlainLen reflects the *padded* length
+      // From here, totalPlainLen reflects the padded length (if any)
       const totalPlainLen = payloadBytes.length;
       const chunks = chunkFixed(payloadBytes);
       const totalChunks = chunks.length;
@@ -2694,9 +2769,6 @@ async function doEncrypt() {
       const sealedParts = [];
       const perChunkHashes = [];
       setProgress(document.getElementById(ids.bar), 15); 
-      
-      // If you still need a whole-plaintext hash in the manifest, prefer the REAL one:
-      // const wholeHashHex = wholeHashHexReal;
       
       for (let i = 0; i < totalChunks; i++) {
         const c = chunks[i];
@@ -2747,7 +2819,7 @@ async function doEncrypt() {
         totalChunks,
         chunkHashes: perChunkHashes,
       
-        // Integrity of REAL content (unpadded)
+        // Integrity of real (unpadded) content
         wholePlainHash: wholeHashHexReal,   // sha256(real content)
         hashAlg: 'sha256',
       
@@ -2755,9 +2827,9 @@ async function doEncrypt() {
         realPlainLen,
         sizePadded: (typeof sizePadded === 'boolean') ? sizePadded : true,
         padBytes: Math.max(0, totalPlainLen - realPlainLen),
-        padBucket: 8 * 1024 * 1024,         // if stable
+        padBucket: 8 * 1024 * 1024,
       
-        // Crypto descriptor (doc)
+        // Crypto descriptor
         aead: 'AES-256-GCM',
         kdf: { outer: 'Argon2id', split: 'HKDF' },
       
@@ -2818,7 +2890,7 @@ async function doEncrypt() {
         });
       }
 
-      // Header d’amorçage chiffré au mot de passe (pour récupérer bundleId + bundleSaltB64)
+      // Password-based bootstrap header (to recover bundleId + bundleSaltB64)
       const headerBytes = await sealBundleHeaderWithPassword({
         password,
         params: tunedParams,
@@ -2828,15 +2900,15 @@ async function doEncrypt() {
       const headerEntry = { name: `BUNDLE_HEADER${FILE_SINGLE_EXT}`, bytes: headerBytes };
 
       /* ******************************************************
-      * Build bundle ZIP (store-only) and present download
-      ****************************************************** */
+       * Build bundle ZIP (store-only) and present download
+       ****************************************************** */
       const filesOut = [ headerEntry, ...sealedParts, ...manSealedParts, ...manIndexSealed ];
       const bundleZip = buildZip(filesOut, { store: true });
 
-      // wipe sealed parts memory
+      // Wipe sealed parts memory
       try { for (const f of filesOut) f?.bytes?.fill?.(0); } catch {}
 
-      // *** wipe keying material (bytes) ***
+      // Wipe keying material (bytes)
       try { master32.fill(0); } catch {}
       try { kEnc32.fill(0); } catch {}
       try { kIv32.fill(0); } catch {}
@@ -2860,7 +2932,7 @@ async function doEncrypt() {
     }
 
     /* ******************************************************
-     * FILES MODE (STREAMING) — utilise le StoreZipWriter + File System Access
+     * FILES MODE (STREAMING) — StoreZipWriter + File System Access
      ****************************************************** */
     const files = Array.from($('#encFiles').files || []);
     if (files.length === 0) throw new EnvelopeError('input', 'missing');
@@ -2875,22 +2947,22 @@ async function doEncrypt() {
       }
     }
 
-    // -- Before choosing sink, calculate the "plaintext" hash
+    // Before choosing sink, compute a plaintext hash when feasible
     {
       const maxIn = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_INPUT_BYTES;
       if (files.length === 1) {
-        // Hash du fichier clair (si ça rentre dans la limite)
+        // Hash of the single clear file (only if it fits in memory bound)
         const f0 = files[0];
         if (Number(f0.size || 0) <= maxIn) {
           const u8 = new Uint8Array(await f0.arrayBuffer());
           plaintextHashHex = await sha256Hex(u8);
           try { u8.fill(0); } catch {}
         } else {
-          plaintextHashHex = null; // trop gros → None
+          plaintextHashHex = null;
         }
         plaintextIsZip = false;
       } else {
-        // Hash du ZIP clair (STORE) reconstruit en mémoire (si total annoncé ≤ limite)
+        // Hash of a clear STORE ZIP reconstructed in memory (only if total ≤ bound)
         let total = 0;
         for (const f of files) { total += Number(f.size || 0); }
         if (total <= maxIn) {
@@ -2906,16 +2978,16 @@ async function doEncrypt() {
           plaintextHashHex = await sha256Hex(zipPlain);
           try { zipPlain.fill(0); } catch {}
         } else {
-          plaintextHashHex = null; // trop gros → None
+          plaintextHashHex = null;
         }
         plaintextIsZip = true;
       }
     }
 
-    // 1) Choose output sink: O(1) via File System Access si dispo, sinon mémoire
+    // 1) Choose output sink: O(1) with File System Access when available, else memory
     const { sink, close, kind } = await getBundleSink('secret' + FILE_BUNDLE_EXT);
 
-    // 2) Run streaming encryption → écrit .cboxbundle directement
+    // 2) Streaming encryption — directly writes the .cboxbundle
     const res = await encryptMultiFilesStreaming({
       files,
       password,
@@ -2923,7 +2995,7 @@ async function doEncrypt() {
       outSink: sink
     });
 
-    // 3) UI result selon le sink
+    // 3) UI result depending on sink kind
     if (kind === 'fs') {
       await close?.();
       renderSimpleHashes({
@@ -4241,7 +4313,8 @@ async function doDecrypt() {
       if (manifest.wholePlainHash) {
         const whole = await sha256Hex(offeredBytes);
         const ok = timingSafeEqual(whole, manifest.wholePlainHash);
-        setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
+        //setText('#decIntegrity', ok ? 'Integrity OK (unpadded plaintext).' : 'Alert: plaintext hash mismatch.');
+        setText('#decIntegrity', ok ? 'Integrity OK.' : 'Alert: plaintext hash mismatch.');
       } else {
         setText('#decIntegrity', wantTrim ? 'Integrity: chunk-level verified (unpadded written).'
                                           : 'Integrity: chunk-level verified.');
