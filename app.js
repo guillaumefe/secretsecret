@@ -528,6 +528,23 @@ function addDownload(containerSel, blob, filename, label) {
   container.appendChild(btn);
   container.appendChild(a);
   logInfo('[addDownload] appended elements');
+
+  // --- Make container and its <details> parent visible ---
+  try {
+    // The result container is hidden by default
+    container.classList.remove('hidden');
+    container.classList.add('visible');
+
+    // Open and reveal its parent <details> (Results), if any
+    const det = container.closest('details');
+    if (det) {
+      det.classList.remove('hidden');
+      det.classList.add('visible');
+      det.setAttribute('open', '');
+    }
+  } catch (e) {
+    logWarn('[addDownload] visibility update warn', e);
+  }
 }
 
 
