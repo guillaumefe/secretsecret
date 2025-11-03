@@ -1,9 +1,403 @@
-// ===== Constants and parameters =====
+/* =================== Identity and format =================== */
+
+export const CRYPTO_NS   = 'data';   // namespace string used everywhere
+export const FORMAT_VER  = '4';      // human-readable version tag
+
+export function buildMagic(ns, ver) {
+  if (typeof ns !== 'string' || !ns.length) throw new TypeError('bad ns');
+  const s = `${ns.toUpperCase()}${String(ver)}`;
+  const u8 = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i);
+  return u8;
+}
+
+// Helpers
+function u8startsWith(buf, pre) {
+  if (buf.length < pre.length) return false;
+  for (let i = 0; i < pre.length; i++) if (buf[i] !== pre[i]) return false;
+  return true;
+}
+function u8hex(u8) {
+  return Array.from(u8, b => b.toString(16).padStart(2,'0')).join('');
+}
+
+// Base candidate (current version)
+export const MAGIC = buildMagic(CRYPTO_NS, FORMAT_VER);
+
+// Current magic and a forward-compatible candidates list.
+// To roll forward later, append another buildMagic(CRYPTO_NS, '5'), etc.
+// Future versions can be listed here without caring about order
+const RAW_MAGIC_CANDIDATES = [
+  MAGIC,
+  // buildMagic(CRYPTO_NS, 5), // example future
+];
+
+// Normalize (dedupe + sort longest→shortest + prefix warnings)
+function normalizeMagicCandidates(list) {
+  const seen = new Set();
+  const uniq = [];
+  for (const u8 of list) {
+    const key = u8hex(u8);
+    if (!seen.has(key)) { seen.add(key); uniq.push(u8); }
+  }
+  uniq.sort((a,b) => b.length - a.length);
+  for (let i = 0; i < uniq.length; i++) {
+    for (let j = i+1; j < uniq.length; j++) {
+      if (u8startsWith(uniq[i], uniq[j])) {
+        console.warn("[MAGIC] prefix overlap detected");
+      }
+    }
+  }
+  return Object.freeze(uniq);
+}
+
+export const MAGIC_CANDIDATES = normalizeMagicCandidates(RAW_MAGIC_CANDIDATES);
+
+// Derive accepted format versions automatically from MAGIC suffix
+function extractVersionFromMagic(u8) {
+  let s = "";
+  for (let i=0; i<u8.length; i++) s += String.fromCharCode(u8[i]);
+  const m = s.match(/(\d+)$/);
+  return m ? Number(m[1]) : NaN;
+}
+
+// Derive accepted numeric versions from MAGIC_CANDIDATES’ last char(s).
+export const ACCEPTED_VERSIONS = Object.freeze(
+  MAGIC_CANDIDATES.map(extractVersionFromMagic).filter(Number.isFinite)
+);
+
+/* =================== KDF label helpers (namespace-bound) =================== */
+
+function nsLabel(suffix) {
+  // All HKDF "info" labels and metadata tags are namespaced
+  return `${CRYPTO_NS}/${suffix}`;
+}
+
+/* =================== HKDF split and deterministic IV =================== */
+
+/* ******************************************************
+ * HKDF helpers (one-time master → subkeys/IVs)
+ *  - hkdfExpand: WebCrypto HKDF-Expand (SHA-256)
+ *  - hkdfSplit : derive encryption and IV subkeys from master
+ ****************************************************** */
+
+export async function hkdfExpand(baseKeyBytes, saltBytes, infoBytes, outLen) {
+  const ikm  = await crypto.subtle.importKey('raw', baseKeyBytes, 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: saltBytes, info: infoBytes },
+    ikm,
+    outLen * 8
+  );
+  return new Uint8Array(bits);
+}
+
+export async function hkdfSplit(master32, bundleSalt) {
+  const kEnc32 = await hkdfExpand(master32, bundleSalt, TE.encode(nsLabel('kEnc')), 32);
+  const kIv32  = await hkdfExpand(master32, bundleSalt, TE.encode(nsLabel('kIv')),  32);
+  return { kEnc32, kIv32 };
+}
+
+/* ******************************************************
+ * Deterministic 96-bit IV per chunk via HKDF
+ *  - Stable for (kIv32, bundleId, chunkIndex)
+ ****************************************************** */
+export async function deriveIv96(kIv32, bundleId, chunkIndex, domain = CRYPTO_NS) {
+  const prefix = TE.encode(nsLabel(`iv/${domain}/`));
+  const bid    = TE.encode(bundleId);
+  const info   = new Uint8Array(prefix.length + bid.length + 4);
+  let p = 0;
+  info.set(prefix, p); p += prefix.length;
+  info.set(bid,    p); p += bid.length;
+  new DataView(info.buffer, info.byteOffset + p, 4).setUint32(0, chunkIndex >>> 0, false);
+  return hkdfExpand(kIv32, new Uint8Array(0), info, 12);
+}
+
+/* =================== Envelope header matching and parsing =================== */
+
+function matchMagicOrThrow(bytes) {
+  if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
+  // Try candidates in order; return the first that matches
+  for (const cand of MAGIC_CANDIDATES) {
+    const L = cand.length;
+    if (bytes.length >= L + 4) {
+      let ok = true;
+      for (let i = 0; i < L; i++) if (bytes[i] !== cand[i]) { ok = false; break; }
+      if (ok) return L; // magic length
+    }
+  }
+  throw new EnvelopeError('magic', 'Unknown format');
+}
+
+function parseEnvelopeHeaderOrThrow(bytes) {
+  if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
+
+  const MAGIC_LEN = matchMagicOrThrow(bytes);
+  if (bytes.length < MAGIC_LEN + 4) {
+    throw new EnvelopeError('format', 'Invalid envelope');
+  }
+
+  const metaLen   = new DataView(bytes.buffer, bytes.byteOffset + MAGIC_LEN, 4).getUint32(0, false);
+  const metaStart = MAGIC_LEN + 4;
+  const metaEnd   = metaStart + metaLen;
+
+  if (metaLen <= 0 || metaLen > 4096) throw new EnvelopeError('meta_big', 'Metadata too large');
+  if (metaEnd > bytes.length)         throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
+
+  const metaBytes = bytes.subarray(metaStart, metaEnd);
+  let meta;
+  try { meta = JSON.parse(TD.decode(metaBytes)); }
+  catch { throw new EnvelopeError('meta_parse', 'Malformed metadata'); }
+
+  return { meta, metaBytes, metaEnd, MAGIC_LEN };
+}
+
+/* =================== Deterministic-envelope opener (bundle keys) =================== */
+
+/* ******************************************************
+ * openFixedChunkDet
+ *  - Decrypts a fixed-size chunk using bundle-level:
+ *      - kEncKey (AES-256-GCM)
+ *      - kIv32 (HKDF IV key) to rebuild IV deterministically
+ *  - Verifies bundleId and inner meta
+ ****************************************************** */
+export async function openFixedChunkDet({
+  kEncKey, kIv32, bytes, expectedBundleId, chunkIndex, domain = CRYPTO_NS
+}) {
+  // 1) Parse and validate outer header
+  const { meta, metaBytes, metaEnd } = parseEnvelopeHeaderOrThrow(bytes);
+  ensureAlgoAndVersionOrThrow(meta);
+  ensureNamespaceOrThrow(meta);
+
+  if (expectedBundleId !== undefined && meta.bundleId !== expectedBundleId) {
+    throw new EnvelopeError('bundle_mismatch', 'BundleId mismatch');
+  }
+
+  // 2) Derive deterministic IV and decrypt
+  const ivU8 = await deriveIv96(kIv32, meta.bundleId || '', (chunkIndex >>> 0), domain);
+  if (DEBUG && ivU8.length !== 12) throw new EnvelopeError('iv_len', 'IV must be 96-bit');
+
+  const cipher = bytes.subarray(metaEnd);
+  if (cipher.length < 16) throw new EnvelopeError('cipher_short', 'Ciphertext too short');
+
+  const clear = new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: ivU8, additionalData: metaBytes, tagLength: 128 },
+    kEncKey,
+    cipher
+  ));
+
+  // 3) Parse inner meta (prefixed length + JSON)
+  if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
+  const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
+  const innerEnd = 4 + innerLen;
+  if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner meta');
+
+  let innerMeta;
+  try {
+    innerMeta = JSON.parse(TD.decode(clear.subarray(4, innerEnd)));
+  } catch {
+    throw new EnvelopeError('inner_parse', 'Malformed inner meta');
+  }
+
+  // Sanity checks on inner meta
+  if (
+    innerMeta?.kind !== 'fixed' ||
+    innerMeta?.fixedSize !== FIXED_CHUNK_SIZE ||
+    !Number.isSafeInteger(innerMeta?.totalChunks) ||
+    !Number.isSafeInteger(innerMeta?.totalPlainLen) ||
+    !Number.isSafeInteger(innerMeta?.chunkIndex) ||
+    (innerMeta.chunkIndex !== (chunkIndex >>> 0))
+  ) {
+    throw new EnvelopeError('inner_meta_invalid', 'Invalid inner meta');
+  }
+
+  // Ensure fixed payload fits completely after inner meta
+  if (innerEnd + FIXED_CHUNK_SIZE > clear.length) {
+    throw new EnvelopeError('inner_fixed_trunc', 'Fixed chunk truncated');
+  }
+
+  // 4) Extract fixed-size payload and compute useful length
+  const fixedPayload = clear.subarray(innerEnd, innerEnd + FIXED_CHUNK_SIZE);
+
+  const totalChunks   = innerMeta.totalChunks >>> 0;
+  const chunkIdx      = innerMeta.chunkIndex >>> 0;
+  const totalPlainLen = innerMeta.totalPlainLen >>> 0;
+
+  const bytesBefore = (totalChunks - 1) * FIXED_CHUNK_SIZE;
+  const isLast      = (chunkIdx === totalChunks - 1);
+
+  const usefulLen = isLast
+    ? Math.max(0, totalPlainLen - bytesBefore)
+    : FIXED_CHUNK_SIZE;
+
+  if (usefulLen < 0 || usefulLen > FIXED_CHUNK_SIZE) {
+    throw new EnvelopeError('inner_useful_len', 'Invalid useful length');
+  }
+
+  // Copy out the whole fixed chunk (for callers that need full block),
+  // and also provide a convenient view for the useful plaintext slice.
+  const out = new Uint8Array(fixedPayload.length);
+  out.set(fixedPayload);
+  const fixedChunkUseful = out.subarray(0, usefulLen);
+
+  // 5) Scrub and return
+  try { clear.fill(0); } catch {}
+
+  return {
+    meta,
+    innerMeta,
+    fixedChunk: out,
+    fixedChunkUseful,              // Uint8Array view of the meaningful bytes
+    fixedChunkUsefulLen: usefulLen, // kept for compatibility
+    usefulLen                      // same value as above
+  };
+}
+
+/* =================== Password-envelope opener (legacy per-envelope Argon2id) =================== */
+
+/**
+ * openFixedChunk
+ * Password-based envelope opener (legacy single-file mode).
+ * 
+ * Validates:
+ * - MAGIC + metadata structure (via parseEnvelopeHeaderOrThrow)
+ * - Namespace consistency (ns)
+ * - AES-GCM (enc_v, algo)
+ * - Argon2id presence and parameter bounds
+ * - Base64-encoded salt and IV structure
+ * - Inner metadata structure and declared payload size
+ */
+export async function openFixedChunk({ password, bytes, params }) {
+  const { meta, metaBytes, metaEnd } = parseEnvelopeHeaderOrThrow(bytes);
+
+  ensureAlgoAndVersionOrThrow(meta);
+  ensureNamespaceOrThrow(meta);
+
+  if (!meta.kdf || meta.kdf.kdf !== 'Argon2id') {
+    throw new EnvelopeError('kdf', 'Unsupported KDF');
+  }
+  if (!meta.salt) {
+    throw new EnvelopeError('salt', 'Missing KDF salt');
+  }
+
+  // Validate and decode IV / salt
+  let ivU8, saltU8;
+  try { ivU8 = b64d(String(meta.iv)); }
+  catch { throw new EnvelopeError('iv', 'Invalid IV encoding'); }
+  if (!ivU8 || ivU8.length !== 12) {
+    throw new EnvelopeError('iv_len', 'IV must be 96-bit');
+  }
+
+  try { saltU8 = b64d(String(meta.salt)); }
+  catch { throw new EnvelopeError('salt', 'Invalid salt encoding'); }
+  if (saltU8.length < 16 || saltU8.length > 64) {
+    throw new EnvelopeError('salt_len', 'Unsupported salt length');
+  }
+
+  // Validate and select KDF parameters
+  const kdfParams = {
+    mMiB: Number(meta.kdf.mMiB ?? params?.mMiB ?? tunedParams?.mMiB),
+    t:    Number(meta.kdf.t    ?? params?.t    ?? tunedParams?.t),
+    p:    Number(meta.kdf.p    ?? params?.p    ?? tunedParams?.p)
+  };
+  validateArgon(kdfParams);
+
+  // Derive per-envelope AES-GCM key
+  const keyBytes = await deriveArgon2id(password, saltU8, kdfParams);
+  const key      = await importAesKey(keyBytes);
+
+  const cipher = bytes.subarray(metaEnd);
+  if (cipher.length < 16) {
+    throw new EnvelopeError('cipher_short', 'Ciphertext too short');
+  }
+
+  // AES-GCM decryption
+  const clear = new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: ivU8, additionalData: metaBytes, tagLength: 128 },
+    key,
+    cipher
+  ));
+
+  if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
+
+  // Read inner metadata length (big-endian U32)
+  const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
+  const innerEnd = 4 + innerLen;
+  if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner metadata');
+
+  // Parse inner metadata (plaintext)
+  let innerMeta;
+  try {
+    innerMeta = JSON.parse(TD.decode(clear.subarray(4, innerEnd)));
+  } catch {
+    throw new EnvelopeError('inner_parse', 'Malformed inner metadata');
+  }
+
+  // Validate inner metadata and payload layout
+  if (innerMeta?.kind !== 'fixed' ||
+      innerMeta?.fixedSize !== FIXED_CHUNK_SIZE ||
+      !Number.isSafeInteger(innerMeta?.totalChunks) ||
+      !Number.isSafeInteger(innerMeta?.totalPlainLen)) {
+    throw new EnvelopeError('inner_meta_invalid', 'Invalid inner metadata');
+  }
+
+  if (innerEnd + FIXED_CHUNK_SIZE > clear.length) {
+    throw new EnvelopeError('inner_fixed_trunc', 'Fixed chunk truncated');
+  }
+
+  const fixedPayload = clear.subarray(innerEnd, innerEnd + FIXED_CHUNK_SIZE);
+
+  const out = new Uint8Array(fixedPayload.length);
+  out.set(fixedPayload);
+
+  // Wipe sensitive buffers
+  try { clear.fill(0); } catch {}
+  try { keyBytes.fill(0); } catch {}
+
+  return { meta, innerMeta, fixedChunk: out };
+}
+
+/* =================== Detector (decides det vs pw) =================== */
+
+export function detectDetEnvelope(bytes) {
+  const { meta } = parseEnvelopeHeaderOrThrow(bytes);
+  const isDet = (meta?.kdf?.kdf === 'HKDF') && (meta?.salt == null);
+  return { kind: isDet ? 'det' : 'pw', meta };
+}
+
+/* =================== Writers must also use the NS in metadata =================== */
+
+// Example snippet when creating metadata (AAD) for a sealed part:
+// const metaObj = {
+//   enc_v: Number(FORMAT_VER),
+//   algo: 'AES-GCM',
+//   iv: b64(ivU8),
+//   salt: null,                     // or b64(salt) for per-envelope paths
+//   kdf: { kdf: 'HKDF', v: 1, from: 'Argon2id-once' }, // or { kdf: 'Argon2id', ... }
+//   bundleId,
+//   ns: CRYPTO_NS                   // namespace marker
+// };
+// const aad = TE.encode(JSON.stringify(metaObj));
+
+function ensureNamespaceOrThrow(meta) {
+  if (meta.ns !== CRYPTO_NS) {
+    throw new EnvelopeError('ns_mismatch', 'Namespace mismatch');
+  }
+}
+
+function ensureAlgoAndVersionOrThrow(meta) {
+  if (!ACCEPTED_VERSIONS.includes(Number(meta.enc_v)) || meta.algo !== 'AES-GCM') {
+    throw new EnvelopeError('algo', 'Unsupported AEAD');
+  }
+}
+
+// ===== Other constants and parameters =====
 
 // Build-time flag: set to false in hard-CSP builds
 // When false → strict worker only → any CSP/WASM failure is a hard failure
 const ALLOW_PERMISSIVE_FALLBACK = true;
 let __permissiveFallbackUsed = false;
+
+const REQUIRE_WASM_STRICT = true;
 
 const ARGON2_JS_PATH   = './argon2-bundled.min.js';
 const ARGON2_WASM_PATH = './argon2.wasm';
@@ -15,8 +409,8 @@ let __WORDLOG2__ = undefined;
 const MAX_INPUT_BYTES   = 512 * 1024 * 1024;        // 512 MiB bound for ZIP extraction DoS guard
 const MAX_BUNDLE_BYTES = MAX_INPUT_BYTES; 
 const FIXED_CHUNK_SIZE  = 4 * 1024 * 1024;          // 4 MiB fixed-size chunks
-const FILE_BUNDLE_EXT   = '.cboxbundle';
-const FILE_SINGLE_EXT   = '.cbox';
+const FILE_BUNDLE_EXT   = '.bundle';
+const FILE_SINGLE_EXT   = '.data';
 
 // Argon2 auto-tuning targets and bounds
 const AUTO_TARGET_MS_MIN = 900;
@@ -30,65 +424,135 @@ const ARGON_MAX_T        = 10;
 
 // Max amount of text we render directly in the UI (1 MiB)
 const MAX_PREVIEW = 1 * 1024 * 1024;
+// ====================================================================
+// Trusted Script URL (single source of truth)
+// - Exact allowlist on absolute pathnames (works in subdir deployments)
+// - Same-origin only; no query/hash; no data:/blob:/filesystem:
+// - One default TT policy + one worker-url TT policy
+// - Safe manual fallback when TT is unavailable
+// - No duplicate globals; frozen state; tiny self-tests
+// ====================================================================
 
-// ===== Trusted Types setup (default + worker-url) ===============================
-// CSP expectations:
-//   require-trusted-types-for 'script';
-//   trusted-types default worker-url;
-// Policy goals:
-//   - Block createHTML / createScript (no innerHTML/eval injection).
-//   - Only allow same-origin ScriptURLs for Web Workers and modules.
-//   - Support GitHub Pages subfolder deployments.
-// ==============================================================================
+(() => {
+  "use strict";
 
-(function setupTrustedTypes() {
-  // If Trusted Types are not supported, nothing to do (older browsers).
-  if (!window.trustedTypes) return;
+  // ---------- Utilities (no redefinitions elsewhere) ----------------
+  const toAbsURL = (rel) => new URL(String(rel), self.location.href);
+  const toAbsPath = (rel) => toAbsURL(rel).pathname;
 
-  // Shared validator for allowed ScriptURLs
-  const allowScriptURL = (url) => {
-    const u = new URL(url, location.href);
-    if (u.origin !== location.origin) throw new TypeError('TrustedTypes: only same-origin ScriptURL allowed');
-    if (u.search || u.hash) throw new TypeError('TrustedTypes: query/hash not allowed for ScriptURL');
-    const p = u.pathname;
-    const allowed = new Set([
-      '/app.js',
-      '/argon-worker.js',
-      '/argon-worker-permissive.js',
-      '/argon2-bundled.min.js'
-    ]);
-    if (!allowed.has(p)) throw new TypeError('TrustedTypes: ScriptURL path not whitelisted: ' + p);
-    return u.toString();
-  };
+  // Normalize and freeze an allowlist of absolute paths
+  const RAW_ALLOWED_REL = [
+    "./app.js",
+    "./argon-worker.js",
+    "./argon-worker-permissive.js",
+    "./argon2-bundled.min.js",
+    "./argon2.wasm",     // ✅ nécessaire : permet au worker de charger le WASM
+  ];
+  const ALLOWED_SCRIPT_PATHS = Object.freeze(new Set(RAW_ALLOWED_REL.map(toAbsPath)));
 
-  // Create the "default" policy if not already defined
-  try {
-    if (!trustedTypes.defaultPolicy) {
-      trustedTypes.createPolicy('default', {
-        createHTML()   { throw new TypeError('TrustedTypes: createHTML blocked'); },
-        createScript() { throw new TypeError('TrustedTypes: createScript blocked'); },
-        createScriptURL: allowScriptURL,
-      });
+  // Disallow dangerous schemes explicitly (defense-in-depth)
+  const DISALLOWED_SCHEMES = Object.freeze(new Set(["data:", "blob:", "filesystem:"]));
+
+  function assertSameOriginNoSearchHash(urlObj) {
+    if (urlObj.origin !== self.location.origin) {
+      throw new TypeError("TrustedTypes: only same-origin ScriptURL allowed");
     }
-  } catch (e) {
-    try { console.warn('[TT] default policy not installed:', e); } catch {}
+    if (urlObj.search || urlObj.hash) {
+      throw new TypeError("TrustedTypes: query/hash not allowed for ScriptURL");
+    }
+    for (const bad of DISALLOWED_SCHEMES) {
+      if (urlObj.href.startsWith(bad)) {
+        throw new TypeError(`TrustedTypes: disallowed URL scheme (${bad})`);
+      }
+    }
   }
 
-  // Create a dedicated "worker-url" policy (allowed by CSP)
+  function assertPathAllowed(urlObj) {
+    const p = urlObj.pathname;
+    if (!ALLOWED_SCRIPT_PATHS.has(p)) {
+      try { console.warn("[TT] Blocked ScriptURL path:", p, "(not in allowlist)"); } catch {}
+      throw new TypeError("TrustedTypes: ScriptURL path not whitelisted");
+    }
+  }
+
+  function validateAndStringifyScriptURL(input) {
+    const u = toAbsURL(input);
+    assertSameOriginNoSearchHash(u);
+    assertPathAllowed(u);
+    return u.toString();
+  }
+
+  // ---------- Trusted Types policies (if supported) ------------------
+  let workerUrlPolicy = null;
+
+  (function setupTrustedTypes() {
+    const tt = self.trustedTypes;
+    if (!tt) return;
+
+    const allowScriptURL = (raw) => validateAndStringifyScriptURL(raw);
+
+    try {
+      const already = (typeof tt.getPolicy === "function") ? tt.getPolicy("default") : tt.defaultPolicy;
+      if (!already) {
+        tt.createPolicy("default", {
+          createHTML()   { throw new TypeError("TrustedTypes: createHTML blocked"); },
+          createScript() { throw new TypeError("TrustedTypes: createScript blocked"); },
+          createScriptURL: allowScriptURL,
+        });
+      }
+    } catch (e) {
+      try { console.warn("[TT] default policy install failed (non-fatal):", e); } catch {}
+    }
+
+    try {
+      workerUrlPolicy =
+        (typeof tt.getPolicy === "function" && tt.getPolicy("worker-url")) ||
+        tt.createPolicy("worker-url", { createScriptURL: allowScriptURL });
+    } catch (e) {
+      try { console.warn("[TT] worker-url policy not installed (may already exist):", e); } catch {}
+      try {
+        workerUrlPolicy = (typeof tt.getPolicy === "function") ? tt.getPolicy("worker-url") : workerUrlPolicy;
+      } catch {}
+    }
+  })();
+
+  function makeTrustedScriptURL(relativePath) {
+    if (workerUrlPolicy && typeof workerUrlPolicy.createScriptURL === "function") {
+      return workerUrlPolicy.createScriptURL(relativePath);
+    }
+    return validateAndStringifyScriptURL(relativePath);
+  }
+
+  const diagnostics = Object.freeze({
+    allowedPaths: Object.freeze([...ALLOWED_SCRIPT_PATHS]),
+    hasTrustedTypes: !!self.trustedTypes,
+    policyNames: (() => {
+      try {
+        if (!self.trustedTypes || typeof self.trustedTypes.getPolicyNames !== "function") return [];
+        return Object.freeze(self.trustedTypes.getPolicyNames());
+      } catch { return []; }
+    })(),
+  });
+
+  const API = Object.freeze({ makeTrustedScriptURL, diagnostics });
+
+  Object.defineProperty(self, "__ScriptURL", {
+    value: API,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
+
   try {
-    const p = trustedTypes.createPolicy('worker-url', {
-      createScriptURL: allowScriptURL,
-    });
-    // Cache for later use so other code can reuse this policy safely
-    try { window.__workerUrlPolicy = p; } catch {}
+    const ok = makeTrustedScriptURL("./argon-worker.js");
+    if (!ok) throw new Error("Self-test: failed to produce a ScriptURL for allowed path");
+    let threw = false;
+    try { makeTrustedScriptURL("./not-allowed.js"); } catch { threw = true; }
+    if (!threw) throw new Error("Self-test: did not block a non-allowlisted path");
   } catch (e) {
-    try { console.warn('[TT] worker-url policy not installed (may already exist):', e); } catch {}
-    // If the policy already exists, attempt to read it from a cached handle
-    // (another script may have created and cached it earlier)
-    // No throw here to avoid breaking worker startup later.
+    try { console.error("[TT] Self-test failed:", e); } catch {}
   }
 })();
-
 
 
 // ===== Utilities =====
@@ -305,7 +769,7 @@ async function secureFail(ctx, overrideMsg) {
   // Optionally reset ARIA-now to 0 so screen readers don’t announce stale values
   try { setProgress(document.getElementById('encBarText'),  0); } catch {}
   try { setProgress(document.getElementById('encBarFiles'), 0); } catch {}
-  try { setProgress('decBar', 0); } catch {}
+  try { setProgress('#decBar', 0); } catch {}
 
   // Hide results ONLY if they are actually empty (no stale UI)
   try { hideIfEmpty('#encOutputsText',  '#encResultsText'); } catch {}
@@ -356,6 +820,23 @@ function normalizeEncError(err) {
     return 'Encryption failed or file is corrupted.';
   }
 }
+
+// Safe regex-escape
+function rxEscape(s){ return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+// Name builders (single source of truth)
+function namePart(i){ return `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`; }
+function nameManifestPart(i){ return `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`; }
+function nameIndexPart(i){ return `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`; }
+function nameHeader(){ return `BUNDLE_HEADER${FILE_SINGLE_EXT}`; }
+
+// Dynamic regex (case-insensitive)
+const RX_SINGLE_EXT     = new RegExp(rxEscape(FILE_SINGLE_EXT) + '$', 'i');
+const RX_BUNDLE_EXT     = new RegExp(rxEscape(FILE_BUNDLE_EXT) + '$', 'i');
+const RX_PART           = new RegExp(`^part-\\d{6}${rxEscape(FILE_SINGLE_EXT)}$`, 'i');
+const RX_MANIFEST_PART  = new RegExp(`^MANIFEST\\.part-\\d{6}${rxEscape(FILE_SINGLE_EXT)}$`, 'i');
+const RX_INDEX_PART     = new RegExp(`^MANIFEST_INDEX\\.part-\\d{6}${rxEscape(FILE_SINGLE_EXT)}$`, 'i');
+const RX_ANY_EXPECTED   = [RX_PART, RX_MANIFEST_PART, RX_INDEX_PART, new RegExp(`^${rxEscape(nameHeader())}$`, 'i')];
 
 function preflightInputs(files) {
   const total = files.reduce((s,f)=>s+ (f.size||0), 0);
@@ -584,43 +1065,6 @@ function timingSafeEqual(a, b) {
   return out === 0;
 }
 
-/* ******************************************************
- * HKDF helpers (one-time master → subkeys/IVs)
- *  - hkdfExpand: WebCrypto HKDF-Expand (SHA-256)
- *  - hkdfSplit : derive encryption and IV subkeys from master
- ****************************************************** */
-async function hkdfExpand(baseKeyBytes, saltBytes, infoBytes, outLen) {
-  const ikm = await crypto.subtle.importKey('raw', baseKeyBytes, 'HKDF', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'HKDF', hash: 'SHA-256', salt: saltBytes, info: infoBytes },
-    ikm, outLen * 8
-  );
-  return new Uint8Array(bits);
-}
-
-async function hkdfSplit(master32, bundleSalt) {
-  const kEnc32 = await hkdfExpand(master32, bundleSalt, TE.encode('cbox/kEnc'), 32);
-  const kIv32  = await hkdfExpand(master32, bundleSalt, TE.encode('cbox/kIv'),  32);
-  return { kEnc32, kIv32 };
-}
-
-/* ******************************************************
- * Deterministic 96-bit IV per chunk via HKDF
- *  - Stable for (kIv32, bundleId, chunkIndex)
- ****************************************************** */
-async function deriveIv96(kIv32, bundleId, chunkIndex, domain = 'data') {
-  const prefix = TE.encode(`cbox/iv/${domain}/`);
-  const bid    = TE.encode(bundleId);
-  const info   = new Uint8Array(prefix.length + bid.length + 4);
-
-  let p = 0;
-  info.set(prefix, p); p += prefix.length;
-  info.set(bid,    p); p += bid.length;
-  new DataView(info.buffer, info.byteOffset + p, 4).setUint32(0, chunkIndex >>> 0, false);
-
-  return hkdfExpand(kIv32, new Uint8Array(0), info, 12); // 96-bit IV
-}
-
 // ===== Worker selection (strict vs permissive) =====
 //
 // Production-safe policy (no user/manual toggles):
@@ -658,77 +1102,115 @@ function looksLikeWasmCspError(err) {
   );
 }
 
-async function startArgonWorker(url) {
+/**
+ * Start the Argon2 Web Worker and wait for its "init" handshake.
+ * - Validates URL via __ScriptURL.makeTrustedScriptURL (TT or safe fallback).
+ * - Uses module workers (works with strict CSP + TT).
+ * - Cleans up listeners and timers on resolve/reject.
+ * - Wraps errors into EnvelopeError with clear codes.
+ *
+ * @param {string} urlRel - Relative path to the worker (e.g., "./argon-worker.js").
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs=10000] - Handshake timeout.
+ * @returns {Promise<Worker>}
+ */
+async function startArgonWorker(urlRel, opts = {}) {
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 10_000;
+
+  // ---- Resolve/validate the worker URL through the central hardening API
+  let workerURL;
+  try {
+    // Produces TrustedScriptURL (when TT available) or a validated absolute string otherwise
+    if (!self.__ScriptURL || typeof __ScriptURL.makeTrustedScriptURL !== 'function') {
+      throw new EnvelopeError('worker_url_blocked', 'Trusted URL helper missing');
+    }
+    workerURL = __ScriptURL.makeTrustedScriptURL(urlRel);
+  } catch (e) {
+    // Keep the path visible in diagnostics when possible
+    const pathname = (() => {
+      try { return new URL(urlRel, location.href).pathname; } catch { return String(urlRel); }
+    })();
+    throw (e instanceof EnvelopeError)
+      ? e
+      : new EnvelopeError('worker_url_blocked', 'Worker URL validation failed', { cause: e, fileName: pathname });
+  }
+
+  // ---- Construct the worker
+  let w;
+  try {
+    // Prefer module workers (safer with CSP + no classic inline importScripts)
+    w = new Worker(workerURL, { type: 'module', name: 'argon2-worker' });
+  } catch (e) {
+    // Construction can fail synchronously due to CSP/TT/URL issues
+    const pathname = (() => {
+      try { return new URL(String(workerURL), location.href).pathname; } catch { return String(urlRel); }
+    })();
+    throw new EnvelopeError('worker_init', 'Failed to construct Argon2 worker', { cause: e, fileName: pathname });
+  }
+
+  // ---- Await handshake ("init") with robust cleanup
   return new Promise((resolve, reject) => {
     let settled = false;
-    let w;
-    try {
-      // Trusted Types policy for Worker script URLs
-      // Reuse the previously created policy when available; otherwise apply the same whitelist logic.
-      const workerPolicy = (window.trustedTypes && window.__workerUrlPolicy)
-        ? window.__workerUrlPolicy
-        : {
-            createScriptURL: (u) => {
-              const abs = new URL(u, location.href);
-              if (abs.origin !== location.origin) throw new EnvelopeError('worker_url_blocked','Cross-origin worker blocked',{fileName:abs.pathname});
-              if (abs.search || abs.hash) throw new EnvelopeError('worker_url_blocked','Worker URL cannot have query/hash',{fileName:abs.pathname});
-              const okPath = abs.pathname.endsWith('/argon-worker.js') ||
-                             abs.pathname.endsWith('/argon-worker-permissive.js');
-              if (!okPath) throw new EnvelopeError('worker_url_blocked','Worker path not whitelisted',{fileName:abs.pathname});
-              return abs.toString();
-            }
-          };
-      try {
-          w = new Worker(workerPolicy.createScriptURL(url));
-      } catch (e) {
-          // Erreur de construction du Worker (CSP/TT/URL)
-          throw new EnvelopeError('worker_init', 'Failed to construct Argon2 worker', { cause: e, fileName: url });
-      }
-      
-    } catch (syncErr) {
-      // CSP/TT/URL can block synchronously
-      reject(syncErr instanceof EnvelopeError
-        ? syncErr
-        : new EnvelopeError('worker_init', 'Failed to start Argon2 worker', { cause: syncErr, fileName: url }));
-      return;
-    }
 
-    const to = setTimeout(() => {
-      if (!settled) {
-        settled = true;
+    const cleanup = (terminate = false) => {
+      try { w.removeEventListener('message', onMsg); } catch {}
+      try { w.removeEventListener('error', onErr); } catch {}
+      try { w.removeEventListener('messageerror', onMsgErr); } catch {}
+      clearTimeout(to);
+      if (terminate) {
         try { w.terminate(); } catch {}
-        reject(new Error('worker_init_timeout'));
-      }
-    }, 10000);
-
-    const onMsg = (e) => {
-      const d = e.data || {};
-      if (d.cmd === 'init') {
-        clearTimeout(to);
-        w.removeEventListener('message', onMsg);
-        if (!settled) { settled = true; resolve(w); }
       }
     };
 
-    w.addEventListener('message', onMsg);
-    
-    w.addEventListener('error', (e) => {
-      if (!settled) {
-        settled = true; clearTimeout(to);
-        try { w.terminate(); } catch {}
-        reject((e && e.error) || new Error(e?.message || 'worker_error'));
-      }
-    });
-    
-    w.addEventListener('messageerror', (e) => {
-      if (!settled) {
-        settled = true; clearTimeout(to);
-        try { w.terminate(); } catch {}
-        reject(new Error('worker_message_error'));
-      }
-    });
+    const to = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup(true);
+      reject(new EnvelopeError('worker_init_timeout', 'Argon2 worker handshake timed out'));
+    }, timeoutMs);
 
-    w.postMessage({ cmd: 'init', payload: { jsURL: ARGON2_JS_PATH, wasmURL: ARGON2_WASM_PATH } });
+    const onMsg = (e) => {
+      const d = e?.data || {};
+      if (d.cmd === 'init') {
+        if (settled) return;
+        settled = true;
+        cleanup(false);
+        resolve(w);
+      }
+    };
+
+    const onErr = (e) => {
+      if (settled) return;
+      settled = true;
+      cleanup(true);
+      // Prefer original error if present
+      const base = (e && e.error) ? e.error : new Error(e?.message || 'worker_error');
+      reject(new EnvelopeError('worker_error', 'Argon2 worker emitted an error', { cause: base }));
+    };
+
+    const onMsgErr = () => {
+      if (settled) return;
+      settled = true;
+      cleanup(true);
+      reject(new EnvelopeError('worker_message_error', 'Argon2 worker message deserialization failed'));
+    };
+
+    w.addEventListener('message', onMsg);
+    w.addEventListener('error', onErr);
+    w.addEventListener('messageerror', onMsgErr);
+
+    // Kick off worker-side initialization
+    try {
+      w.postMessage({
+        cmd: 'init',
+        payload: { jsURL: ARGON2_JS_PATH, wasmURL: ARGON2_WASM_PATH }
+      });
+    } catch (e) {
+      if (settled) return;
+      settled = true;
+      cleanup(true);
+      reject(new EnvelopeError('worker_init', 'Failed to post init message to worker', { cause: e }));
+    }
   });
 }
 
@@ -739,31 +1221,30 @@ async function getArgonWorker() {
   try {
     return await startArgonWorker('./argon-worker.js');
   } catch (err) {
-    if (!looksLikeWasmCspError(err)) throw err;
+    const isTimeoutOrWorkerFail =
+      (err && err.code === 'worker_init_timeout') ||
+      (err && err.code === 'worker_init') ||
+      (err && err.code === 'worker_error') ||
+      (err && err.code === 'worker_message_error');
+  
+    const eligible = looksLikeWasmCspError(err) || isTimeoutOrWorkerFail;
+  
+    if (!eligible) throw err;
     if (!ALLOW_PERMISSIVE_FALLBACK) throw err;
-
+  
     try {
-      console.warn('[argon2] Strict worker blocked by CSP/WASM; attempting permissive worker…');
+      console.warn('[argon2] Strict worker indisponible; tentative en mode permissif…');
       const w = await startArgonWorker('./argon-worker-permissive.js');
-
       __permissiveFallbackUsed = true;
-
       try {
         showErrorBanner(
-          'Running in degraded mode (permissive worker). Cryptography remains safe, but CSP was relaxed.'
+          'Running in degraded mode (permissive worker). Cryptography remains safe, but CSP/worker was restricted.'
         );
-        setLive('Degraded mode active: permissive worker in use.');
       } catch {}
-
       return w;
-    } catch (err2) {
-      const combo = new Error(
-        'permissive_fallback_failed: strict=' +
-        String(err && (err.message || err)) +
-        '; permissive=' +
-        String(err2 && (err2.message || err2))
-      );
-      combo.name = 'WorkerFallbackError';
+    } catch (e2) {
+      const combo = new EnvelopeError('worker_fallback_failed', 'Permissive worker also failed', { cause: e2 });
+      try { combo.meta = { first: err, second: e2 }; } catch {}
       throw combo;
     }
   }
@@ -862,6 +1343,26 @@ function jitterMemory(m) {
   return out;
 }
 
+// --- helper minimal, à poser au-dessus du handler (ou dans tes helpers)
+function kdfIsReady() {
+  return tunedParams &&
+         Number.isFinite(tunedParams.mMiB) &&
+         Number.isFinite(tunedParams.t) &&
+         Number.isFinite(tunedParams.p);
+}
+
+function waitForKdfReady(timeoutMs = 8000, intervalMs = 50) {
+  return new Promise((resolve, reject) => {
+    const t0 = performance.now();
+    const id = setInterval(() => {
+      if (kdfIsReady()) { clearInterval(id); resolve(true); }
+      else if (performance.now() - t0 > timeoutMs) {
+        clearInterval(id);
+        reject(new EnvelopeError('argon_missing', 'Argon2 parameters are missing'));
+      }
+    }, intervalMs);
+  });
+}
 
 
 // ===== Rate-limit UX (simple token bucket per action kind) =====
@@ -965,9 +1466,7 @@ function choosePadBucket() {
 }
 
 
-// ===== Envelope format (version 4) =====
-
-const MAGIC = TE.encode('CBOX4');
+// ===== Envelope format =====
 
 /**
  * Encode metadata object as additional authenticated data (AAD).
@@ -979,20 +1478,33 @@ function metaAAD(metaObj) {
 /**
  * Validate Argon2 parameter bounds; throw on unsupported values.
  */
-function validateArgon({ mMiB, t, p }) {
-  if (!Number.isFinite(mMiB) || mMiB < ARGON_MIN_MIB || mMiB > ARGON_MAX_MIB) throw new EnvelopeError('arg_memory',   'Unsupported Argon2 memory');
-  if (!Number.isFinite(t)    || t    < ARGON_MIN_T   || t    > ARGON_MAX_T  ) throw new EnvelopeError('arg_time',     'Unsupported Argon2 time');
-  if (!Number.isFinite(p)    || p    < HEALTHY_P_MIN || p    > HEALTHY_P_MAX) throw new EnvelopeError('arg_parallel', 'Unsupported Argon2 parallelism');
+function validateArgon(params) {
+  // ✅ Correction de la déstructuration
+  if (!params || typeof params !== 'object') {
+    throw new EnvelopeError('argon_params_missing', 'Argon2 parameters are missing');
+  }
+
+  const { mMiB, t, p } = params;
+
+  if (!Number.isFinite(mMiB) || mMiB < ARGON_MIN_MIB || mMiB > ARGON_MAX_MIB)
+    throw new EnvelopeError('arg_memory',   'Unsupported Argon2 memory');
+
+  if (!Number.isFinite(t)    || t    < ARGON_MIN_T   || t    > ARGON_MAX_T)
+    throw new EnvelopeError('arg_time',     'Unsupported Argon2 time');
+
+  if (!Number.isFinite(p)    || p    < HEALTHY_P_MIN || p    > HEALTHY_P_MAX)
+    throw new EnvelopeError('arg_parallel', 'Unsupported Argon2 parallelism');
 }
 
 /* ******************************************************
  * sealFixedChunkDet
  *  - Encrypt a fixed-size chunk with AES-GCM (bundle-level keys)
  ****************************************************** */
-async function sealFixedChunkDet({
-  kEncKey, kIv32, bundleId, payloadChunk, chunkIndex, totalChunks, totalPlainLen, domain = 'data'
-}) {
-  const ivU8 = new Uint8Array(await deriveIv96(kIv32, bundleId, chunkIndex, domain));
+async function sealFixedChunkDet({ kEncKey, kIv32, bundleId, payloadChunk, chunkIndex, totalChunks, totalPlainLen, domain = CRYPTO_NS }) {
+  const ivU8 = await deriveIv96(kIv32, bundleId, chunkIndex, domain);
+
+  if (DEBUG && ivU8.length !== 12)
+    throw new EnvelopeError('iv_len', 'IV must be 96-bit');
 
   const innerMeta = { v: 1, kind: 'fixed', fixedSize: FIXED_CHUNK_SIZE, chunkIndex, totalChunks, totalPlainLen };
   const innerMetaBytes = TE.encode(JSON.stringify(innerMeta));
@@ -1003,11 +1515,13 @@ async function sealFixedChunkDet({
   plainPre.set(payloadChunk, 4 + innerMetaBytes.length);
 
   const metaObj = {
-    enc_v: 4, algo: 'AES-GCM',
+    enc_v: Number(FORMAT_VER),
+    algo: 'AES-GCM',
     iv: b64(ivU8),                     // informational only
     salt: null,
     kdf: { kdf: 'HKDF', v: 1, from: 'Argon2id-once' },
-    bundleId
+    bundleId,
+    ns: CRYPTO_NS
   };
   const aad = metaAAD(metaObj);
 
@@ -1029,200 +1543,12 @@ async function sealFixedChunkDet({
 }
 
 
-/* ******************************************************
- * openFixedChunkDet
- *  - Decrypts a fixed-size chunk using bundle-level:
- *      - kEncKey (AES-256-GCM)
- *      - kIv32 (HKDF IV key) to rebuild IV deterministically
- *  - Verifies bundleId and inner meta
- ****************************************************** */
-async function openFixedChunkDet({ kEncKey, kIv32, bytes, expectedBundleId, chunkIndex, domain = 'data' }) {
-  /* ******************************************************
-   * Strict header: MAGIC + meta length field guard
-   ****************************************************** */
-  const MAGIC_LEN = MAGIC.length;
-  if (bytes.length < MAGIC_LEN + 4) {
-    throw new EnvelopeError('format', 'Invalid envelope');
-  }
-  const magicView = bytes.subarray(0, MAGIC_LEN);
-  for (let i = 0; i < MAGIC_LEN; i++) {
-    if (magicView[i] !== MAGIC[i]) {
-      throw new EnvelopeError('magic', 'Unknown format');
-    }
-  }
-
-  /* ******************************************************
-   * Metadata (AAD) parsing
-   ****************************************************** */
-  const metaLen   = new DataView(bytes.buffer, bytes.byteOffset + MAGIC_LEN, 4).getUint32(0, false);
-  const metaStart = MAGIC_LEN + 4;
-  const metaEnd   = metaStart + metaLen;
-  if (metaEnd > bytes.length) {
-    throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
-  }
-
-  const metaBytes = bytes.subarray(metaStart, metaEnd);
-  if (metaBytes.length > 4096) {
-    throw new EnvelopeError('meta_big', 'Metadata too large');
-  }
-
-  let meta;
-  try {
-    meta = JSON.parse(TD.decode(metaBytes));
-  } catch {
-    throw new EnvelopeError('meta_parse', 'Malformed metadata');
-  }
-
-  if (meta.enc_v !== 4 || meta.algo !== 'AES-GCM') {
-    throw new EnvelopeError('algo', 'Unsupported AEAD');
-  }
-  if (expectedBundleId !== undefined && meta.bundleId !== expectedBundleId) {
-    throw new EnvelopeError('bundle_mismatch', 'BundleId mismatch');
-  }
-
-  /* ******************************************************
-   * Deterministic IV for this chunk
-   ****************************************************** */
-  const ivU8 = await deriveIv96(kIv32, meta.bundleId || '', chunkIndex >>> 0, domain);
-
-  /* ******************************************************
-   * Decrypt and parse inner prelude
-   ****************************************************** */
-  const cipher = bytes.subarray(metaEnd);
-  const clear  = new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: ivU8, additionalData: metaBytes, tagLength: 128 },
-    kEncKey,
-    cipher
-  ));
-
-  if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
-  const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
-  const innerEnd = 4 + innerLen;
-  if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner meta');
-
-  const innerMetaBytes = clear.subarray(4, innerEnd);
-  let innerMeta;
-  try {
-    innerMeta = JSON.parse(TD.decode(innerMetaBytes));
-  } catch {
-    throw new EnvelopeError('inner_parse', 'Malformed inner meta');
-  }
-
-  const fixedPayload = clear.subarray(innerEnd, innerEnd + FIXED_CHUNK_SIZE);
-  const out = new Uint8Array(fixedPayload.length);
-  out.set(fixedPayload);
-
-  try { clear.fill(0); } catch {}
-  return { meta, innerMeta, fixedChunk: out };
-}
-
-/* ******************************************************
- * openFixedChunk (legacy, password-based per envelope)
- *  - Supports single .cbox path with per-envelope Argon2id
- *  - Reads KDF params from metadata (meta.kdf) or falls back to tunedParams
- *  - Returns { meta, innerMeta, fixedChunk }
- ****************************************************** */
-async function openFixedChunk({ password, bytes, params }) {
-  if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
-
-  /* ******************************************************
-   * Strict header: MAGIC + meta length field guard
-   ****************************************************** */
-  const MAGIC_LEN = MAGIC.length;
-  if (bytes.length < MAGIC_LEN + 4) {
-    throw new EnvelopeError('format', 'Invalid envelope');
-  }
-  const magicView = bytes.subarray(0, MAGIC_LEN);
-  for (let i = 0; i < MAGIC_LEN; i++) {
-    if (magicView[i] !== MAGIC[i]) {
-      throw new EnvelopeError('magic', 'Unknown format');
-    }
-  }
-
-  /* ******************************************************
-   * Metadata (AAD) parsing
-   ****************************************************** */
-  const metaLen   = new DataView(bytes.buffer, bytes.byteOffset + MAGIC_LEN, 4).getUint32(0, false);
-  const metaStart = MAGIC_LEN + 4;
-  const metaEnd   = metaStart + metaLen;
-  if (metaEnd > bytes.length) {
-    throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
-  }
-
-  const metaBytes = bytes.subarray(metaStart, metaEnd);
-  if (metaBytes.length > 4096) {
-    throw new EnvelopeError('meta_big', 'Metadata too large');
-  }
-
-  let meta;
-  try {
-    meta = JSON.parse(TD.decode(metaBytes));
-  } catch {
-    throw new EnvelopeError('meta_parse', 'Malformed metadata');
-  }
-
-  if (meta.enc_v !== 4 || meta.algo !== 'AES-GCM') {
-    throw new EnvelopeError('algo', 'Unsupported AEAD');
-  }
-  if (!meta.kdf || meta.kdf.kdf !== 'Argon2id') {
-    throw new EnvelopeError('kdf', 'Unsupported KDF');
-  }
-  if (!meta.salt) {
-    throw new EnvelopeError('salt', 'Missing KDF salt');
-  }
-
-  /* ******************************************************
-   * Per-envelope Argon2id → AES-GCM key
-   ****************************************************** */
-  const kdfParams = {
-    mMiB: Number(meta.kdf.mMiB ?? params?.mMiB ?? tunedParams?.mMiB),
-    t:    Number(meta.kdf.t    ?? params?.t    ?? tunedParams?.t),
-    p:    Number(meta.kdf.p    ?? params?.p    ?? tunedParams?.p)
-  };
-  validateArgon(kdfParams);
-
-  const salt    = b64d(meta.salt);
-  const keyBytes = await deriveArgon2id(password, salt, kdfParams);
-  const key      = await importAesKey(keyBytes);
-
-  /* ******************************************************
-   * Decrypt and parse inner prelude
-   ****************************************************** */
-  const cipher = bytes.subarray(metaEnd);
-  const clear  = new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: b64d(meta.iv), additionalData: metaBytes, tagLength: 128 },
-    key,
-    cipher
-  ));
-
-  if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
-  const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
-  const innerEnd = 4 + innerLen;
-  if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner meta');
-
-  const innerMetaBytes = clear.subarray(4, innerEnd);
-  let innerMeta;
-  try {
-    innerMeta = JSON.parse(TD.decode(innerMetaBytes));
-  } catch {
-    throw new EnvelopeError('inner_parse', 'Malformed inner meta');
-  }
-
-  const fixedPayload = clear.subarray(innerEnd, innerEnd + FIXED_CHUNK_SIZE);
-  const out = new Uint8Array(fixedPayload.length);
-  out.set(fixedPayload);
-
-  try { clear.fill(0); } catch {}
-  try { keyBytes.fill(0); } catch {}
-  return { meta, innerMeta, fixedChunk: out };
-}
-
-
 // ===== Minimal ZIP (store-only) =====
 //
 // We only build and read "store" (method=0) entries.
 // Extraction validates every header and offset before slicing.
-// No data descriptors (GP bit 3 must be 0). No ZIP64.
+// store-only, CD-authoritative; DD tolerated (via CD values)
+// (GPBF bit 3 may be set → ignore LFH sizes/CRC, trust CD)
 
 const CRC_TABLE = (() => {
   const t = new Uint32Array(256);
@@ -1631,7 +1957,7 @@ class FileStreamSink {
 
 
 // Automatically chooses the best sink: FS (O(1)) otherwise memory (SegmentsSink)
-async function getBundleSink(suggestedName = 'secret.cboxbundle') {
+async function getBundleSink(suggestedName = 'secret' + FILE_BUNDLE_EXT) {
   if (window.showSaveFilePicker) {
     try {
       const handle = await showSaveFilePicker({
@@ -1655,60 +1981,43 @@ async function getBundleSink(suggestedName = 'secret.cboxbundle') {
 
 // ===== Manifest (authenticated) =====
 
-/**
- * (Legacy helper) Produce an authenticated manifest envelope (not used in final bundle path;
- * kept for completeness and potential future compositions).
- */
-async function sealManifest({ password, params, chunkHashes, totalPlainLen }) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const iv   = crypto.getRandomValues(new Uint8Array(12));
-
-  const inner = {
-    v: 1, kind: 'manifest',
-    chunkSize: FIXED_CHUNK_SIZE,
-    totalPlainLen,
-    totalChunks: chunkHashes.length,
-    chunkHashes,
-    createdAt: new Date().toISOString()
-  };
-  const innerBytes = TE.encode(JSON.stringify(inner));
-  const header4    = u32be(innerBytes.length);
-  const plainPre   = new Uint8Array(4 + innerBytes.length);
-  plainPre.set(header4, 0);
-  plainPre.set(innerBytes, 4);
-
-  const metaObj = {
-    enc_v: 4, algo: 'AES-GCM',
-    iv: b64(iv), salt: b64(salt),
-    kdf: { kdf: 'Argon2id', v: 1, mMiB: params.mMiB, t: params.t, p: params.p }
-  };
-  const aad = metaAAD(metaObj);
-
-  const keyBytes = await deriveArgon2id(password, salt, params);
-  const key      = await importAesKey(keyBytes);
-  const ct       = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, key, plainPre));
-
-  const head = new Uint8Array(MAGIC.length + 4 + aad.length);
-  head.set(MAGIC, 0);
-  new DataView(head.buffer, MAGIC.length, 4).setUint32(0, aad.length, false);
-  head.set(aad, MAGIC.length + 4);
-
-  const out = new Uint8Array(head.length + ct.length);
-  out.set(head, 0); out.set(ct, head.length);
-
-  wipeBytes(keyBytes); wipeBytes(salt); wipeBytes(iv); wipeBytes(plainPre);
-  return out;
-}
-
 /* ******************************************************
  * sealBundleHeaderWithPassword
- *  - Small password-based header to bootstrap bundle keys
+ *  - Password-based header to bootstrap multi-chunk container keys
  *  - Inner JSON: { v:1, kind:'bundle_header', bundleId, bundleSaltB64 }
  ****************************************************** */
 async function sealBundleHeaderWithPassword({ password, params, bundleId, bundleSaltB64 }) {
+  // 1) Validate KDF params (mMiB/t/p bounds etc.)
+  validateArgon(params);
+
+  // 2) Normalize password if it's a string (consistent with other paths)
+  if (typeof password === 'string') {
+    password = password.normalize('NFKC');
+  }
+
+  // 3) Minimal sanity on inputs persisted in inner JSON
+  if (typeof bundleId !== 'string' || bundleId.length === 0) {
+    throw new EnvelopeError('bundle_id', 'Invalid bundleId');
+  }
+  if (typeof bundleSaltB64 !== 'string' || bundleSaltB64.length === 0) {
+    throw new EnvelopeError('bundle_salt', 'Invalid bundleSaltB64');
+  }
+  // ensure bundleSaltB64 decodes (length is informational here, but reject nonsense)
+  try {
+    const dec = b64d(bundleSaltB64);
+    if (dec.length < 16 || dec.length > 64) {
+      throw new EnvelopeError('bundle_salt_len', 'Unsupported bundleSalt length');
+    }
+  } catch (e) {
+    if (e instanceof EnvelopeError) throw e;
+    throw new EnvelopeError('bundle_salt_b64', 'Malformed bundleSaltB64', { cause: e });
+  }
+
+  // 4) Fresh per-envelope salt/IV for the header AEAD
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv   = crypto.getRandomValues(new Uint8Array(12));
 
+  // 5) Inner JSON
   const inner = { v: 1, kind: 'bundle_header', bundleId, bundleSaltB64 };
   const innerBytes = TE.encode(JSON.stringify(inner));
   const header4    = u32be(innerBytes.length);
@@ -1716,19 +2025,25 @@ async function sealBundleHeaderWithPassword({ password, params, bundleId, bundle
   plainPre.set(header4, 0);
   plainPre.set(innerBytes, 4);
 
+  // 6) AAD / metadata
   const metaObj = {
-    enc_v: 4, algo: 'AES-GCM',
-    iv: b64(iv), salt: b64(salt),
-    kdf: { kdf: 'Argon2id', v: 1, mMiB: params.mMiB, t: params.t, p: params.p }
+    enc_v: Number(FORMAT_VER),
+    algo: 'AES-GCM',
+    iv: b64(iv),
+    salt: b64(salt),
+    kdf: { kdf: 'Argon2id', v: 1, mMiB: params.mMiB, t: params.t, p: params.p },
+    ns: CRYPTO_NS
   };
   const aad = metaAAD(metaObj);
 
+  // 7) Derive & encrypt
   const keyBytes = await deriveArgon2id(password, salt, params);
   const key      = await importAesKey(keyBytes);
   const ct       = new Uint8Array(await crypto.subtle.encrypt(
     { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, key, plainPre
   ));
 
+  // 8) Envelope (MAGIC + metaLen + meta + ct)
   const head = new Uint8Array(MAGIC.length + 4 + aad.length);
   head.set(MAGIC, 0);
   new DataView(head.buffer, MAGIC.length, 4).setUint32(0, aad.length, false);
@@ -1737,73 +2052,101 @@ async function sealBundleHeaderWithPassword({ password, params, bundleId, bundle
   const out = new Uint8Array(head.length + ct.length);
   out.set(head, 0); out.set(ct, head.length);
 
+  // 9) Hygiene
   wipeBytes(keyBytes); wipeBytes(salt); wipeBytes(iv); wipeBytes(plainPre);
+
   return out;
 }
+
 
 /* ******************************************************
  * openBundleHeaderWithPassword
  *  - Open password-based header and return { bundleId, bundleSaltB64 }
+ *  - Dynamic MAGIC length and version/namespace checks
  ****************************************************** */
 async function openBundleHeaderWithPassword({ password, bytes, params }) {
-  if (bytes.length < 9) throw new EnvelopeError('format', 'Invalid envelope');
+  // Parse and validate the outer envelope header (handles MAGIC candidates)
+  const { meta, metaBytes, metaEnd } = parseEnvelopeHeaderOrThrow(bytes);
 
-  // MAGIC check
-  const magicView = bytes.subarray(0, MAGIC.length);
-  for (let i = 0; i < MAGIC.length; i++) {
-    if (magicView[i] !== MAGIC[i]) throw new EnvelopeError('magic', 'Unknown format');
-  }
+  // AEAD / version / namespace checks
+  ensureAlgoAndVersionOrThrow(meta);
+  ensureNamespaceOrThrow(meta);
 
-  const metaLen = new DataView(bytes.buffer, bytes.byteOffset + 5, 4).getUint32(0, false);
-  const metaEnd = 9 + metaLen;
-  if (metaEnd > bytes.length) throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
-
-  const metaBytes = bytes.subarray(9, metaEnd);
-  if (metaBytes.length > 4096) throw new EnvelopeError('meta_big', 'Metadata too large');
-
-  let meta;
-  try { meta = JSON.parse(TD.decode(metaBytes)); }
-  catch { throw new EnvelopeError('meta_parse', 'Malformed metadata'); }
-
-  if (meta.enc_v !== 4 || meta.algo !== 'AES-GCM') throw new EnvelopeError('algo', 'Unsupported AEAD');
-  if (!meta.salt) throw new EnvelopeError('salt', 'Missing KDF salt');
-
+  // KDF checks (Argon2id per-envelope)
   if (!meta.kdf || meta.kdf.kdf !== 'Argon2id') {
     throw new EnvelopeError('kdf', 'Unsupported KDF');
   }
+  if (meta.salt == null || meta.iv == null) {
+    throw new EnvelopeError('salt_iv', 'Missing KDF salt or IV');
+  }
+
+  // Decode + validate IV / salt just like password mode
+  let ivU8, saltU8;
+  try { ivU8 = b64d(String(meta.iv)); }
+  catch { throw new EnvelopeError('iv', 'Invalid IV encoding'); }
+  if (!ivU8 || ivU8.length !== 12) {
+    throw new EnvelopeError('iv_len', 'IV must be 96-bit');
+  }
+
+  try { saltU8 = b64d(String(meta.salt)); }
+  catch { throw new EnvelopeError('salt', 'Invalid salt encoding'); }
+  if (saltU8.length < 16 || saltU8.length > 64) {
+    throw new EnvelopeError('salt_len', 'Unsupported salt length');
+  }
+
+  // Validate Argon2 parameters
   const kdfParams = {
     mMiB: Number(meta.kdf.mMiB),
     t:    Number(meta.kdf.t),
     p:    Number(meta.kdf.p),
   };
   validateArgon(kdfParams);
-  
-  const salt     = b64d(meta.salt);
-  const keyBytes = await deriveArgon2id(password, salt, kdfParams);
-  const key      = await importAesKey(keyBytes);
 
-  const cipher = bytes.subarray(metaEnd);
-  const clear  = new Uint8Array(await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: b64d(meta.iv), additionalData: metaBytes, tagLength: 128 },
-    key, cipher
-  ));
+  let keyBytes;
+  try {
+    // Derive key and import
+    keyBytes = await deriveArgon2id(password, saltU8, kdfParams);
+    const key = await importAesKey(keyBytes);
 
-  if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
-  const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
-  const innerEnd = 4 + innerLen;
-  if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner meta');
+    // Cipher slice sanity
+    const cipher = bytes.subarray(metaEnd);
+    if (cipher.length < 16) {
+      throw new EnvelopeError('cipher_short', 'Ciphertext too short');
+    }
 
-  let inner;
-  try { inner = JSON.parse(TD.decode(clear.subarray(4, innerEnd))); }
-  catch { throw new EnvelopeError('inner_parse', 'Malformed inner JSON'); }
-  finally { try { clear.fill(0); } catch {} }
+    // Decrypt
+    const clear = new Uint8Array(await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: ivU8, additionalData: metaBytes, tagLength: 128 },
+      key, cipher
+    ));
 
-  if (inner.kind !== 'bundle_header' || typeof inner.bundleId !== 'string' || typeof inner.bundleSaltB64 !== 'string') {
-    throw new EnvelopeError('bad_header', 'Invalid bundle header');
+    // Parse inner header
+    if (clear.length < 4) throw new EnvelopeError('clear_short', 'Malformed plaintext');
+    const innerLen = new DataView(clear.buffer, clear.byteOffset, 4).getUint32(0, false);
+    const innerEnd = 4 + innerLen;
+    if (innerEnd > clear.length) throw new EnvelopeError('inner_trunc', 'Truncated inner meta');
+
+    let inner;
+    try {
+      inner = JSON.parse(TD.decode(clear.subarray(4, innerEnd)));
+    } catch {
+      throw new EnvelopeError('inner_parse', 'Malformed inner JSON');
+    } finally {
+      try { clear.fill(0); } catch {}
+    }
+
+    // Basic structure checks
+    if (inner.kind !== 'bundle_header' ||
+        typeof inner.bundleId !== 'string' ||
+        typeof inner.bundleSaltB64 !== 'string') {
+      throw new EnvelopeError('bad_header', 'Invalid bundle header');
+    }
+
+    return { bundleId: inner.bundleId, bundleSaltB64: inner.bundleSaltB64 };
+  } finally {
+    // Always wipe key material even on failure paths
+    try { if (keyBytes) keyBytes.fill(0); } catch {}
   }
-
-  wipeBytes(keyBytes);
-  return { bundleId: inner.bundleId, bundleSaltB64: inner.bundleSaltB64 };
 }
 
 
@@ -1941,6 +2284,7 @@ function promptUserConfirm(message) {
 
 const decBar = '#decBar';
 let tunedParams = null;
+
 let wordlist    = null;
 
 function getEncMode() {
@@ -2217,7 +2561,7 @@ function resetEncryptUI(opts = {}) {
 function resetDecryptUI(opts = {}) {
   const {
     preservePassword = false, // by default, clear the password on Decrypt
-    preserveFile     = false, // selected .cbox/.cboxbundle
+    preserveFile     = false, // selected encrypted file or bundle
   } = opts;
 
   // Clear Decrypt-specific outputs and state
@@ -2497,15 +2841,31 @@ async function autoTuneStrongWithBudget(budgetMs = 2500) {
 function cryptoRuntimeOk() {
   try {
     const hasSubtle = !!(crypto && crypto.subtle && crypto.getRandomValues);
-    const hasWorker = typeof Worker === 'function';
-    return hasSubtle && hasWorker;
-  } catch { return false; }
+    const hasWorker = (typeof Worker === 'function');
+
+    // Vérifie WebAssembly quand on est en mode strict
+    const hasWasm =
+      (typeof WebAssembly === 'object') &&
+      (typeof WebAssembly.instantiate === 'function');
+
+    // Si REQUIRE_WASM_STRICT est vrai, on exige WASM aussi
+    return hasSubtle && hasWorker && (!REQUIRE_WASM_STRICT || hasWasm);
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Initialize UI, load wordlist, rate-limit the benchmark, run auto-tune with budget,
  * and store tuned parameters. Disable buttons on failure.
  */
+// en haut du fichier (à côté de la ligne où tu as déjà):
+// let tunedParams = null;
+let __tpResolve;                                       // 🔹 Ajout
+const tunedParamsReady = new Promise(res => {          // 🔹 Ajout
+  __tpResolve = res;
+});
+
 async function init() {
   try {
     // Disable clearly on startup (ARIA + native)
@@ -2517,10 +2877,29 @@ async function init() {
     setLive('Optimizing...');
     
     if (!cryptoRuntimeOk()) {
-      setLive('This browser lacks required crypto/worker features.');
-      const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
-      if (be) { be.setAttribute('aria-disabled','true'); be.disabled = true; }
-      if (bd) { bd.setAttribute('aria-disabled','true'); bd.disabled = true; }
+      const hasWasm = (typeof WebAssembly === 'object') && (typeof WebAssembly.instantiate === 'function');
+    
+      if (REQUIRE_WASM_STRICT) {
+        const msg = 'WebAssembly is required for secure encryption. Operation aborted.';
+        setLive(msg);
+        showErrorBanner(msg);
+        $('#btnEncrypt')?.setAttribute('disabled', 'true');
+        $('#btnDecrypt')?.setAttribute('disabled', 'true');
+
+        throw new EnvelopeError('wasm_required', msg);
+      }
+    
+      // Permissive fallback allowed → sécurité réduite
+      const msg = hasWasm
+        ? 'Reduced crypto capabilities detected.'
+        : 'WebAssembly unavailable — degraded security mode.';
+      setLive(msg);
+    
+      showWarningBanner(
+        "Security warning — degraded mode: WebAssembly unavailable. " +
+        "Password protection is significantly weaker."
+      );
+    
       return;
     }
 
@@ -2529,34 +2908,31 @@ async function init() {
     // Benchmark rate-limit check
     const gate = allow('bench');
     if (!gate.ok) {
-      // Fallback params so the app remains usable
+      // Safe fallback params
       const caps = chooseCaps();
       const guessedMiB = clamp(jitterMemory(512), caps.minMemMiB, caps.maxMemMiB);
       const guessedP = clamp(Math.min((navigator.hardwareConcurrency || 2), HEALTHY_P_MAX), 1, caps.maxParallel);
     
-      // clamp to global hard mins/maxes BEFORE enabling UI
       tunedParams = {
         mMiB: clamp(guessedMiB, ARGON_MIN_MIB, ARGON_MAX_MIB),
         t:    clamp(5,           ARGON_MIN_T,   ARGON_MAX_T),
         p:    clamp(guessedP,    HEALTHY_P_MIN, HEALTHY_P_MAX)
       };
+
       window.__MAX_INPUT_BYTES_DYNAMIC = caps.maxInput;
-    
       setLive(`Auto (fallback): ${tunedParams.mMiB} MiB, t=${tunedParams.t}, p=${tunedParams.p}`);
-    
-      // Re-enable buttons so the app can run with fallback parameters
+
+      __tpResolve?.(tunedParams);
+
       const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
       if (be) { be.removeAttribute('aria-disabled'); be.disabled = false; }
       if (bd) { bd.removeAttribute('aria-disabled'); bd.disabled = false; }
-    
-      // IMPORTANT: do not return; we keep going with fallback params
     }
 
-    // Auto-tune with a time budget; safe fallback on failure
+    // Auto-tune with a time budget
     const tuned = await autoTuneStrongWithBudget(2500)
       .catch(() => ({ mMiB: 512, t: 5, p: 2, ms: 0 }));
 
-    // Apply adaptive limits based on device profile
     const caps = chooseCaps();
     tuned.mMiB = clamp(tuned.mMiB, caps.minMemMiB, caps.maxMemMiB);
     tuned.p    = clamp(tuned.p, 1, caps.maxParallel);
@@ -2570,7 +2946,18 @@ async function init() {
     };
     setLive(`Auto: ${tunedParams.mMiB} MiB, t=${tunedParams.t}, p=${tunedParams.p}`);
 
-    // Fully re-enable buttons (ARIA + native)
+    __tpResolve?.(tunedParams);
+
+    (function validateExts(){
+      if (typeof FILE_SINGLE_EXT !== 'string' || !FILE_SINGLE_EXT.startsWith('.')) {
+        throw new Error('Invalid FILE_SINGLE_EXT');
+      }
+      if (typeof FILE_BUNDLE_EXT !== 'string' || !FILE_BUNDLE_EXT.startsWith('.')) {
+        throw new Error('Invalid FILE_BUNDLE_EXT');
+      }
+    })();
+
+    // Re-enable buttons
     const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
     if (be) { be.removeAttribute('aria-disabled'); be.disabled = false; }
     if (bd) { bd.removeAttribute('aria-disabled'); bd.disabled = false; }
@@ -2580,7 +2967,6 @@ async function init() {
 
   } catch (e) {
     setLive('This device cannot load Argon2/WASM. Encryption disabled.');
-    // Keep disabled (ARIA + native)
     const be = $('#btnEncrypt'), bd = $('#btnDecrypt');
     if (be) { be.setAttribute('aria-disabled','true'); be.disabled = true; }
     if (bd) { bd.setAttribute('aria-disabled','true'); bd.disabled = true; }
@@ -2612,35 +2998,92 @@ function chunkFixedGeneric(u8) {
   return chunks.length ? chunks : [ new Uint8Array(0) ];
 }
 
-async function computeCrcAndSizeFromFile(file) {
-  let crc = 0xFFFFFFFF; // standard init
-  let size = 0;
-  const reader = file.stream().getReader();
-  while (true) {
-    const {value, done} = await reader.read();
-    if (done) break;
-    const u8 = value instanceof Uint8Array ? value : new Uint8Array(value);
-    crc = CRC_TABLE ? (function(c,u){ // inline update
-      for (let i=0;i<u.length;i++) c = CRC_TABLE[(c ^ u[i]) & 0xFF] ^ (c >>> 8);
-      return c;
-    })(crc, u8) : crc32Update(crc, u8);
-    size += u8.length;
+// Safer, cancellable CRC+size over a File/Blob stream.
+// Options:
+//  - signal: AbortSignal to allow cancellation
+//  - maxBytes: hard upper bound; aborts if exceeded
+//  - useBYOB: try ReadableStream BYOB reader to reduce allocations (best-effort)
+async function computeCrcAndSizeFromFile(file, { signal, maxBytes, useBYOB = true } = {}) {
+  // Pre-check size if the environment gives it (File.size is a safe hint)
+  const announced = Number(file?.size ?? 0);
+  if (Number.isFinite(announced) && maxBytes && announced > maxBytes) {
+    throw new EnvelopeError('input_large', `Announced size exceeds limit (${announced} > ${maxBytes})`);
   }
+
+  let crc = 0xFFFFFFFF >>> 0;
+  let sizeBig = 0n;
+
+  // Prefer BYOB to limit allocations if the stream supports it
+  const sourceStream = file.stream();
+  let reader = null;
+  let byob = false;
+  try {
+    if (useBYOB && typeof sourceStream.getReader === 'function' && 'ReadableStreamBYOBReader' in window) {
+      reader = sourceStream.getReader({ mode: 'byob' });
+      byob = true;
+    } else {
+      reader = sourceStream.getReader();
+    }
+
+    const table = CRC_TABLE || null; // optional precomputed table
+    const buf = byob ? new Uint8Array(64 * 1024) : null;
+
+    while (true) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+
+      const read = byob
+        ? await reader.read(buf)
+        : await reader.read();
+
+      if (read.done) break;
+
+      const chunk = byob
+        ? (read.value || buf).subarray(0, read.value?.byteLength ?? 0)
+        : (read.value instanceof Uint8Array ? read.value : new Uint8Array(read.value));
+
+      // size accounting (as BigInt to avoid precision loss)
+      sizeBig += BigInt(chunk.byteLength);
+      if (maxBytes && sizeBig > BigInt(maxBytes)) {
+        throw new EnvelopeError('input_large', 'Stream exceeds allowed limit');
+      }
+
+      // CRC32 update (table fast-path if available)
+      let c = crc >>> 0;
+      if (table) {
+        for (let i = 0; i < chunk.length; i++) {
+          c = (table[(c ^ chunk[i]) & 0xFF] ^ (c >>> 8)) >>> 0;
+        }
+      } else {
+        c = crc32Update(c, chunk) >>> 0;
+      }
+      crc = c;
+    }
+  } catch (e) {
+    try { await reader?.cancel?.(e); } catch {}
+    throw e;
+  } finally {
+    try { reader?.releaseLock?.(); } catch {}
+  }
+
   crc = (crc ^ 0xFFFFFFFF) >>> 0;
-  return { crc, size };
+
+  // Return both: precise BigInt + best-effort Number (null when unsafe)
+  const size = (sizeBig <= BigInt(Number.MAX_SAFE_INTEGER)) ? Number(sizeBig) : null;
+  return { crc, size, sizeBig };
 }
 
-function fileChunkProducer(file) {
+function fileChunkProducer(file, { signal } = {}) {
   return async function* () {
     const r = file.stream().getReader();
     try {
       while (true) {
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
         const { value, done } = await r.read();
         if (done) break;
         yield (value instanceof Uint8Array) ? value : new Uint8Array(value);
       }
     } catch (e) {
-      // → fait remonter un code + le nom du fichier + la cause d’origine
+      try { await r.cancel?.(e); } catch {}
       throw new EnvelopeError('input_stream', `Error while reading "${file.name}"`, { cause: e, fileName: file.name });
     } finally {
       try { r.releaseLock?.(); } catch {}
@@ -2654,7 +3097,7 @@ function fileChunkProducer(file) {
  * doEncrypt
  *  - Text mode: single Argon2 (bundle) → HKDF → sealFixedChunkDet
  *  - Files mode (streaming): streaming pipeline (Store ZIP → fixed chunks → AES-GCM Det)
- *  - Outputs: .cboxbundle (ZIP store-only) en O(1) RAM si File System Access est dispo
+ *  - Outputs: encrypted bundle (ZIP store-only) with O(1) RAM usage when File System Access API is available
  ****************************************************** */
 async function doEncrypt() {
   let payloadBytes = null;
@@ -2705,7 +3148,7 @@ async function doEncrypt() {
     const password = pw.normalize('NFKC');
 
     // Determine input source from panel visibility
-    const textMode = !$('#encPanelText').hidden;
+    const textMode = (mode === 'text');
     if (textMode) {
       /* ******************************************************
        * TEXT MODE — One-time KDF and deterministic chunk sealing
@@ -2721,6 +3164,8 @@ async function doEncrypt() {
       // Optional size padding (bucket)
       const enableSizePadding = false;      // toggle on hardened builds as needed
       let PAD_TO = choosePadBucket();
+      // Garder la valeur effectivement utilisée (peut être ajustée plus bas)
+      let PAD_TO_EFFECTIVE = PAD_TO;
       
       // Keep the real length for manifest/UX
       const realPlainLen = payloadBytes.length;
@@ -2756,6 +3201,7 @@ async function doEncrypt() {
               sizePadded = false;
               logWarn("[enc] padding auto-disabled due to device cap; using realPlainLen only");
               setLive("Size padding automatically disabled to fit device limit.");
+              PAD_TO_EFFECTIVE = PAD_TO;
             } else {
               // Ensure bucket is at least one full chunk
               if (newBucket < FIXED_CHUNK_SIZE) newBucket = FIXED_CHUNK_SIZE;
@@ -2767,6 +3213,7 @@ async function doEncrypt() {
                 payloadBytes = originalBytes;
                 sizePadded = false;
                 setLive("No size padding required.");
+                PAD_TO_EFFECTIVE = newBucket;
               } else {
                 const pad = new Uint8Array(needPadBytes2);
                 crypto.getRandomValues(pad);
@@ -2784,6 +3231,7 @@ async function doEncrypt() {
           
                 logInfo("[enc] size padding adjusted", { bucket: newBucket, paddedLen: paddedLen2 });
                 setLive("Size padding automatically adjusted to device capacity.");
+                PAD_TO_EFFECTIVE = newBucket;
               }
             }
           } else {
@@ -2800,6 +3248,7 @@ async function doEncrypt() {
             payloadBytes = combined;
             sizePadded = true;
             try { originalBytes.fill(0); } catch {}
+            PAD_TO_EFFECTIVE = PAD_TO;
           }
         }
       }
@@ -2849,7 +3298,7 @@ async function doEncrypt() {
         });
 
         sealedParts.push({
-          name: `part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
+          name: namePart(i),
           bytes: part
         });
 
@@ -2885,7 +3334,7 @@ async function doEncrypt() {
         realPlainLen,
         sizePadded: (typeof sizePadded === 'boolean') ? sizePadded : true,
         padBytes: Math.max(0, totalPlainLen - realPlainLen),
-        padBucket: 8 * 1024 * 1024,
+        padBucket: enableSizePadding ? PAD_TO_EFFECTIVE : null,
       
         // Crypto descriptor
         aead: 'AES-256-GCM',
@@ -2911,7 +3360,7 @@ async function doEncrypt() {
           domain: 'manifest'
         });
         manSealedParts.push({
-          name: `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
+          name: nameManifestPart(i),
           bytes: sealed
         });
       }
@@ -2943,7 +3392,7 @@ async function doEncrypt() {
           domain: 'index'
         });
         manIndexSealed.push({
-          name: `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`,
+          name: nameIndexPart(i),
           bytes: sealed
         });
       }
@@ -2955,7 +3404,7 @@ async function doEncrypt() {
         bundleId,
         bundleSaltB64: b64(bundleSalt)
       });
-      const headerEntry = { name: `BUNDLE_HEADER${FILE_SINGLE_EXT}`, bytes: headerBytes };
+      const headerEntry = { name: nameHeader(), bytes: headerBytes };
 
       /* ******************************************************
        * Build bundle ZIP (store-only) and present download
@@ -3028,7 +3477,7 @@ async function doEncrypt() {
           const writerTmp = new StoreZipWriter(sinkTmp);
           let idx = 0;
           for (const f of files) {
-            const internalName = `000${String(idx).padStart(3,'0')}.bin`.replace(/^0+/, (m)=> m);
+            const internalName = `${String(idx).padStart(3,'0')}.bin`;
             await writerTmp.addFile(internalName, null, null, fileChunkProducer(f));
             idx++;
           }
@@ -3042,10 +3491,10 @@ async function doEncrypt() {
       }
     }
 
-    // 1) Choose output sink: O(1) with File System Access when available, else memory
+    // Choose output sink: O(1) with File System Access when available, else memory
     const { sink, close, kind } = await getBundleSink('secret' + FILE_BUNDLE_EXT);
 
-    // 2) Streaming encryption — directly writes the .cboxbundle
+    // Streaming encryption — directly writes the encrypted bundle
     const res = await encryptMultiFilesStreaming({
       files,
       password,
@@ -3053,7 +3502,7 @@ async function doEncrypt() {
       outSink: sink
     });
 
-    // 3) UI result depending on sink kind
+    // UI result depending on sink kind
     if (kind === 'fs') {
       await close?.();
       renderSimpleHashes({
@@ -3139,7 +3588,7 @@ async function computeZipSha256HexForFiles(files, limitBytes) {
   let fileIdx = 0;
   for (const f of files) {
     // match the opaque internal naming used in encryptMultiFilesStreaming()
-    const internalName = `000${String(fileIdx).padStart(3,'0')}.bin`.replace(/^0+/, (m)=> m);
+    const internalName = String(fileIdx).padStart(6, '0') + '.bin';
     await writer.addFile(internalName, null, null, fileChunkProducer(f));
     fileIdx++;
   }
@@ -3195,7 +3644,7 @@ ${plb}:
 
 /**
  * Builds the clear ZIP as a stream (store-only), feeds it into chunk-based encryption,
- * and writes the bundle (.cboxbundle) as a stream (store-only) on the fly.
+ * and writes the encrypted bundle as a stream (store-only) on the fly.
  * Returns {bundleU8, manifest, manifestIndex}.
  */
 async function encryptMultiFilesStreaming({ files, password, tunedParams, outSink }) {
@@ -3224,12 +3673,12 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
     bundleSaltB64: b64(bundleSalt)
   });
   const headerCrc = crc32(headerBytes);
-  await bundleWriter.addFile(`BUNDLE_HEADER${FILE_SINGLE_EXT}`, headerBytes.length, headerCrc, async function*(){ yield headerBytes.slice(); });
+  await bundleWriter.addFile(nameHeader(), headerBytes.length, headerCrc, async function*(){ yield headerBytes.slice(); });
   try { headerBytes.fill(0); } catch {}
 
-  // 2) Build clear ZIP *as a stream* and simultaneously chunk/encrypt it
-  //    We produce encrypted parts part-000000.cbox directly in the bundle.
-  //    We need a “clear chunker” that accumulates FIXED_CHUNK_SIZE.
+  //  Build the clear ZIP as a stream while encrypting fixed-size chunks
+  //  Encrypted parts (part-******) are emitted directly into the bundle
+  //  A clear-chunk accumulator assembles FIXED_CHUNK_SIZE for each sealed part
   let plainTotalLen = 0;
   let partIndex = 0;
   const perChunkHashes = [];
@@ -3254,7 +3703,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       domain: 'data'
     });    
 
-    // Add part-XXXXXX.cbox entry into bundle (store-only) immediately
+    // Add the encrypted part entry (part-******) into the bundle (store-only) immediately
     const entryName = `part-${String(partIndex).padStart(6,'0')}${FILE_SINGLE_EXT}`;
     const crc = crc32(sealed);
     await bundleWriter.addFile(entryName, sealed.length, crc, async function*(){ yield sealed.slice(); });
@@ -3406,7 +3855,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       totalPlainLen: manifestBytes.length,
       domain: 'manifest'
     });
-    const name = `MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
+    const name = nameManifestPart(i);
     const crc  = crc32(sealed);
     await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed.slice(); });
     try { sealed.fill(0); } catch {}
@@ -3438,7 +3887,7 @@ async function encryptMultiFilesStreaming({ files, password, tunedParams, outSin
       totalPlainLen: manIndexBytes.length,
       domain: 'index'
     });
-    const name = `MANIFEST_INDEX.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`;
+    const name = nameIndexPart(i);
     const crc  = crc32(sealed);
     await bundleWriter.addFile(name, sealed.length, crc, async function*(){ yield sealed.slice(); });
     try { sealed.fill(0); } catch {}
@@ -3458,7 +3907,6 @@ function updateEncryptButtonState() {
 
   const pw = ($('#encPassword').value || '').trim();
 
-  // Check active content type
   const textPanelVisible  = !$('#encPanelText').hidden;
   const filesPanelVisible = !$('#encPanelFiles').hidden;
 
@@ -3469,8 +3917,14 @@ function updateEncryptButtonState() {
     const files = $('#encFiles').files;
     hasInput = !!(files && files.length > 0);
   }
+  
+  const kdfReady =
+    tunedParams &&
+    Number.isFinite(tunedParams.mMiB) &&
+    Number.isFinite(tunedParams.t) &&
+    Number.isFinite(tunedParams.p);
 
-  const enabled = pw.length > 0 && hasInput;
+  const enabled = pw.length > 0 && hasInput && kdfReady;
 
   btn.disabled = !enabled;
   if (enabled) btn.removeAttribute('aria-disabled');
@@ -3553,7 +4007,7 @@ function maskPasswordField(inputSel, toggleSel) {
  * Ensure chunk indices are continuous from 0..max without duplicates.
  */
 function validateIndexSetFromNames(entries) {
-  const partNames = entries.filter(e => /^part-\d{6}\.cbox$/i.test(e.name)).map(e => e.name);
+  const partNames = entries.filter(e => RX_PART.test(e.name)).map(e => e.name);
   const idxs = partNames.map(n => parseInt(n.slice(5, 11), 10));
   const set  = new Set(idxs);
 
@@ -3641,13 +4095,17 @@ async function tryRenderOrDownload(bytes, containerSel, textSel) {
 
 /* ******************************************************
  * doDecrypt
- *  - Single .cbox: openFixedChunk (password) → preview or download
- *  - .cboxbundle:
- *      • Open BUNDLE_HEADER.cbox (password) → (bundleId, bundleSaltB64)
- *      • Derive K_ENC/kIv32 once (Argon2id → HKDF)
- *      • Open MANIFEST_INDEX with openFixedChunkDet (bundle keys)
- *      • Open MANIFEST with openFixedChunkDet (bundle keys) + verify against INDEX
- *      • Decrypt data parts with openFixedChunkDet (bundle keys) and stream plaintext to disk (O(1) RAM)
+ *  - Single envelope:
+ *      • openFixedChunk (password) → preview or download
+ *  - Bundle:
+ *      • Open bundle header with openBundleHeaderWithPassword (password)
+ *        → (bundleId, bundleSaltB64)
+ *      • Derive bundle-level keys once (Argon2id → HKDF → kEnc/kIv32)
+ *      • Open manifest index with openFixedChunkDet (bundle keys)
+ *      • Open manifest with openFixedChunkDet (bundle keys)
+ *        + verify entries against index
+ *      • Decrypt each data part with openFixedChunkDet (bundle keys)
+ *        and stream plaintext to disk (O(1) RAM)
  ****************************************************** */
 async function doDecrypt() {
   let zipU8 = null;
@@ -3663,7 +4121,7 @@ async function doDecrypt() {
 
     // Now show the bar and set initial progress
     showProgress('decBar', true);
-    setProgress(decBar, 10);
+    setProgress('#decBar', 10);
 
     // Show decryption progress container only while active
     try {
@@ -3676,7 +4134,7 @@ async function doDecrypt() {
     if (!gate.ok) {
       logWarn('[dec] rate-limited', { wait: gate.wait });
       cooldownButton('#btnDecrypt', gate.wait);
-      setProgress(decBar, 0);
+      setProgress('#decBar', 0);
       try {
         const decProgress = document.querySelector('#decBar')?.parentElement;
         if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (rate-limit)'); }
@@ -3684,7 +4142,7 @@ async function doDecrypt() {
       throw new EnvelopeError('rate_limit', 'cooldown');
     }
 
-    setProgress(decBar, 10);
+    setProgress('#decBar', 10);
 
     // Anti double-click during processing
     decryptBtn = document.querySelector('#btnDecrypt');
@@ -3704,7 +4162,7 @@ async function doDecrypt() {
     if (!pw) {
       logWarn('[dec] missing password');
       setText('#decFileErr', 'Please enter your passphrase.');
-      setProgress(decBar, 0);
+      setProgress('#decBar', 0);
       try { const decProgress = document.querySelector('#decBar')?.parentElement; if (decProgress) decProgress.style.display = 'none'; } catch {}
       try { document.getElementById('decPassword')?.focus(); } catch {}
       try { if (decryptBtn) { decryptBtn.disabled = !!prevDisabled; if (!prevDisabled) decryptBtn.removeAttribute('aria-disabled'); } } catch {}
@@ -3716,8 +4174,8 @@ async function doDecrypt() {
     const f = $('#decFile').files?.[0];
     if (!f)  {
       logWarn('[dec] missing file');
-      setText('#decFileErr', 'Please choose a .cbox or .cboxbundle file.');
-      setProgress(decBar, 0);
+      setText('#decFileErr', `Please choose a ${FILE_SINGLE_EXT} or ${FILE_BUNDLE_EXT} file.`);
+      setProgress('#decBar', 0);
       try { const decProgress = document.querySelector('#decBar')?.parentElement; if (decProgress) decProgress.style.display = 'none'; } catch {}
       try { document.getElementById('decDrop')?.focus(); } catch {}
       try { if (decryptBtn) { decryptBtn.disabled = !!prevDisabled; if (!prevDisabled) decryptBtn.removeAttribute('aria-disabled'); } } catch {}
@@ -3736,62 +4194,29 @@ async function doDecrypt() {
     const fSize = f.size|0;
     logInfo('[dec] input file', { name, size: fSize });
 
-    /* ******************************************************
-     * Single fixed-chunk .cbox path (with Det-envelope detection)
-     ****************************************************** */
-    async function detectDetEnvelope(bytes) {
-      if (!(bytes instanceof Uint8Array)) bytes = new Uint8Array(bytes);
-    
-      const MAGIC_LEN = MAGIC.length;              // 'CBOX4' → 5
-      if (bytes.length < MAGIC_LEN + 4) {
-        throw new EnvelopeError('format', 'Invalid envelope');
-      }
-    
-      for (let i = 0; i < MAGIC_LEN; i++) {
-        if (bytes[i] !== MAGIC[i]) throw new EnvelopeError('magic', 'Unknown format');
-      }
-    
-      const metaLen = new DataView(bytes.buffer, bytes.byteOffset + MAGIC_LEN, 4).getUint32(0, false);
-      const metaStart = MAGIC_LEN + 4;
-      const metaEnd   = metaStart + metaLen;
-    
-      if (metaLen <= 0 || metaLen > 4096) { // borne prudente
-        throw new EnvelopeError('meta_big', 'Metadata too large');
-      }
-      if (metaEnd > bytes.length) {
-        throw new EnvelopeError('meta_trunc', 'Corrupted metadata');
-      }
-    
-      let meta;
-      try {
-        const metaBytes = bytes.subarray(metaStart, metaEnd);
-        meta = JSON.parse(TD.decode(metaBytes));
-      } catch {
-        throw new EnvelopeError('meta_parse', 'Malformed metadata');
-      }
-    
-      const isDet = (meta?.kdf?.kdf === 'HKDF') && (meta?.salt == null);
-      return { kind: isDet ? 'det' : 'pw', meta };
-    }
-
-    if (name.endsWith(FILE_SINGLE_EXT)) {
-      if (/^(part-\d{6}|MANIFEST(?:_INDEX)?\.part-\d{6})\.cbox$/i.test(f.name)) {
+    if (RX_SINGLE_EXT.test(name)) {
+      const isFragment =
+        RX_PART.test(f.name) || RX_MANIFEST_PART.test(f.name) || RX_INDEX_PART.test(f.name);
+      if (isFragment) {
         throw new EnvelopeError(
           'bundle_fragment',
-          'This is a bundle fragment. Please select the .cboxbundle file.'
+          `This ${FILE_SINGLE_EXT} is a bundle fragment. Please select the ${FILE_BUNDLE_EXT} file.`
         );
       }
-      logInfo('[dec] mode=single .cbox');
+      logInfo(`[dec] mode=single ${FILE_SINGLE_EXT}`);
 
-      // --- SIZE GUARD (single .cbox) ---
+      // --- SIZE GUARD (single-envelope mode) ---
       // dynamic bound based on the device, with a "reasonable" ceiling for a single chunk
       const capsMax = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_BUNDLE_BYTES; // MAX_BUNDLE_BYTES = MAX_INPUT_BYTES
-      const MAX_CBOX_BYTES_DYNAMIC = Math.min(
-        FIXED_CHUNK_SIZE + (1 * 1024 * 1024), // 4 MiB + 1 MiB margin for headers/overhead
+      const MAX_SINGLE_ENVELOPE_BYTES = Math.min(
+        FIXED_CHUNK_SIZE + (1 * 1024 * 1024), // header padding margin
         capsMax
       );
-      if (f.size > MAX_CBOX_BYTES_DYNAMIC) {
-        throw new EnvelopeError('input_large', 'Envelope too large for this device');
+      if (f.size > MAX_SINGLE_ENVELOPE_BYTES) {
+        throw new EnvelopeError(
+          'input_large',
+          `Envelope too large for this device (limit: ~${MAX_SINGLE_ENVELOPE_BYTES} bytes)`
+        );
       }
 
       const env = new Uint8Array(await f.arrayBuffer());
@@ -3807,11 +4232,11 @@ async function doDecrypt() {
       if (probe?.kind === 'det') {
         throw new EnvelopeError(
           'det_envelope',
-          'This .cbox is a bundle fragment (HKDF, no per-envelope salt). Open the .cboxbundle instead.'
+          `This ${FILE_SINGLE_EXT} is a bundle fragment (HKDF, no per-envelope salt). Open the ${FILE_BUNDLE_EXT} instead.`
         );
       }
     
-      // --- Flux “.cbox” per-envelope standard (Argon2id) ---
+      // --- Per-envelope path: password-based encryption (Argon2id), independent envelopes ---
       const opened = await openFixedChunk({ password, bytes: env });
       const meta   = opened.innerMeta;
     
@@ -3844,7 +4269,7 @@ async function doDecrypt() {
       try { opened.fixedChunk.fill(0); } catch {}
       try { env.fill(0); } catch {}
     
-      setProgress(decBar, 100);
+      setProgress('#decBar', 100);
       setLive('Decryption complete.');
       logInfo('[dec] single decryption success');
     
@@ -3873,14 +4298,14 @@ async function doDecrypt() {
     }
 
     /* ******************************************************
-     * Bundle (.cboxbundle) path — boot with HEADER → derive keys → open INDEX → open MANIFEST (Det) → stream data
+     * Bundle mode (deterministic): open header → derive encryption/IV keys → open index → open manifest → stream decrypted payload with O(1) RAM
      ****************************************************** */
-    if (!name.endsWith(FILE_BUNDLE_EXT)) {
+    if (!RX_BUNDLE_EXT.test(name)) {
       logWarn('[dec] unsupported file extension', { name });
       throw new EnvelopeError('input', 'unsupported');
     }
 
-    // --- SIZE GUARD (bundle .cboxbundle) ---
+    // --- SIZE GUARD (bundle file) ---
     // relies on the device capability detected by init(); fallback to the global hard limit
     const MAX_BUNDLE_BYTES_DYNAMIC = window.__MAX_INPUT_BYTES_DYNAMIC || MAX_BUNDLE_BYTES;
     if (f.size > MAX_BUNDLE_BYTES_DYNAMIC) {
@@ -3900,12 +4325,7 @@ async function doDecrypt() {
     }
 
     // Only allow expected entry name patterns
-    const allowed = [
-      /^BUNDLE_HEADER\.cbox$/i,
-      /^part-\d{6}\.cbox$/i,
-      /^MANIFEST\.part-\d{6}\.cbox$/i,
-      /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i
-    ];
+    const allowed = [ new RegExp(`^${rxEscape(nameHeader())}$`, 'i'), RX_PART, RX_MANIFEST_PART, RX_INDEX_PART ];
 
     let unexpected = 0;
     for (const e of entries) {
@@ -3922,9 +4342,9 @@ async function doDecrypt() {
     zipU8 = null;
 
     /* ******************************************************
-    * 1) Bootstrap: open password-based BUNDLE_HEADER.cbox
+    * Bootstrap: open password-based bundle header (encrypted container)
     ****************************************************** */
-    const headerEntry = entries.find(e => /^BUNDLE_HEADER\.cbox$/i.test(e.name));
+    const headerEntry = entries.find(e => e.name.toLowerCase() === nameHeader().toLowerCase());
     if (!headerEntry) {
       logWarn('[dec] missing bootstrap header');
       throw new EnvelopeError('no_header', 'Missing bundle header');
@@ -3943,10 +4363,10 @@ async function doDecrypt() {
     const K_ENC = await importAesKey(kEnc32);
 
     /* ******************************************************
-    * 2) Open MANIFEST_INDEX with bundle-level keys (Det)
+    * Open MANIFEST_INDEX with bundle-level keys (Det)
     ****************************************************** */
     const idxEntries = entries
-      .filter(e => /^MANIFEST_INDEX\.part-\d{6}\.cbox$/i.test(e.name))
+      .filter(e => RX_INDEX_PART.test(e.name))
       .sort((a, b) => a.name.localeCompare(b.name));
     if (idxEntries.length === 0) {
       logWarn('[dec] no manifest index');
@@ -4027,7 +4447,7 @@ async function doDecrypt() {
     let mWritten = 0;
 
     for (let i = 0; i < mTotal; i++) {
-      const entry = byName.get(`MANIFEST.part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
+      const entry = byName.get(nameManifestPart(i));
       if (!entry) {
         logWarn('[dec] missing manifest part', { i });
         throw new EnvelopeError('missing_manifest_part', `Manifest chunk ${i} missing`);
@@ -4069,7 +4489,7 @@ async function doDecrypt() {
       mWritten += slice.length;
       try { opened.fixedChunk.fill(0); } catch {}
 
-      setProgress(decBar, 10 + Math.floor(10 * (i + 1) / mTotal));
+      setProgress('#decBar', 10 + Math.floor(10 * (i + 1) / mTotal));
       if ((i & 1) === 0) await new Promise(r => setTimeout(r, 0));
     }
     if (mWritten !== mLen) {
@@ -4212,7 +4632,7 @@ async function doDecrypt() {
     let warnedAboutExecutable = false;
     let written = 0;
     for (let i = 0; i < manifest.totalChunks; i++) {
-      const entry = byName.get(`part-${String(i).padStart(6,'0')}${FILE_SINGLE_EXT}`);
+      const entry = byName.get(namePart(i));
       if (!entry) { logWarn('[dec] missing data chunk', { i }); throw new EnvelopeError('missing_part', `Chunk ${i} missing`); }
 
       // Open with bundle-level keys (no per-chunk Argon2)
@@ -4261,14 +4681,15 @@ async function doDecrypt() {
       // User warning: content appears executable/script; OK to continue, Cancel to stop.
       if (!warnedAboutExecutable) {
         const sample = slice.subarray(0, Math.min(slice.length, 4096));
-        if (looksExecutableBytes(sample)) {
-          const cont = await promptUserConfirm(
-            'The decrypted content appears to be an executable or script. Opening or running such files can be dangerous.'
-          );
-          if (!cont) throw new EnvelopeError('user_abort', 'User cancelled after executable warning');
-          if (!outName || !outName.endsWith('.zip')) outName = 'decrypted.bin';
-          showErrorBanner('Caution: executable-like content detected. Proceeding as binary.');
-          warnedAboutExecutable = true;
+        if (looksExecutableBytes(sample) ||
+          DANGEROUS_EXT.test(String(outName || ''))) {
+            const cont = await promptUserConfirm(
+              'The decrypted content appears to be an executable or script. Opening or running such files can be dangerous.'
+            );
+            if (!cont) throw new EnvelopeError('user_abort', 'User cancelled after executable warning');
+            if (!outName || !outName.endsWith('.zip')) outName = 'decrypted.bin';
+            showErrorBanner('Caution: executable-like content detected. Proceeding as binary.');
+            warnedAboutExecutable = true;
         }
       }
       
@@ -4291,7 +4712,7 @@ async function doDecrypt() {
 
       try { opened.fixedChunk.fill(0); } catch {}
 
-      setProgress(decBar, 20 + Math.floor(70 * (i + 1) / manifest.totalChunks));
+      setProgress('#decBar', 20 + Math.floor(70 * (i + 1) / manifest.totalChunks));
       if ((i & 1) === 0) await new Promise(r => setTimeout(r, 0));
     }
 
@@ -4404,7 +4825,7 @@ async function doDecrypt() {
       }
     }
 
-    setProgress(decBar, 100);
+    setProgress('#decBar', 100);
     setLive('Decryption complete.');
     logInfo('[dec] success');
 
@@ -4428,8 +4849,8 @@ async function doDecrypt() {
     // Log with extra metadata when possible
     const meta = { name: (err && err.name) || null, code: (err && err.code) || null, msg: (err && err.message) || String(err) };
     logError('[dec] failed', meta, err);
-    await secureFail('Decryption');
-    setProgress(decBar, 0);
+    await secureFail('Decryption', normalizeEncError(err));
+    setProgress('#decBar', 100);
     clearPasswords();
     try {
       const decProgress = document.querySelector('#decBar')?.parentElement;
@@ -4451,7 +4872,7 @@ async function doDecrypt() {
       if (decProgress) { decProgress.style.display = 'none'; logInfo('[dec] progress hidden (finally)'); }
     } catch (e) { logWarn('[dec] progress hide warn (finally)', e); }
 
-    // Wipe encrypted chunk buffers (from ZIP or direct .cbox)
+    // Wipe encrypted chunk buffers (from ZIP or direct encrypted container)
     try {
       let wiped = 0;
       for (const e of entries || []) { if (e?.bytes?.fill) { e.bytes.fill(0); wiped++; } }
@@ -4731,7 +5152,14 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btn.disabled) return;
     btn.disabled = true;
   
-    // Préflight fichiers (si tu l’as ajouté)
+    try {
+      await waitForKdfReady(8000); // 8s max; ajuste si tu veux
+    } catch (err) {
+      await secureFail('Encryption', normalizeEncError(err));
+      btn.disabled = false;
+      return;
+    }
+  
     const files = $('#encFiles')?.files;
     try {
       if (files && files.length) preflightInputs([...files]);
@@ -4749,7 +5177,6 @@ document.addEventListener('DOMContentLoaded', () => {
       btn.disabled = false;
     }
   });
-  
   
   $('#btnDecrypt').addEventListener('click', doDecrypt);
 
